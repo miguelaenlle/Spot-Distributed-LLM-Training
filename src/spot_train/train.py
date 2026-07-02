@@ -84,6 +84,20 @@ def train(cfg: TrainConfig) -> dict:
     device_type = "cuda" if cfg.device.startswith("cuda") else "cpu"
     torch.manual_seed(cfg.seed)
 
+    # GPU banner + fail-fast: if cuda was requested but isn't really here, say so
+    # clearly instead of dying later in a cryptic .to(device) traceback.
+    cuda_ok = torch.cuda.is_available()
+    gpu_name = torch.cuda.get_device_name(0) if cuda_ok else None
+    if device_type == "cuda":
+        if not cuda_ok:
+            raise SystemExit(
+                "DEVICE=cuda but torch.cuda.is_available() is False — GPU driver / "
+                "torch-CUDA build mismatch on this box. Check the AMI has PyTorch+CUDA."
+            )
+        print(f"[gpu] using cuda: {gpu_name}", file=sys.stderr, flush=True)
+    else:
+        print("[cpu] running on CPU", file=sys.stderr, flush=True)
+
     loader = PositionedLoader(
         data_local_dir=cfg.data_local_dir,
         batch_size=cfg.batch_size,
@@ -125,6 +139,8 @@ def train(cfg: TrainConfig) -> dict:
 
     start_time = time.monotonic()
     last_ckpt = start_time
+    last_log_time = start_time
+    last_log_step = start_step
     step = start_step
     ckpt_count = 0
     reason = "max_steps"
@@ -136,6 +152,19 @@ def train(cfg: TrainConfig) -> dict:
         loss.backward()
         optimizer.step()
         step += 1
+
+        # per-step progress (nanoGPT-style) — tail the box log to watch this live
+        if cfg.log_interval_steps and step % cfg.log_interval_steps == 0:
+            t = time.monotonic()
+            per_step = (t - last_log_time) / max(1, step - last_log_step)
+            tok_s = cfg.batch_size * cfg.block_size / per_step if per_step > 0 else 0
+            print(
+                f"step {step}: loss {loss.item():.4f}, {per_step * 1000:.0f}ms/step, "
+                f"{tok_s:.0f} tok/s",
+                file=sys.stderr,
+                flush=True,
+            )
+            last_log_time, last_log_step = t, step
 
         now = time.monotonic()
         if now - last_ckpt >= cfg.checkpoint_interval_seconds:
@@ -168,6 +197,8 @@ def train(cfg: TrainConfig) -> dict:
         "wallclock_s": round(time.monotonic() - start_time, 2),
         "stop_reason": reason,
         "device": cfg.device,
+        "cuda": cuda_ok,
+        "gpu": gpu_name,
         "dataset": cfg.dataset,
     }
     _write_metrics(cfg, metrics)

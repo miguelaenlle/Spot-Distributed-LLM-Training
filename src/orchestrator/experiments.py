@@ -54,6 +54,12 @@ def _launch(
         run_id=run_id,
     )
     aws.wait_running(iid)
+    print(
+        f"[launch] instance {iid} ({market}). Watch training live (no inbound):\n"
+        f"    aws ssm start-session --target {iid} --region {cfg.region}\n"
+        f"    # then on the box:  sudo tail -f /var/log/spot-train-boot.log   (or: nvidia-smi)",
+        file=sys.stderr,
+    )
     return iid
 
 

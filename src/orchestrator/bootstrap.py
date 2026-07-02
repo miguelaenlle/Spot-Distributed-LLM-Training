@@ -34,6 +34,8 @@ def build_user_data(
         "RUN_ID": run_id,
         "MARKET": market,
         "DEVICE": "cuda",
+        # unbuffered stdout so `tail -f` over SSM shows per-step lines live
+        "PYTHONUNBUFFERED": "1",
     }
     exports = "\n".join(f'export {k}="{v}"' for k, v in env.items())
     return f"""#!/bin/bash
@@ -53,7 +55,7 @@ pip install boto3 numpy
 
 {exports}
 
-python -m spot_train.train
+python -u -m spot_train.train
 
 shutdown -h now
 """

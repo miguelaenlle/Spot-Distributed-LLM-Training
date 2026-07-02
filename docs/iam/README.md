@@ -9,6 +9,10 @@ Three least-privilege policies, split by principal. Replace `YOUR_BUCKET` and
 | [`controller-policy.json`](./controller-policy.json) | the **orchestrator** — laptop now, an instance-profile role when it becomes a cloud node | every `stage-data` / `baseline` / `spot` run |
 | [`worker-policy.json`](./worker-policy.json) | the **training box** (`spot-train-role` instance profile) | attached automatically by `setup` |
 
+`setup` also attaches the AWS-managed `AmazonSSMManagedInstanceCore` policy to the
+worker role so you can attach a shell via SSM Session Manager (no inbound ports)
+to watch training live — see the main README's "Watch a run live".
+
 ## Design notes
 
 - **Roles over users.** The code (`orchestrator/aws.py`) never references secret

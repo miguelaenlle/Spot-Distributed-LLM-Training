@@ -37,21 +37,39 @@ See [`CLAUDE.md`](./CLAUDE.md) for the full plan of record and
 
 ## Layout
 
-Minimal by design — only Phase 1a lives here today. Later phases add folders
-(`infra/`, `supervisor/`) when they begin.
+Minimal by design — only Phase 1a lives here today.
 
 ```
-src/spot_train/   fault-tolerance layer (checkpoint, resume, interruption listener)
+src/spot_train/   remote trainer: checkpoint/resume loop + wall-clock budget + eval
+src/orchestrator/ local control plane (boto3): setup / stage-data / baseline / spot
 third_party/      Karpathy's nanoGPT as a pinned submodule — we import the model, not rewrite it
-tests/            kill-and-resume determinism tests
+docs/iam/         least-privilege IAM policies (controller / worker / setup)
+tests/            checkpoint/resume tests
 ```
 
 After cloning: `git submodule update --init` then `pip install -e .`.
 
+## Watch a run live
+
+The training box has **no inbound ports** — you attach over SSM Session Manager
+(the orchestrator prints the exact command with the instance id when it
+launches). `setup` grants the box the SSM role automatically.
+
+```bash
+aws ssm start-session --target <instance-id> --region us-east-1
+# then, on the box:
+sudo tail -f /var/log/spot-train-boot.log   # live per-step loss / tok/s
+nvidia-smi                                  # confirm the GPU is actually busy
+```
+
+The trainer prints a `[gpu] using cuda: <name>` banner at startup (and fails
+fast if CUDA was requested but is missing), logs `step N: loss …, ms/step,
+tok/s` every few steps, and records `cuda`/`gpu` in the final `metrics.json`.
+
 ## Status
 
-🚧 **Phase 1a — scaffolding.** Get kill-and-resume passing locally on CPU
-before moving to spot. No AWS, DDP, or control plane yet.
+🚧 **Phase 1a.** Trainer + orchestrator implemented and CPU-verified; the AWS
+baseline/spot runs are ready to drive. No DDP or control plane yet.
 
 ## License
 

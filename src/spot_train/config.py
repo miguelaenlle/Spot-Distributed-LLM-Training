@@ -56,6 +56,9 @@ class TrainConfig:
     checkpoint_interval_seconds: float = 30.0
     # Run the (heavier) restore smoke test on every Nth checkpoint. 1 => always.
     smoke_test_every: int = 1
+    # Print a per-step loss/throughput line every N steps (0 => silent). Tail the
+    # box log over SSM to watch these live.
+    log_interval_steps: int = 10
     # Where checkpoints live: a local dir for the CPU test, an s3:// URI on spot.
     checkpoint_uri: str = "checkpoints/"
     # Where the final metrics.json is written (local path or s3:// URI).
@@ -87,6 +90,7 @@ class TrainConfig:
         return cls(
             max_seconds=_env_float("MAX_SECONDS", None),
             checkpoint_interval_seconds=_env_float("CHECKPOINT_INTERVAL_SECONDS", 30.0),
+            log_interval_steps=_env_int("LOG_INTERVAL_STEPS", 10),
             checkpoint_uri=_env_str("CHECKPOINT_URI", "checkpoints/"),
             metrics_uri=_env_str("METRICS_URI", "checkpoints/metrics.json"),
             dataset=_env_str("DATASET", "shakespeare_char"),

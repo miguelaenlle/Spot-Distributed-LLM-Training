@@ -167,6 +167,12 @@ def ensure_instance_profile(role_name: str, profile_name: str, bucket: str) -> N
     iam.put_role_policy(
         RoleName=role_name, PolicyName="spot-train-s3", PolicyDocument=json.dumps(policy)
     )
+    # SSM Session Manager: lets you attach a shell to the box (no inbound ports)
+    # to `tail -f /var/log/spot-train-boot.log` and run nvidia-smi.
+    iam.attach_role_policy(
+        RoleName=role_name,
+        PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+    )
     _ignore_exists(lambda: iam.create_instance_profile(InstanceProfileName=profile_name))
     _ignore_exists(
         lambda: iam.add_role_to_instance_profile(
