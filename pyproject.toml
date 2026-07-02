@@ -23,6 +23,11 @@ dev = [
     "ruff",
     "mypy",
 ]
+# Optional visualization: the orchestrator mirrors each run's profile (timeline +
+# loss) to Weights & Biases. Not a core dep — runs write S3 profile.json without it.
+viz = [
+    "wandb",
+]
 
 [project.scripts]
 spot-train = "spot_train.train:main"

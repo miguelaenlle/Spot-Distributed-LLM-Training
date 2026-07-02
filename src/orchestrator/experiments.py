@@ -21,6 +21,7 @@ import time
 
 from . import aws, bootstrap
 from .config import OrchestratorConfig
+from .profile import RunProfile
 
 # seg1's trainer must not self-stop before we kill it — give it a huge budget.
 _SEG1_TRAINER_BUDGET = 24 * 3600
@@ -66,11 +67,12 @@ def _launch(
     return iid
 
 
-def _stream_until_metrics(cfg: OrchestratorConfig, run_id: str) -> dict | None:
+def _stream_until_metrics(cfg: OrchestratorConfig, run_id: str, profile: RunProfile) -> dict | None:
     """Pull the box's boot log from S3 every ``log_stream_seconds`` and print only
     the new bytes, until ``metrics.json`` appears (trainer writes it last => done)
     or ``metrics_timeout_seconds`` elapses. Returns the parsed metrics, or None on
-    timeout. The log grows append-only, so tracking the printed length is enough."""
+    timeout. The log grows append-only, so tracking the printed length is enough.
+    Each read is also fed to ``profile`` for per-step loss + first_log timing."""
     logs_key = cfg.run_logs_key(run_id)
     metrics_key = cfg.run_metrics_key(run_id)
     printed = 0
@@ -82,7 +84,10 @@ def _stream_until_metrics(cfg: OrchestratorConfig, run_id: str) -> dict | None:
         nonlocal printed
         if aws.object_exists(cfg.bucket, logs_key):
             text = aws.get_text(cfg.bucket, logs_key)
+            profile.ingest_log(text)  # parse per-step loss (dedup handles re-reads)
             if len(text) > printed:
+                if printed == 0:
+                    profile.mark("first_log")  # first bytes = boot/provision done
                 sys.stdout.write(text[printed:])
                 sys.stdout.flush()
                 printed = len(text)
@@ -124,12 +129,20 @@ def run_baseline(cfg: OrchestratorConfig) -> dict | None:
     ami, sg_id = _prepare(cfg)
     run_id = _run_id("baseline")
     print(f"[baseline] run_id={run_id} budget={cfg.baseline_seconds}s", file=sys.stderr)
+    # Collect a run profile (timeline + loss) and mirror to W&B if configured.
+    profile = RunProfile(run_id, kind="baseline", market="on-demand")
+    profile.wandb_start(cfg)
     iid = _launch(cfg, ami, sg_id, run_id, "on-demand", cfg.baseline_seconds)
+    profile.mark("launch")
     try:
         if aws.is_dry_run():
             print("[baseline] dry-run: skipping stream/terminate", file=sys.stderr)
             return None
-        metrics = _stream_until_metrics(cfg, run_id)
+        metrics = _stream_until_metrics(cfg, run_id, profile)
+        profile.mark("metrics" if metrics is not None else "timeout")
+        profile.from_metrics(metrics)
+        profile.finalize(cfg)  # write profile.json to S3 + finish the W&B run
+        print(f"[baseline] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
         if metrics is not None:
             print(f"\n[baseline] metrics: {json.dumps(metrics, indent=2)}")
         return metrics

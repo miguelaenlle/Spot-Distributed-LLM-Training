@@ -78,6 +78,11 @@ class OrchestratorConfig:
     # lines. Smaller than the metrics poll — this drives the live view latency.
     log_stream_seconds: int = field(default_factory=lambda: _env_int("LOG_STREAM_SECONDS", 3))
 
+    # --- visualization (optional, Weights & Biases) -------------------------
+    # Logging happens on the ORCHESTRATOR only; spot boxes never see the key.
+    wandb_project: str = field(default_factory=lambda: _env("WANDB_PROJECT", "spot-train"))
+    wandb_entity: str = field(default_factory=lambda: _env("WANDB_ENTITY", ""))
+
     # -- derived S3 locations ------------------------------------------------ #
     def data_uri(self) -> str:
         return f"s3://{self.bucket}/{self.data_prefix}/{self.dataset}/"
@@ -98,6 +103,21 @@ class OrchestratorConfig:
 
     def run_logs_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/logs/boot.log"
+
+    # The tool-agnostic run profile (timeline + loss + merged metrics) the
+    # orchestrator writes at end of run. W&B is just a mirror of this.
+    def run_profile_uri(self, run_id: str) -> str:
+        return f"s3://{self.bucket}/{self.run_prefix}/{run_id}/profile.json"
+
+    def run_profile_key(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/profile.json"
+
+    def wandb_enabled(self) -> bool:
+        """W&B mirror is on iff an API key is present (loaded from .env) and not
+        explicitly disabled. Absent key => S3 profile.json only, no third party."""
+        if os.environ.get("WANDB_DISABLED", "") in ("1", "true", "True"):
+            return False
+        return bool(os.environ.get("WANDB_API_KEY"))
 
     def require_bucket(self) -> None:
         if not self.bucket:
