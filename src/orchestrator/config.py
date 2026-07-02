@@ -34,7 +34,7 @@ class OrchestratorConfig:
     ami_name_filter: str = field(
         default_factory=lambda: _env(
             "AMI_NAME_FILTER",
-            "Deep Learning OSS Nvidia Driver AMI GPU PyTorch*Ubuntu 22.04*",
+            "Deep Learning OSS Nvidia Driver AMI GPU PyTorch*Ubuntu*",
         )
     )
 
