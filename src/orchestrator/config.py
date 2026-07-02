@@ -74,6 +74,9 @@ class OrchestratorConfig:
     # --- polling -------------------------------------------------------------
     metrics_poll_seconds: int = 15
     metrics_timeout_seconds: int = field(default_factory=lambda: _env_int("METRICS_TIMEOUT", 1800))
+    # How often the orchestrator pulls the box's boot log from S3 to print new
+    # lines. Smaller than the metrics poll — this drives the live view latency.
+    log_stream_seconds: int = field(default_factory=lambda: _env_int("LOG_STREAM_SECONDS", 3))
 
     # -- derived S3 locations ------------------------------------------------ #
     def data_uri(self) -> str:
@@ -87,6 +90,14 @@ class OrchestratorConfig:
 
     def run_metrics_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/metrics.json"
+
+    # The box's boot/training log, synced here every few seconds so the
+    # orchestrator can stream it back without SSH.
+    def run_logs_uri(self, run_id: str) -> str:
+        return f"s3://{self.bucket}/{self.run_prefix}/{run_id}/logs/boot.log"
+
+    def run_logs_key(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/logs/boot.log"
 
     def require_bucket(self) -> None:
         if not self.bucket:

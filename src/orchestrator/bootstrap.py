@@ -121,25 +121,64 @@ def build_user_data(
     market: str,
     max_seconds: int,
 ) -> str:
-    """Full run (PARKED while we validate provisioning): provision, train under
-    the wall-clock budget, then self-terminate on success
-    (InstanceInitiatedShutdownBehavior=terminate). On failure the box stays up
-    for debugging; the orchestrator reaps it on the metrics timeout."""
+    """Full run: provision, then train under the wall-clock budget while syncing
+    the boot log to S3 every ``log_stream_seconds`` so the orchestrator can stream
+    it live without SSH. On success the box self-terminates as a cost backstop (the
+    orchestrator also terminates it once it sees metrics.json). On failure the box
+    stays up for debugging; the orchestrator reaps it on the metrics timeout."""
     env = _trainer_env(cfg, run_id=run_id, market=market, max_seconds=max_seconds)
     steps = _provision_steps(cfg, _export_block(env))
+    bucket = cfg.bucket
+    logs_key = cfg.run_logs_key(run_id)
+    interval = cfg.log_stream_seconds
     return f"""#!/bin/bash
 set -x
 exec > /var/log/spot-train-boot.log 2>&1
+chmod 644 /var/log/spot-train-boot.log   # let the ubuntu log-uploader read it
 
 sudo -u ubuntu -i bash <<'BOOT'
 {steps}
+
+# Explicitly activate the DLAMI PyTorch venv — don't rely on login-shell
+# auto-activation (see memory: dlami-source-activate).
+source /opt/pytorch/bin/activate 2>/dev/null || source activate pytorch 2>/dev/null || true
+
+# From here we manage exit codes by hand (final log flush + teardown), so drop -e.
+set +e
+
+# Background uploader: sync the boot log to S3 every {interval}s so the orchestrator
+# can stream it. Uses the instance-profile role via IMDS (no creds in user-data).
+python - <<'PY' &
+import time, boto3
+c = boto3.client("s3")
+while True:
+    try:
+        c.upload_file("/var/log/spot-train-boot.log", "{bucket}", "{logs_key}")
+    except Exception:
+        pass
+    time.sleep({interval})
+PY
+UPLOADER_PID=$!
+
 python -u -m spot_train.train
+RC=$?
+
+# Stop the uploader and push one final copy so the tail of the run is in S3.
+kill "$UPLOADER_PID" 2>/dev/null || true
+python - <<'PY'
+import boto3
+try:
+    boto3.client("s3").upload_file("/var/log/spot-train-boot.log", "{bucket}", "{logs_key}")
+except Exception:
+    pass
+PY
+exit "$RC"
 BOOT
 RC=$?
 
 if [ "$RC" -eq 0 ]; then
-  shutdown -h now
+  shutdown -h now   # cost backstop; orchestrator also terminates on metrics.json
 else
-  echo "training exited $RC — leaving instance up for debugging; orchestrator will reap on timeout"
+  echo "training exited $RC — leaving instance up for debugging; orchestrator reaps on timeout"
 fi
 """

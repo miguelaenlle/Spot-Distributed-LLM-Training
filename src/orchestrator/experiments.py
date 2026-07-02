@@ -43,12 +43,10 @@ def _poll_metrics(cfg: OrchestratorConfig, run_id: str) -> dict:
 def _launch(
     cfg: OrchestratorConfig, ami: str, sg_id: str, run_id: str, market: str, budget: int
 ) -> str:
-    # Provisioning mode: clone the repo + nanoGPT submodule and install deps, then
-    # LEAVE THE BOX UP — no training, no shutdown. You ssh in, verify the code is
-    # there, and run training by hand. Flip to build_user_data for the full run.
-    ud = bootstrap.build_provisioning_user_data(
-        cfg, run_id=run_id, market=market, max_seconds=budget
-    )
+    # Run mode: provision, then train under the wall-clock budget while the box
+    # syncs its boot log to S3 — so we can stream it here without SSH (see
+    # bootstrap.build_user_data and _stream_until_metrics).
+    ud = bootstrap.build_user_data(cfg, run_id=run_id, market=market, max_seconds=budget)
     iid = aws.launch(
         ami_id=ami,
         instance_type=cfg.instance_type,
@@ -60,24 +58,42 @@ def _launch(
         key_name=cfg.key_name,
     )
     aws.wait_running(iid)
-    ip = aws.public_ip(iid) or "<no-public-ip>"
-    user = "ubuntu"  # DLAMI (Ubuntu) default login; use "ec2-user" for AL2023
-    key = cfg.key_name or "<SSH_KEY_NAME unset!>"
     print(
-        f"[launch] instance {iid} ({market}) — provisioning (clone + deps, no training).\n"
-        f"    ssh {user}@{ip}   # key pair: {key}\n"
-        f"    # watch it provision:  sudo tail -f /var/log/spot-train-boot.log\n"
-        f"    # when done:  cd ~/app && source ~/spot-train.env && python -m spot_train.train",
+        f"[launch] instance {iid} ({market}) — training; streaming its log below "
+        f"(boot + clone take ~1-2 min before the first lines appear).",
         file=sys.stderr,
     )
-    # --- ORIGINAL (training mode) — restore when done SSH-testing ---
-    # print(
-    #     f"[launch] instance {iid} ({market}). Watch training live (no inbound):\n"
-    #     f"    aws ssm start-session --target {iid} --region {cfg.region}\n"
-    #     f"    # then on the box:  sudo tail -f /var/log/spot-train-boot.log   (or: nvidia-smi)",
-    #     file=sys.stderr,
-    # )
     return iid
+
+
+def _stream_until_metrics(cfg: OrchestratorConfig, run_id: str) -> dict | None:
+    """Pull the box's boot log from S3 every ``log_stream_seconds`` and print only
+    the new bytes, until ``metrics.json`` appears (trainer writes it last => done)
+    or ``metrics_timeout_seconds`` elapses. Returns the parsed metrics, or None on
+    timeout. The log grows append-only, so tracking the printed length is enough."""
+    logs_key = cfg.run_logs_key(run_id)
+    metrics_key = cfg.run_metrics_key(run_id)
+    printed = 0
+    deadline = time.monotonic() + cfg.metrics_timeout_seconds
+
+    def flush_log() -> None:
+        nonlocal printed
+        if aws.object_exists(cfg.bucket, logs_key):
+            text = aws.get_text(cfg.bucket, logs_key)
+            if len(text) > printed:
+                sys.stdout.write(text[printed:])
+                sys.stdout.flush()
+                printed = len(text)
+
+    while True:
+        flush_log()
+        if aws.object_exists(cfg.bucket, metrics_key):
+            flush_log()  # capture the tail written just before metrics.json
+            return json.loads(aws.get_text(cfg.bucket, metrics_key))
+        if time.monotonic() > deadline:
+            print("\n[baseline] timeout waiting for metrics.json", file=sys.stderr)
+            return None
+        time.sleep(cfg.log_stream_seconds)
 
 
 def _prepare(cfg: OrchestratorConfig) -> tuple[str, str]:
@@ -99,26 +115,17 @@ def run_baseline(cfg: OrchestratorConfig) -> dict | None:
     run_id = _run_id("baseline")
     print(f"[baseline] run_id={run_id} budget={cfg.baseline_seconds}s", file=sys.stderr)
     iid = _launch(cfg, ami, sg_id, run_id, "on-demand", cfg.baseline_seconds)
-    # SSH-verification mode: the box runs nothing, so there's no metrics.json to
-    # poll for. Leave it RUNNING so you can ssh in and confirm access, and DON'T
-    # terminate it here — you tear it down yourself when finished:
-    #     aws ec2 terminate-instances --instance-ids {iid} --region <region>
-    print(
-        f"[baseline] left instance {iid} running for SSH test — "
-        f"terminate it yourself when done.",
-        file=sys.stderr,
-    )
-    return None
-    # --- ORIGINAL (training mode) — restore when done SSH-testing ---
-    # try:
-    #     if aws.is_dry_run():
-    #         print("[baseline] dry-run: skipping metrics poll", file=sys.stderr)
-    #         return None
-    #     metrics = _poll_metrics(cfg, run_id)
-    #     print(f"[baseline] metrics: {json.dumps(metrics, indent=2)}")
-    #     return metrics
-    # finally:
-    #     aws.terminate(iid)
+    try:
+        if aws.is_dry_run():
+            print("[baseline] dry-run: skipping stream/terminate", file=sys.stderr)
+            return None
+        metrics = _stream_until_metrics(cfg, run_id)
+        if metrics is not None:
+            print(f"\n[baseline] metrics: {json.dumps(metrics, indent=2)}")
+        return metrics
+    finally:
+        # Destroy the box when training finishes (also on timeout or Ctrl-C).
+        aws.terminate(iid)
 
 
 def run_spot(cfg: OrchestratorConfig) -> dict | None:
