@@ -51,18 +51,29 @@ def test_ingest_ignores_partial_tail():
     assert [s.step for s in p.samples] == [40]
 
 
-def test_durations_baseline():
+# Baseline phase boundaries: launch=1000, first step observed at 1090 (provision
+# 90), last step at 1150 (training 60 == the budget), metrics at 1165 (final_saves
+# 15 = eval + checkpoint + metrics write).
+def _baseline_profile() -> RunProfile:
     p = RunProfile("baseline-1", "baseline", "on-demand")
-    p.events = [
-        Event("launch", 1000.0, 1),
-        Event("first_log", 1090.0, 1),
-        Event("metrics", 1390.0, 1),
-    ]
-    d = p.durations()
-    assert d == {"provision_s": 90.0, "train_s": 300.0, "total_s": 390.0}
+    p.events = [Event("launch", 1000.0, 1), Event("metrics", 1165.0, 1)]
+    p._first_sample_wall = 1090.0
+    p._last_sample_wall = 1150.0
+    return p
+
+
+def test_durations_baseline():
+    d = _baseline_profile().durations()
+    assert d == {
+        "provisioning_s": 90.0,
+        "training_s": 60.0,  # == max_seconds, NOT boot+clone+eval
+        "final_saves_s": 15.0,
+        "total_s": 165.0,
+    }
 
 
 def test_to_dict_timeout_path():
+    # No per-step samples (died before/at first step) => whole span is provisioning.
     p = RunProfile("baseline-1", "baseline", "on-demand")
     p.events = [
         Event("launch", 1000.0, 1),
@@ -72,19 +83,16 @@ def test_to_dict_timeout_path():
     p.from_metrics(None)
     d = p.to_dict()
     assert d["metrics"] is None
-    assert d["durations"] == {"provision_s": 50.0, "train_s": 150.0, "total_s": 200.0}
+    assert d["durations"] == {"provisioning_s": 200.0, "total_s": 200.0}
     assert d["events"][0]["t_rel"] == 0.0
     assert d["events"][-1]["t_rel"] == 200.0
 
 
 def test_write_local(tmp_path):
-    p = RunProfile("baseline-1", "baseline", "on-demand")
-    p.ingest_log(LOG)
-    p.events = [
-        Event("launch", 1000.0, 1),
-        Event("first_log", 1090.0, 1),
-        Event("metrics", 1390.0, 1),
-    ]
+    p = _baseline_profile()
+    p.ingest_log(LOG)  # 2 loss samples (walls overwritten by _baseline_profile setup)
+    p._first_sample_wall = 1090.0
+    p._last_sample_wall = 1150.0
     p.from_metrics({"train_loss": 1.2, "val_loss": 1.3, "steps": 20})
     out = tmp_path / "profile.json"
     cfg = types.SimpleNamespace(run_profile_uri=lambda rid: str(out))
@@ -93,25 +101,20 @@ def test_write_local(tmp_path):
     assert data["run_id"] == "baseline-1"
     assert data["metrics"]["train_loss"] == 1.2
     assert len(data["loss_samples"]) == 2
-    assert data["durations"]["train_s"] == 300.0
+    assert data["durations"]["training_s"] == 60.0
 
 
 def test_table_rows():
-    p = RunProfile("baseline-1", "baseline", "on-demand")
-    p.events = [
-        Event("launch", 1000.0, 1),
-        Event("first_log", 1090.0, 1),
-        Event("metrics", 1390.0, 1),
-    ]
+    p = _baseline_profile()
     assert p.duration_rows() == [
-        ["provision_s", 90.0],
-        ["train_s", 300.0],
-        ["total_s", 390.0],
+        ["provisioning_s", 90.0],
+        ["training_s", 60.0],
+        ["final_saves_s", 15.0],
+        ["total_s", 165.0],
     ]
     assert p.timeline_rows() == [
         ["launch", 1, 0.0, 1000.0],
-        ["first_log", 1, 90.0, 1090.0],
-        ["metrics", 1, 390.0, 1390.0],
+        ["metrics", 1, 165.0, 1165.0],
     ]
 
 
@@ -122,43 +125,25 @@ def test_table_rows_empty():
 
 
 def test_segments_baseline():
-    p = RunProfile("baseline-1", "baseline", "on-demand")
-    p.events = [
-        Event("launch", 1000.0, 1),
-        Event("first_log", 1090.0, 1),
-        Event("metrics", 1390.0, 1),
-    ]
+    p = _baseline_profile()
     assert p.segments() == [
         {"phase": "provisioning", "seconds": 90.0},
-        {"phase": "training", "seconds": 300.0},
+        {"phase": "training", "seconds": 60.0},
+        {"phase": "final_saves", "seconds": 15.0},
     ]
     # stacked-bar rows carry the running start offset
     assert p.segment_rows() == [
         ["provisioning", 90.0, 0.0],
-        ["training", 300.0, 90.0],
+        ["training", 60.0, 90.0],
+        ["final_saves", 15.0, 150.0],
     ]
 
 
-def test_segments_spot_sequence():
-    # Simulate the future spot kill/resume event stream; the phase mapping should
-    # yield the full ordered timeline the stacked bar needs.
-    p = RunProfile("spot-1", "spot", "spot")
-    p.events = [
-        Event("launch", 0.0, 1),
-        Event("first_log", 90.0, 1),  # provisioning 90
-        Event("kill", 240.0, 1),  # training 150
-        Event("relaunch", 250.0, 2),  # downtime 10
-        Event("first_log", 300.0, 2),  # preemption_recovery 50
-        Event("metrics", 500.0, 2),  # training 200
-    ]
-    assert [s["phase"] for s in p.segments()] == [
-        "provisioning",
-        "training",
-        "downtime",
-        "preemption_recovery",
-        "training",
-    ]
-    assert [s["seconds"] for s in p.segments()] == [90.0, 150.0, 10.0, 50.0, 200.0]
+def test_segments_no_samples_is_provisioning():
+    # A run that never reached the first training step reads as all provisioning.
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    p.events = [Event("launch", 1000.0, 1), Event("timeout", 1120.0, 1)]
+    assert p.segments() == [{"phase": "provisioning", "seconds": 120.0}]
 
 
 def test_wandb_disabled_is_noop():

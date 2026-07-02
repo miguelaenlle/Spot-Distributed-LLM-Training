@@ -21,18 +21,19 @@ from dataclasses import dataclass, field
 #   "step 20: loss 2.9876, 80ms/step, 15300 tok/s"
 _STEP_RE = re.compile(r"step\s+(\d+):\s+loss\s+([0-9.]+),\s+(\d+)ms/step,\s+(\d+)\s+tok/s")
 
-# The timeline is a sequence of phases derived from consecutive events. Each
-# (from_event, to_event) pair maps to a named phase; the segment's width is the
-# time between them. Baseline yields provisioning + training; spot will add the
-# downtime / preemption_recovery / second training phases once run_spot marks
-# kill/relaunch (final_saves needs a future "final_save" event marker).
-_PHASE_FOR: dict[tuple[str, str], str] = {
-    ("launch", "first_log"): "provisioning",
-    ("first_log", "metrics"): "training",
-    ("first_log", "timeout"): "training",
-    ("first_log", "kill"): "training",  # spot: trained until preemption
-    ("kill", "relaunch"): "downtime",  # spot: no compute while we launch a replacement
-    ("relaunch", "first_log"): "preemption_recovery",  # spot: reboot + restore checkpoint
+# The timeline is a sequence of phases running between ordered milestones. Crucially
+# train_start / train_end come from the FIRST / LAST per-step line actually observed
+# (not "first log byte"), so the training phase reflects the loop (~max_seconds) and
+# the boot/clone/pip/dataset work lands in provisioning while eval+checkpoint+metrics
+# land in final_saves. Each consecutive milestone pair maps to a named phase.
+_SEGMENT_LABEL: dict[tuple[str, str], str] = {
+    ("launch", "train_start"): "provisioning",
+    ("train_start", "train_end"): "training",
+    ("train_end", "end"): "final_saves",
+    # degenerate paths (kept so a partial run still yields a sane bar):
+    ("launch", "end"): "provisioning",  # never reached the first training step
+    ("launch", "train_end"): "provisioning",  # exactly one step observed
+    ("train_start", "end"): "training",  # metrics immediately after the last step
 }
 
 # Stable colors per phase (used by the stacked timeline bar).
@@ -77,6 +78,9 @@ class RunProfile:
     _seen: set[tuple[int, int]] = field(default_factory=set)  # (segment, step) dedup
     _wb: object | None = field(default=None, repr=False)  # wandb run handle or None
     _wb_step: int = 0  # monotonic step for W&B (survives spot step-number resets)
+    # Wall-clock of the first/last per-step line observed => training-phase bounds.
+    _first_sample_wall: float | None = None
+    _last_sample_wall: float | None = None
 
     # -- timeline ---------------------------------------------------------- #
     def mark(self, event: str) -> None:
@@ -96,6 +100,10 @@ class RunProfile:
             self._seen.add(key)
             s = Sample(step, float(m.group(2)), int(m.group(3)), int(m.group(4)))
             self.samples.append(s)
+            now = time.time()  # observation time bounds the training phase
+            if self._first_sample_wall is None:
+                self._first_sample_wall = now
+            self._last_sample_wall = now
             self._wb_log_step(s)
 
     def from_metrics(self, metrics: dict | None) -> None:
@@ -108,21 +116,35 @@ class RunProfile:
                 return e.t_wall
         return None
 
-    def durations(self) -> dict:
-        """Phase durations (seconds, 2dp) derived from events. Robust to missing
-        events (timeout path). End = metrics if present, else the last event."""
+    def _milestones(self) -> list[tuple[str, float]]:
+        """Ordered (name, t_wall) phase boundaries. train_start/train_end are the
+        first/last per-step line observed, so training reflects the loop — not the
+        boot/clone/pip before it or the eval/checkpoint/metrics after it."""
+        pts: list[tuple[str, float]] = []
         launch = self._t("launch")
-        first_log = self._t("first_log")
+        if launch is not None:
+            pts.append(("launch", launch))
+        if self._first_sample_wall is not None:
+            pts.append(("train_start", self._first_sample_wall))
+        if self._last_sample_wall is not None:
+            pts.append(("train_end", self._last_sample_wall))
         end = self._t("metrics") or self._t("timeout")
         if end is None and self.events:
             end = self.events[-1].t_wall
+        if end is not None:
+            pts.append(("end", end))
+        pts.sort(key=lambda p: p[1])
+        return pts
+
+    def durations(self) -> dict:
+        """Phase durations (seconds, 2dp), summed per phase, plus total_s."""
         out: dict[str, float] = {}
-        if launch is not None and first_log is not None:
-            out["provision_s"] = round(first_log - launch, 2)
-        if first_log is not None and end is not None:
-            out["train_s"] = round(end - first_log, 2)
-        if self.events and end is not None:
-            out["total_s"] = round(end - self.events[0].t_wall, 2)
+        for s in self.segments():
+            key = f"{s['phase']}_s"
+            out[key] = round(out.get(key, 0.0) + s["seconds"], 2)
+        pts = self._milestones()
+        if len(pts) >= 2:
+            out["total_s"] = round(pts[-1][1] - pts[0][1], 2)
         return out
 
     def to_dict(self) -> dict:
@@ -199,15 +221,17 @@ class RunProfile:
 
     # -- phase segments (ordered, non-overlapping; sum ~= total_s) --------- #
     def segments(self) -> list[dict]:
-        """The timeline as an ordered list of phases derived from consecutive
-        events: [{"phase", "seconds"}]. Baseline => provisioning + training; spot
-        adds downtime / preemption_recovery / a second training once wired."""
+        """The timeline as an ordered list of phases between consecutive
+        milestones: [{"phase", "seconds"}]. Baseline => provisioning / training /
+        final_saves. (Spot's downtime / preemption_recovery / second training land
+        here once run_spot inserts kill/relaunch milestones.)"""
         out: list[dict] = []
-        for a, b in zip(self.events, self.events[1:], strict=False):
-            phase = _PHASE_FOR.get((a.event, b.event))
+        pts = self._milestones()
+        for (na, ta), (nb, tb) in zip(pts, pts[1:], strict=False):
+            phase = _SEGMENT_LABEL.get((na, nb))
             if phase is None:
                 continue
-            out.append({"phase": phase, "seconds": round(b.t_wall - a.t_wall, 2)})
+            out.append({"phase": phase, "seconds": round(tb - ta, 2)})
         return out
 
     # -- table row builders (pure; unit-testable without wandb) ------------ #
@@ -233,54 +257,8 @@ class RunProfile:
         ]
 
     def render_timeline_png(self, path: str) -> bool:
-        """Render the phases as a single horizontal STACKED bar (one segment per
-        phase, width = seconds, colored by phase) to ``path``. Returns False if
-        matplotlib isn't installed or there are no segments. Structured to extend
-        to a multi-node Gantt later (one row per node)."""
-        segs = self.segments()
-        if not segs:
-            return False
-        try:
-            import matplotlib
-
-            matplotlib.use("Agg")  # headless
-            import matplotlib.pyplot as plt
-        except ImportError:
-            return False
-
-        fig, ax = plt.subplots(figsize=(9, 1.9))
-        left = 0.0
-        seen: set[str] = set()
-        for s in segs:
-            color = _PHASE_COLORS.get(s["phase"], "#777777")
-            label = None if s["phase"] in seen else s["phase"]
-            seen.add(s["phase"])
-            ax.barh(0, s["seconds"], left=left, color=color, edgecolor="white", label=label)
-            if s["seconds"] > 0:
-                ax.text(
-                    left + s["seconds"] / 2,
-                    0,
-                    f"{s['seconds']:.0f}s",
-                    ha="center",
-                    va="center",
-                    color="white",
-                    fontsize=8,
-                )
-            left += s["seconds"]
-        ax.set_yticks([])
-        ax.set_xlabel("seconds")
-        ax.set_title(f"Run timeline — {self.run_id}")
-        ax.legend(
-            ncol=len(seen),
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.35),
-            frameon=False,
-            fontsize=8,
-        )
-        fig.tight_layout()
-        fig.savefig(path, dpi=120, bbox_inches="tight")
-        plt.close(fig)
-        return True
+        """Render this run's phases as a stacked timeline bar to ``path``."""
+        return render_segments_png(f"Run timeline — {self.run_id}", self.segments(), path)
 
     def _wb_finish(self) -> None:
         if self._wb is None:
@@ -313,3 +291,56 @@ class RunProfile:
             log["profile/timeline_bar"] = wandb.Image(png)
         self._wb.log(log)
         self._wb.finish()
+
+
+# --------------------------------------------------------------------------- #
+# Rendering (module-level so it can preview arbitrary phase sequences — a single
+# run now, a multi-node Gantt later)
+# --------------------------------------------------------------------------- #
+def render_segments_png(title: str, segments: list[dict], path: str) -> bool:
+    """Render an ordered list of ``{"phase", "seconds"}`` as one horizontal
+    STACKED bar (segment width = seconds, colored per phase) to ``path``. Returns
+    False if matplotlib is absent or there are no segments."""
+    if not segments:
+        return False
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")  # headless
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return False
+
+    fig, ax = plt.subplots(figsize=(9, 2.2))
+    left = 0.0
+    seen: set[str] = set()
+    for s in segments:
+        color = _PHASE_COLORS.get(s["phase"], "#777777")
+        label = None if s["phase"] in seen else s["phase"]
+        seen.add(s["phase"])
+        ax.barh(0, s["seconds"], left=left, color=color, edgecolor="white", label=label)
+        if s["seconds"] > 0:
+            ax.text(
+                left + s["seconds"] / 2,
+                0,
+                f"{s['seconds']:.0f}s",
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=8,
+            )
+        left += s["seconds"]
+    ax.set_yticks([])
+    ax.set_xlabel("seconds")
+    ax.set_title(title)
+    ax.legend(
+        ncol=max(1, len(seen)),
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.55),  # below the x-axis label so they don't overlap
+        frameon=False,
+        fontsize=8,
+    )
+    fig.tight_layout()
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return True
