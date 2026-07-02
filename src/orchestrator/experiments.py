@@ -43,7 +43,12 @@ def _poll_metrics(cfg: OrchestratorConfig, run_id: str) -> dict:
 def _launch(
     cfg: OrchestratorConfig, ami: str, sg_id: str, run_id: str, market: str, budget: int
 ) -> str:
-    ud = bootstrap.build_user_data(cfg, run_id=run_id, market=market, max_seconds=budget)
+    # Provisioning mode: clone the repo + nanoGPT submodule and install deps, then
+    # LEAVE THE BOX UP — no training, no shutdown. You ssh in, verify the code is
+    # there, and run training by hand. Flip to build_user_data for the full run.
+    ud = bootstrap.build_provisioning_user_data(
+        cfg, run_id=run_id, market=market, max_seconds=budget
+    )
     iid = aws.launch(
         ami_id=ami,
         instance_type=cfg.instance_type,
@@ -52,14 +57,26 @@ def _launch(
         user_data=ud,
         market=market,
         run_id=run_id,
+        key_name=cfg.key_name,
     )
     aws.wait_running(iid)
+    ip = aws.public_ip(iid) or "<no-public-ip>"
+    user = "ubuntu"  # DLAMI (Ubuntu) default login; use "ec2-user" for AL2023
+    key = cfg.key_name or "<SSH_KEY_NAME unset!>"
     print(
-        f"[launch] instance {iid} ({market}). Watch training live (no inbound):\n"
-        f"    aws ssm start-session --target {iid} --region {cfg.region}\n"
-        f"    # then on the box:  sudo tail -f /var/log/spot-train-boot.log   (or: nvidia-smi)",
+        f"[launch] instance {iid} ({market}) — provisioning (clone + deps, no training).\n"
+        f"    ssh {user}@{ip}   # key pair: {key}\n"
+        f"    # watch it provision:  sudo tail -f /var/log/spot-train-boot.log\n"
+        f"    # when done:  cd ~/app && source ~/spot-train.env && python -m spot_train.train",
         file=sys.stderr,
     )
+    # --- ORIGINAL (training mode) — restore when done SSH-testing ---
+    # print(
+    #     f"[launch] instance {iid} ({market}). Watch training live (no inbound):\n"
+    #     f"    aws ssm start-session --target {iid} --region {cfg.region}\n"
+    #     f"    # then on the box:  sudo tail -f /var/log/spot-train-boot.log   (or: nvidia-smi)",
+    #     file=sys.stderr,
+    # )
     return iid
 
 
@@ -82,15 +99,26 @@ def run_baseline(cfg: OrchestratorConfig) -> dict | None:
     run_id = _run_id("baseline")
     print(f"[baseline] run_id={run_id} budget={cfg.baseline_seconds}s", file=sys.stderr)
     iid = _launch(cfg, ami, sg_id, run_id, "on-demand", cfg.baseline_seconds)
-    try:
-        if aws.is_dry_run():
-            print("[baseline] dry-run: skipping metrics poll", file=sys.stderr)
-            return None
-        metrics = _poll_metrics(cfg, run_id)
-        print(f"[baseline] metrics: {json.dumps(metrics, indent=2)}")
-        return metrics
-    finally:
-        aws.terminate(iid)
+    # SSH-verification mode: the box runs nothing, so there's no metrics.json to
+    # poll for. Leave it RUNNING so you can ssh in and confirm access, and DON'T
+    # terminate it here — you tear it down yourself when finished:
+    #     aws ec2 terminate-instances --instance-ids {iid} --region <region>
+    print(
+        f"[baseline] left instance {iid} running for SSH test — "
+        f"terminate it yourself when done.",
+        file=sys.stderr,
+    )
+    return None
+    # --- ORIGINAL (training mode) — restore when done SSH-testing ---
+    # try:
+    #     if aws.is_dry_run():
+    #         print("[baseline] dry-run: skipping metrics poll", file=sys.stderr)
+    #         return None
+    #     metrics = _poll_metrics(cfg, run_id)
+    #     print(f"[baseline] metrics: {json.dumps(metrics, indent=2)}")
+    #     return metrics
+    # finally:
+    #     aws.terminate(iid)
 
 
 def run_spot(cfg: OrchestratorConfig) -> dict | None:

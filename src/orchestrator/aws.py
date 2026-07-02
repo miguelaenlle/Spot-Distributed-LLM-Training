@@ -116,6 +116,15 @@ def instance_state(instance_id: str) -> str:
     return r["Reservations"][0]["Instances"][0]["State"]["Name"]
 
 
+def public_ip(instance_id: str) -> str:
+    """Public IPv4 of the instance, or "" if it has none. (SSH-verification mode.)"""
+    if _DRY_RUN:
+        _log(f"describe {instance_id} (public ip)")
+        return "203.0.113.10"
+    r = _client("ec2").describe_instances(InstanceIds=[instance_id])
+    return r["Reservations"][0]["Instances"][0].get("PublicIpAddress", "")
+
+
 # --------------------------------------------------------------------------- #
 # Mutating: S3
 # --------------------------------------------------------------------------- #
@@ -177,7 +186,10 @@ def ensure_instance_profile(role_name: str, profile_name: str, bucket: str) -> N
         "Statement": [
             {
                 "Effect": "Allow",
-                "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+                # DeleteObject is required: the atomic checkpoint writes a .tmp
+                # key, copies it to the final key, then DELETES the .tmp
+                # (s3_store._s3_save). Without it, checkpointing fails AccessDenied.
+                "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
                 "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
             }
         ],
@@ -192,26 +204,59 @@ def ensure_instance_profile(role_name: str, profile_name: str, bucket: str) -> N
         PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
     )
     _ignore_exists(lambda: iam.create_instance_profile(InstanceProfileName=profile_name))
-    _ignore_exists(
-        lambda: iam.add_role_to_instance_profile(
-            InstanceProfileName=profile_name, RoleName=role_name
-        )
-    )
+    # An instance profile holds at most one role; on a re-run the role is already
+    # attached and AddRoleToInstanceProfile raises LimitExceeded. Add only if the
+    # role isn't already in the profile (idempotent).
+    attached = [
+        r["RoleName"]
+        for r in iam.get_instance_profile(InstanceProfileName=profile_name)["InstanceProfile"][
+            "Roles"
+        ]
+    ]
+    if role_name not in attached:
+        iam.add_role_to_instance_profile(InstanceProfileName=profile_name, RoleName=role_name)
 
 
 def ensure_security_group(name: str, region: str) -> str:
-    """Create an egress-only security group (no inbound needed — user-data mode).
-    Returns the group id."""
-    _log(f"ensure security group {name} (egress only) in {region}")
+    """Create the security group and ensure it allows inbound SSH (port 22).
+    Returns the group id.
+
+    SSH-verification mode: the group used to be egress-only (user-data mode needs
+    no inbound). We now open TCP 22 so you can ssh into a bare box. Idempotent —
+    AWS raises InvalidPermission.Duplicate if the rule already exists.
+    """
+    _log(f"ensure security group {name} (inbound SSH :22) in {region}")
     if _DRY_RUN:
         return "sg-DRYRUN"
     ec2 = _client("ec2")
     existing = ec2.describe_security_groups(Filters=[{"Name": "group-name", "Values": [name]}])[
         "SecurityGroups"
     ]
-    if existing:
-        return existing[0]["GroupId"]
-    gid = ec2.create_security_group(GroupName=name, Description="spot-train egress only")["GroupId"]
+    gid = (
+        existing[0]["GroupId"]
+        if existing
+        else ec2.create_security_group(GroupName=name, Description="spot-train (SSH verify)")[
+            "GroupId"
+        ]
+    )
+    try:
+        ec2.authorize_security_group_ingress(
+            GroupId=gid,
+            IpPermissions=[
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 22,
+                    "ToPort": 22,
+                    # TEMP: open to the world for a quick SSH test. Tighten to your
+                    # own IP (e.g. "<your-ip>/32") if the box stays up any length of
+                    # time, and revert this whole block when done verifying.
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH (temp verify)"}],
+                }
+            ],
+        )
+    except Exception as e:  # noqa: BLE001 — boto ClientError; duplicate rule is fine
+        if "InvalidPermission.Duplicate" not in str(e):
+            raise
     return gid
 
 
@@ -227,11 +272,13 @@ def launch(
     user_data: str,
     market: str,
     run_id: str,
+    key_name: str = "",
 ) -> str:
     """Launch one instance (on-demand or spot). Returns the instance id."""
     _log(
         f"RunInstances type={instance_type} market={market} ami={ami_id} "
-        f"run_id={run_id} (auto-terminate on shutdown)"
+        f"run_id={run_id} key={key_name or '<none>'} "
+        f"user-data={'yes' if user_data else 'none'} (public IP + SSH ingress)"
     )
     if _DRY_RUN:
         return "i-DRYRUN"
@@ -241,8 +288,18 @@ def launch(
         "MinCount": 1,
         "MaxCount": 1,
         "IamInstanceProfile": {"Name": profile_name},
-        "SecurityGroupIds": [security_group_id],
-        "UserData": user_data,
+        # SSH-verification mode: give the box a public IP so you can reach it, and
+        # attach the SG via the interface. NOTE: when you pass NetworkInterfaces you
+        # must NOT also set top-level "SecurityGroupIds" — the group goes in here.
+        "NetworkInterfaces": [
+            {
+                "DeviceIndex": 0,
+                "AssociatePublicIpAddress": True,
+                "Groups": [security_group_id],
+            }
+        ],
+        # --- ORIGINAL (SG without public IP) — restore when done SSH-testing ---
+        # "SecurityGroupIds": [security_group_id],
         "InstanceInitiatedShutdownBehavior": "terminate",
         "TagSpecifications": [
             {
@@ -260,6 +317,10 @@ def launch(
             "MarketType": "spot",
             "SpotOptions": {"SpotInstanceType": "one-time"},
         }
+    if key_name:  # SSH-verification mode: attach a key pair so you can ssh in
+        kwargs["KeyName"] = key_name
+    if user_data:  # the boot script (provisioning); empty => bare boot, no user-data
+        kwargs["UserData"] = user_data
     r = _client("ec2").run_instances(**kwargs)
     return r["Instances"][0]["InstanceId"]
 
