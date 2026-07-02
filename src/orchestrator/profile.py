@@ -21,6 +21,29 @@ from dataclasses import dataclass, field
 #   "step 20: loss 2.9876, 80ms/step, 15300 tok/s"
 _STEP_RE = re.compile(r"step\s+(\d+):\s+loss\s+([0-9.]+),\s+(\d+)ms/step,\s+(\d+)\s+tok/s")
 
+# The timeline is a sequence of phases derived from consecutive events. Each
+# (from_event, to_event) pair maps to a named phase; the segment's width is the
+# time between them. Baseline yields provisioning + training; spot will add the
+# downtime / preemption_recovery / second training phases once run_spot marks
+# kill/relaunch (final_saves needs a future "final_save" event marker).
+_PHASE_FOR: dict[tuple[str, str], str] = {
+    ("launch", "first_log"): "provisioning",
+    ("first_log", "metrics"): "training",
+    ("first_log", "timeout"): "training",
+    ("first_log", "kill"): "training",  # spot: trained until preemption
+    ("kill", "relaunch"): "downtime",  # spot: no compute while we launch a replacement
+    ("relaunch", "first_log"): "preemption_recovery",  # spot: reboot + restore checkpoint
+}
+
+# Stable colors per phase (used by the stacked timeline bar).
+_PHASE_COLORS: dict[str, str] = {
+    "provisioning": "#4C78A8",
+    "training": "#54A24B",
+    "downtime": "#9E9E9E",
+    "preemption_recovery": "#F58518",
+    "final_saves": "#B279A2",
+}
+
 
 @dataclass
 class Event:
@@ -174,7 +197,28 @@ class RunProfile:
         )
         self._wb_step += 1
 
+    # -- phase segments (ordered, non-overlapping; sum ~= total_s) --------- #
+    def segments(self) -> list[dict]:
+        """The timeline as an ordered list of phases derived from consecutive
+        events: [{"phase", "seconds"}]. Baseline => provisioning + training; spot
+        adds downtime / preemption_recovery / a second training once wired."""
+        out: list[dict] = []
+        for a, b in zip(self.events, self.events[1:], strict=False):
+            phase = _PHASE_FOR.get((a.event, b.event))
+            if phase is None:
+                continue
+            out.append({"phase": phase, "seconds": round(b.t_wall - a.t_wall, 2)})
+        return out
+
     # -- table row builders (pure; unit-testable without wandb) ------------ #
+    def segment_rows(self) -> list[list]:
+        """Rows for the stacked timeline: [phase, seconds, start_s] in time order."""
+        rows, start = [], 0.0
+        for s in self.segments():
+            rows.append([s["phase"], s["seconds"], round(start, 2)])
+            start += s["seconds"]
+        return rows
+
     def duration_rows(self) -> list[list]:
         """Rows for the durations table/bar chart: [phase, seconds]."""
         return [[k, v] for k, v in self.durations().items()]
@@ -188,9 +232,62 @@ class RunProfile:
             [e.event, e.segment, round(e.t_wall - t0, 2), round(e.t_wall, 3)] for e in self.events
         ]
 
+    def render_timeline_png(self, path: str) -> bool:
+        """Render the phases as a single horizontal STACKED bar (one segment per
+        phase, width = seconds, colored by phase) to ``path``. Returns False if
+        matplotlib isn't installed or there are no segments. Structured to extend
+        to a multi-node Gantt later (one row per node)."""
+        segs = self.segments()
+        if not segs:
+            return False
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")  # headless
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return False
+
+        fig, ax = plt.subplots(figsize=(9, 1.9))
+        left = 0.0
+        seen: set[str] = set()
+        for s in segs:
+            color = _PHASE_COLORS.get(s["phase"], "#777777")
+            label = None if s["phase"] in seen else s["phase"]
+            seen.add(s["phase"])
+            ax.barh(0, s["seconds"], left=left, color=color, edgecolor="white", label=label)
+            if s["seconds"] > 0:
+                ax.text(
+                    left + s["seconds"] / 2,
+                    0,
+                    f"{s['seconds']:.0f}s",
+                    ha="center",
+                    va="center",
+                    color="white",
+                    fontsize=8,
+                )
+            left += s["seconds"]
+        ax.set_yticks([])
+        ax.set_xlabel("seconds")
+        ax.set_title(f"Run timeline — {self.run_id}")
+        ax.legend(
+            ncol=len(seen),
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.35),
+            frameon=False,
+            fontsize=8,
+        )
+        fig.tight_layout()
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        return True
+
     def _wb_finish(self) -> None:
         if self._wb is None:
             return
+        import os
+        import tempfile
+
         import wandb
 
         # Comparable scalar columns in the runs table.
@@ -201,19 +298,18 @@ class RunProfile:
                 if k in self.metrics:
                     self._wb.summary[k] = self.metrics[k]
 
-        # Profiling tables + a durations bar chart, built programmatically (they
-        # render as panels in the run automatically — no UI setup). Use distinct
-        # Table objects: a wandb.Table can only be consumed by one log target.
-        timeline = wandb.Table(
-            columns=["event", "segment", "t_rel_s", "t_wall"], data=self.timeline_rows()
-        )
-        durations = wandb.Table(columns=["phase", "seconds"], data=self.duration_rows())
-        self._wb.log(
-            {
-                "profile/timeline": timeline,
-                "profile/durations": wandb.plot.bar(
-                    durations, "phase", "seconds", title="Run profile (seconds)"
-                ),
-            }
-        )
+        # The timeline as (1) a per-event table and (2) a stacked segment bar image,
+        # both built programmatically — they render as panels with no UI setup.
+        log: dict[str, object] = {
+            "profile/timeline": wandb.Table(
+                columns=["event", "segment", "t_rel_s", "t_wall"], data=self.timeline_rows()
+            ),
+            "profile/segments": wandb.Table(
+                columns=["phase", "seconds", "start_s"], data=self.segment_rows()
+            ),
+        }
+        png = os.path.join(tempfile.gettempdir(), f"{self.run_id}-timeline.png")
+        if self.render_timeline_png(png):
+            log["profile/timeline_bar"] = wandb.Image(png)
+        self._wb.log(log)
         self._wb.finish()

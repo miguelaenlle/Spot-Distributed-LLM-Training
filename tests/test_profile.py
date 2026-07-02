@@ -121,6 +121,46 @@ def test_table_rows_empty():
     assert p.duration_rows() == []
 
 
+def test_segments_baseline():
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    p.events = [
+        Event("launch", 1000.0, 1),
+        Event("first_log", 1090.0, 1),
+        Event("metrics", 1390.0, 1),
+    ]
+    assert p.segments() == [
+        {"phase": "provisioning", "seconds": 90.0},
+        {"phase": "training", "seconds": 300.0},
+    ]
+    # stacked-bar rows carry the running start offset
+    assert p.segment_rows() == [
+        ["provisioning", 90.0, 0.0],
+        ["training", 300.0, 90.0],
+    ]
+
+
+def test_segments_spot_sequence():
+    # Simulate the future spot kill/resume event stream; the phase mapping should
+    # yield the full ordered timeline the stacked bar needs.
+    p = RunProfile("spot-1", "spot", "spot")
+    p.events = [
+        Event("launch", 0.0, 1),
+        Event("first_log", 90.0, 1),  # provisioning 90
+        Event("kill", 240.0, 1),  # training 150
+        Event("relaunch", 250.0, 2),  # downtime 10
+        Event("first_log", 300.0, 2),  # preemption_recovery 50
+        Event("metrics", 500.0, 2),  # training 200
+    ]
+    assert [s["phase"] for s in p.segments()] == [
+        "provisioning",
+        "training",
+        "downtime",
+        "preemption_recovery",
+        "training",
+    ]
+    assert [s["seconds"] for s in p.segments()] == [90.0, 150.0, 10.0, 50.0, 200.0]
+
+
 def test_wandb_disabled_is_noop():
     p = RunProfile("baseline-1", "baseline", "on-demand")
     cfg = types.SimpleNamespace(wandb_enabled=lambda: False)

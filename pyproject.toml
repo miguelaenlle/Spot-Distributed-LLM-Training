@@ -27,6 +27,7 @@ dev = [
 # loss) to Weights & Biases. Not a core dep — runs write S3 profile.json without it.
 viz = [
     "wandb",
+    "matplotlib",  # renders the stacked phase-timeline bar logged to W&B
 ]
 
 [project.scripts]
