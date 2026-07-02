@@ -141,6 +141,9 @@ def train(cfg: TrainConfig) -> dict:
             print(f"[verify] checkpoint at step {step} passed verify + smoke test", file=sys.stderr)
 
     start_time = time.monotonic()
+    # Epoch at loop start: the orchestrator's run profile uses this to split
+    # provisioning (launch -> here: boot+clone+pip+dataset) from training (the loop).
+    train_started_at = time.time()
     last_ckpt = start_time
     last_log_time = start_time
     last_log_step = start_step
@@ -182,13 +185,21 @@ def train(cfg: TrainConfig) -> dict:
             reason = "time_budget"
             break
 
-    # Final checkpoint so no tail work is lost, then evaluate + report.
+    # Training loop is done — stamp its wall-clock, then save + evaluate (each timed
+    # separately so the run profile shows the real breakdown, not "eval as saves").
+    train_s = round(time.monotonic() - start_time, 2)
+
+    save_t0 = time.monotonic()
     ckpt_count += 1
     do_checkpoint(step, ckpt_count)
     listener.stop()
+    save_s = round(time.monotonic() - save_t0, 2)
 
     final_step = step
+    eval_t0 = time.monotonic()
     losses = estimate_loss(model, loader, cfg.eval_iters)
+    eval_s = round(time.monotonic() - eval_t0, 2)
+
     metrics = {
         "run_id": cfg.run_id,
         "market": cfg.market,
@@ -198,6 +209,10 @@ def train(cfg: TrainConfig) -> dict:
         "train_loss": losses["train"],
         "val_loss": losses["val"],
         "wallclock_s": round(time.monotonic() - start_time, 2),
+        # Exact per-phase wall-clock for the run-profile timeline. train_started_at
+        # (epoch) lets the orchestrator derive provisioning = train_started_at - launch.
+        "train_started_at": round(train_started_at, 3),
+        "phases": {"train_s": train_s, "save_s": save_s, "eval_s": eval_s},
         "stop_reason": reason,
         "device": cfg.device,
         "cuda": cuda_ok,

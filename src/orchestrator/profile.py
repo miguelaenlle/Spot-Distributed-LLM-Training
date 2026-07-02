@@ -42,6 +42,7 @@ _PHASE_COLORS: dict[str, str] = {
     "training": "#54A24B",
     "downtime": "#9E9E9E",
     "preemption_recovery": "#F58518",
+    "evaluation": "#72B7B2",
     "final_saves": "#B279A2",
 }
 
@@ -219,13 +220,41 @@ class RunProfile:
         )
         self._wb_step += 1
 
-    # -- phase segments (ordered, non-overlapping; sum ~= total_s) --------- #
+    # -- phase segments (ordered, non-overlapping) ------------------------- #
     def segments(self) -> list[dict]:
-        """The timeline as an ordered list of phases between consecutive
-        milestones: [{"phase", "seconds"}]. Baseline => provisioning / training /
-        final_saves. (Spot's downtime / preemption_recovery / second training land
-        here once run_spot inserts kill/relaunch milestones.)"""
-        out: list[dict] = []
+        """The timeline as an ordered list of phases [{"phase", "seconds"}].
+
+        Prefer the trainer's EXACT wall-clock stamps in metrics.json
+        (train_started_at + phases{train_s,save_s,eval_s}) — these are measured on
+        the box, so training reflects the real loop regardless of step speed. Fall
+        back to the per-step-line milestone proxy when they're absent (timeout, or
+        an older trainer)."""
+        m = self.metrics
+        launch = self._t("launch")
+        if (
+            m
+            and launch is not None
+            and m.get("train_started_at")
+            and isinstance(m.get("phases"), dict)
+        ):
+            ph = m["phases"]
+            out: list[dict] = []
+            prov = round(m["train_started_at"] - launch, 2)
+            if prov > 0:
+                out.append({"phase": "provisioning", "seconds": prov})
+            # order matches the trainer: loop -> final checkpoint -> eval
+            for phase, key in (
+                ("training", "train_s"),
+                ("final_saves", "save_s"),
+                ("evaluation", "eval_s"),
+            ):
+                secs = ph.get(key)
+                if secs:
+                    out.append({"phase": phase, "seconds": round(secs, 2)})
+            return out
+
+        # fallback: derive from the first/last per-step line observed
+        out = []
         pts = self._milestones()
         for (na, ta), (nb, tb) in zip(pts, pts[1:], strict=False):
             phase = _SEGMENT_LABEL.get((na, nb))

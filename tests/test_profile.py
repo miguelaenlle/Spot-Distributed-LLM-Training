@@ -146,6 +146,30 @@ def test_segments_no_samples_is_provisioning():
     assert p.segments() == [{"phase": "provisioning", "seconds": 120.0}]
 
 
+def test_segments_from_trainer_stamps():
+    # Exact wall-clock phases from the trainer take precedence over the per-step
+    # proxy: training reads the real 60s loop, and eval is split from saves.
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    p.events = [Event("launch", 1000.0, 1), Event("metrics", 1170.0, 1)]
+    p.from_metrics(
+        {
+            "train_started_at": 1060.0,  # provisioning = 60
+            "phases": {"train_s": 60.0, "save_s": 2.0, "eval_s": 44.0},
+        }
+    )
+    assert p.segments() == [
+        {"phase": "provisioning", "seconds": 60.0},
+        {"phase": "training", "seconds": 60.0},
+        {"phase": "final_saves", "seconds": 2.0},
+        {"phase": "evaluation", "seconds": 44.0},
+    ]
+    # durations() sums those + total_s from the launch->metrics span
+    d = p.durations()
+    assert d["training_s"] == 60.0
+    assert d["evaluation_s"] == 44.0
+    assert d["total_s"] == 170.0
+
+
 def test_wandb_disabled_is_noop():
     p = RunProfile("baseline-1", "baseline", "on-demand")
     cfg = types.SimpleNamespace(wandb_enabled=lambda: False)
