@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import signal
 import threading
-from typing import Optional
 
 # 169.254.169.254 is the EC2 link-local IMDS address.
 IMDS_TOKEN_URL = "http://169.254.169.254/latest/api/token"
@@ -34,12 +33,12 @@ class InterruptionListener:
     """Sets ``.should_stop`` when a preemption signal is observed."""
 
     def __init__(self, poll_seconds: int = POLL_SECONDS):
-        self._stop = threading.Event()          # tells the poller thread to exit
-        self.should_stop = threading.Event()    # tells the train loop to wind down
+        self._stop = threading.Event()  # tells the poller thread to exit
+        self.should_stop = threading.Event()  # tells the train loop to wind down
         self._poll_seconds = poll_seconds
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
 
-    def start(self) -> "InterruptionListener":
+    def start(self) -> InterruptionListener:
         signal.signal(signal.SIGTERM, self._on_sigterm)
         self._thread = threading.Thread(target=self._poll_imds, daemon=True)
         self._thread.start()
@@ -68,7 +67,5 @@ class InterruptionListener:
                 self.should_stop.set()
                 return
 
-    def _check_spot_action(self) -> Optional[str]:
-        raise NotImplementedError(
-            "Phase 1a step 2 (spot): IMDSv2 token + GET spot/instance-action"
-        )
+    def _check_spot_action(self) -> str | None:
+        raise NotImplementedError("Phase 1a step 2 (spot): IMDSv2 token + GET spot/instance-action")

@@ -72,14 +72,12 @@ def train(cfg: TrainConfig) -> None:
 
         # periodic checkpoint — bounds worst-case lost work to the interval
         if step % cfg.checkpoint_interval == 0:
-            save(model=model, optimizer=optimizer, loader=loader, step=step,
-                 uri=cfg.checkpoint_uri)
+            save(model=model, optimizer=optimizer, loader=loader, step=step, uri=cfg.checkpoint_uri)
 
         # preemption notice -> final checkpoint + clean exit
         if listener.should_stop.is_set():
             print(f"[preempt] signal at step {step}; final checkpoint", file=sys.stderr)
-            save(model=model, optimizer=optimizer, loader=loader, step=step,
-                 uri=cfg.checkpoint_uri)
+            save(model=model, optimizer=optimizer, loader=loader, step=step, uri=cfg.checkpoint_uri)
             listener.stop()
             return
 

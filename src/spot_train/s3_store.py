@@ -16,8 +16,6 @@ old object or the new one — never a partial one).
 from __future__ import annotations
 
 import os
-from typing import Optional
-from urllib.parse import urlparse
 
 CHECKPOINT_PREFIX = "ckpt-"
 _TMP_SUFFIX = ".tmp"
@@ -40,11 +38,12 @@ def _local_save(local_path: str, dest_dir: str, name: str) -> str:
     return final
 
 
-def _local_latest(dest_dir: str) -> Optional[str]:
+def _local_latest(dest_dir: str) -> str | None:
     if not os.path.isdir(dest_dir):
         return None
     cks = sorted(
-        f for f in os.listdir(dest_dir)
+        f
+        for f in os.listdir(dest_dir)
         if f.startswith(CHECKPOINT_PREFIX) and not f.endswith(_TMP_SUFFIX)
     )
     return os.path.join(dest_dir, cks[-1]) if cks else None
@@ -61,7 +60,7 @@ def _s3_save(local_path: str, uri: str, name: str) -> str:
     )
 
 
-def _s3_latest(uri: str) -> Optional[str]:
+def _s3_latest(uri: str) -> str | None:
     raise NotImplementedError("list_objects_v2 under prefix, return max ckpt- key")
 
 
@@ -75,6 +74,6 @@ def save_atomic(local_path: str, uri: str, name: str) -> str:
     return _local_save(local_path, uri, name)
 
 
-def latest(uri: str) -> Optional[str]:
+def latest(uri: str) -> str | None:
     """Return a ref to the newest checkpoint under ``uri``, or None if empty."""
     return _s3_latest(uri) if is_s3(uri) else _local_latest(uri)

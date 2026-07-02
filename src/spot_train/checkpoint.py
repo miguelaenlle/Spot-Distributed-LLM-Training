@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -52,7 +52,7 @@ def save(
     return s3_store.save_atomic(tmp_path, uri, _ckpt_name(step))
 
 
-def load_latest(uri: str, map_location: str = "cpu") -> Optional[dict[str, Any]]:
+def load_latest(uri: str, map_location: str = "cpu") -> dict[str, Any] | None:
     """Return the newest checkpoint blob under ``uri``, or None if none exists."""
     ref = s3_store.latest(uri)
     if ref is None:

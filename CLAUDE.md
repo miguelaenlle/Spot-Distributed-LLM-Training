@@ -141,3 +141,17 @@ The nanoGPT submodule is pinned; contributors run
 - Prefer running the CPU determinism test before any cloud work:
   `pytest tests/test_kill_resume.py`.
 - Keep the Go supervisor untouched until Phase 1c; it has its own module.
+
+### Linting / formatting (ruff)
+
+`ruff` is the linter and formatter; config lives in `pyproject.toml`
+(`third_party/` is excluded — nanoGPT is read-only). Two ways to run it
+automatically on commit — enable one after cloning:
+
+- **Native git hook (no extra install):** `git config core.hooksPath .githooks`
+  — runs `ruff check --fix` + `ruff format` on staged Python via the `ruff`
+  already on PATH.
+- **pre-commit framework (shareable, pinned):** `pip install pre-commit &&
+  pre-commit install` — uses `.pre-commit-config.yaml`.
+
+Run manually: `ruff check --fix . && ruff format .`

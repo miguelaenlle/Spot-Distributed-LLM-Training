@@ -36,8 +36,12 @@ def test_rng_roundtrip():
 @pytest.mark.xfail(reason="Phase 1a: train loop + nanoGPT wiring not implemented yet")
 def test_kill_and_resume_matches_uninterrupted():
     from spot_train.config import TrainConfig
-    from spot_train.train import train  # noqa: F401
+    from spot_train.train import train
 
     cfg = TrainConfig(max_steps=20, checkpoint_interval=10, device="cpu")
-    # TODO: run-to-completion loss vs. kill-at-10-then-resume loss must match.
+
+    # 1. uninterrupted reference run.
+    train(cfg)
+    # TODO: 2. kill at step 10, 3. resume to 20, 4. assert losses match.
+    #       Divergence => an RNG source or the loader position wasn't captured.
     raise NotImplementedError

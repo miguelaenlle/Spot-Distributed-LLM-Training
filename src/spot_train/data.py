@@ -19,7 +19,8 @@ from typing import Any
 @dataclass
 class LoaderState:
     """Everything needed to resume the data stream exactly."""
-    step: int = 0            # batches served so far
+
+    step: int = 0  # batches served so far
     epoch: int = 0
     # Extend as needed (e.g. shard index, within-shard offset) for larger data.
 

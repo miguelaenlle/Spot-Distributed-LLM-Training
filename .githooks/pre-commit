@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Native git pre-commit hook: auto-lint + auto-format staged Python with ruff.
+# No pre-commit framework needed — uses the `ruff` already on PATH.
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+
+# Staged .py files, excluding the read-only nanoGPT submodule.
+# NUL-delimited so paths with spaces survive; portable to macOS bash 3.2.
+files=()
+while IFS= read -r -d '' f; do
+  case "$f" in third_party/*) continue ;; esac
+  files+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACM -z -- '*.py')
+
+[ ${#files[@]} -eq 0 ] && exit 0
+
+if ! command -v ruff >/dev/null 2>&1; then
+  echo "pre-commit: ruff not found on PATH (pip install ruff)." >&2
+  exit 1
+fi
+
+ruff check --fix "${files[@]}"
+ruff format "${files[@]}"
+
+# Re-stage anything ruff rewrote so the fixes land in this commit.
+git add "${files[@]}"
