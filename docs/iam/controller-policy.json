@@ -42,6 +42,21 @@
       "Effect": "Allow",
       "Action": ["servicequotas:GetServiceQuota"],
       "Resource": "*"
+    },
+    {
+      "Sid": "StartSsmSessions",
+      "Effect": "Allow",
+      "Action": "ssm:StartSession",
+      "Resource": [
+        "arn:aws:ec2:*:*:instance/*",
+        "arn:aws:ssm:*:*:document/SSM-SessionManagerRunShell"
+      ]
+    },
+    {
+      "Sid": "ManageOwnSsmSessions",
+      "Effect": "Allow",
+      "Action": ["ssm:TerminateSession", "ssm:ResumeSession"],
+      "Resource": "arn:aws:ssm:*:*:session/${aws:username}-*"
     }
   ]
 }

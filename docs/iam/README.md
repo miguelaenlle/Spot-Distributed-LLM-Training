@@ -27,6 +27,10 @@ to watch training live — see the main README's "Watch a run live".
 - **`PassRole` is scoped.** The controller may pass only `spot-train-role`, and
   only to `ec2.amazonaws.com` — a compromised controller can't hand out arbitrary
   roles.
+- **`ssm:StartSession`** in the controller policy is a human-operator convenience
+  (to `tail -f` the box live). It's not needed by an automated cloud controller —
+  drop that statement there. The box side (`AmazonSSMManagedInstanceCore` on the
+  worker role) is attached by `setup`.
 
 ## For a throwaway test user
 
