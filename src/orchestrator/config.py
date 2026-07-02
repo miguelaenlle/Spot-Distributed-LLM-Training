@@ -38,6 +38,10 @@ class OrchestratorConfig:
         )
     )
 
+    # SSH-verification mode: name of an EXISTING EC2 key pair in `region` to
+    # attach so you can ssh into the box. Blank = launch without SSH access.
+    key_name: str = field(default_factory=lambda: _env("SSH_KEY_NAME", ""))
+
     # --- names created by `setup` (you own these) ---------------------------
     bucket: str = field(default_factory=lambda: _env("SPOT_TRAIN_BUCKET", ""))
     role_name: str = field(default_factory=lambda: _env("IAM_ROLE", "spot-train-role"))

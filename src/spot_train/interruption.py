@@ -68,4 +68,9 @@ class InterruptionListener:
                 return
 
     def _check_spot_action(self) -> str | None:
-        raise NotImplementedError("Phase 1a step 2 (spot): IMDSv2 token + GET spot/instance-action")
+        # PARKED for Phase 1a: the MVP uses controlled kills, not real preemption.
+        # The real impl fetches an IMDSv2 token and GETs the spot/instance-action
+        # endpoint (a 200 => preemption imminent). Until then we no-op so the
+        # poller "quietly idles" as the docstring promises, instead of raising and
+        # crashing the daemon thread on every poll (noisy traceback in the log).
+        return None
