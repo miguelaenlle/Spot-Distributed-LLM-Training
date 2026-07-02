@@ -43,7 +43,8 @@ def build_user_data(
         "BATCH_SIZE": str(cfg.batch_size),
         "RUN_ID": run_id,
         "MARKET": market,
-        "DEVICE": "cuda",
+        # the trainer auto-detects cuda vs cpu from the box at runtime
+        "DEVICE": "auto",
         # unbuffered stdout so `tail -f` over SSM shows per-step lines live
         "PYTHONUNBUFFERED": "1",
     }

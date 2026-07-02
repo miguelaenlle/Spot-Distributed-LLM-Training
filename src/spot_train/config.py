@@ -78,7 +78,9 @@ class TrainConfig:
     market: str = "local"  # "on-demand" | "spot" on the box
 
     # --- device --------------------------------------------------------------
-    device: str = "cpu"  # "cuda" on the spot box
+    # "auto" -> cuda if the box has a GPU, else cpu (resolved at runtime, the way
+    # ML training scripts normally do it). Set "cuda"/"cpu" to force.
+    device: str = "auto"
 
     @classmethod
     def from_env(cls) -> TrainConfig:
@@ -100,5 +102,5 @@ class TrainConfig:
             batch_size=_env_int("BATCH_SIZE", 12),
             run_id=_env_str("RUN_ID", "local"),
             market=_env_str("MARKET", "local"),
-            device=_env_str("DEVICE", "cpu"),
+            device=_env_str("DEVICE", "auto"),
         )

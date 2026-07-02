@@ -81,13 +81,16 @@ def _write_metrics(cfg: TrainConfig, metrics: dict) -> None:
 
 
 def train(cfg: TrainConfig) -> dict:
-    device_type = "cuda" if cfg.device.startswith("cuda") else "cpu"
     torch.manual_seed(cfg.seed)
 
-    # GPU banner + fail-fast: if cuda was requested but isn't really here, say so
-    # clearly instead of dying later in a cryptic .to(device) traceback.
+    # Resolve the device from the actual machine (the usual ML-training pattern):
+    # "auto" -> cuda if present else cpu. An explicit "cuda" that isn't available
+    # is a hard error (a GPU run silently falling back to CPU is worse).
     cuda_ok = torch.cuda.is_available()
     gpu_name = torch.cuda.get_device_name(0) if cuda_ok else None
+    if cfg.device == "auto":
+        cfg.device = "cuda" if cuda_ok else "cpu"
+    device_type = "cuda" if cfg.device.startswith("cuda") else "cpu"
     if device_type == "cuda":
         if not cuda_ok:
             raise SystemExit(
