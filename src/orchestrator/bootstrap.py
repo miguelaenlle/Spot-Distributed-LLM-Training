@@ -178,6 +178,9 @@ UPLOADER_PID=$!
 
 # From here we manage exit codes by hand (final log flush + teardown), so drop -e.
 set +e
+# Load the run config the trainer reads (PYTHONPATH so `spot_train` imports, plus
+# the S3 URIs, MAX_SECONDS, etc.). Provisioning wrote this file but doesn't source it.
+source /home/ubuntu/spot-train.env
 "$VENV_PY" -u -m spot_train.train
 RC=$?
 
