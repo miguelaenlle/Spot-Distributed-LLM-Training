@@ -26,8 +26,26 @@ from .data import PositionedLoader
 from .interruption import InterruptionListener
 
 
+def _ensure_nanogpt_on_path() -> None:
+    """Put the nanoGPT submodule on sys.path so ``from model import GPT`` works.
+
+    Works for an editable install (local or on the box): repo root is two levels
+    above this file (src/spot_train/train.py -> repo root), and nanoGPT lives at
+    <root>/third_party/nanoGPT. Lets `spot-train` and `python -m spot_train.train`
+    run without a manual PYTHONPATH.
+    """
+    import os
+    import sys
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ng = os.path.join(root, "third_party", "nanoGPT")
+    if os.path.isdir(ng) and ng not in sys.path:
+        sys.path.insert(0, ng)
+
+
 def build_model(cfg: TrainConfig, vocab_size: int):
     """Instantiate nanoGPT's GPT from the submodule. We import, never rewrite."""
+    _ensure_nanogpt_on_path()
     from model import GPT, GPTConfig  # type: ignore
 
     gpt_cfg = GPTConfig(
