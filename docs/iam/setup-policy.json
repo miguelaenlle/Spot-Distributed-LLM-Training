@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CreateBucket",
+      "Effect": "Allow",
+      "Action": ["s3:CreateBucket", "s3:ListBucket"],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET"
+    },
+    {
+      "Sid": "CreateWorkerRoleAndProfile",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:TagRole",
+        "iam:PutRolePolicy",
+        "iam:CreateInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:GetRole",
+        "iam:GetInstanceProfile"
+      ],
+      "Resource": [
+        "arn:aws:iam::ACCOUNT_ID:role/spot-train-role",
+        "arn:aws:iam::ACCOUNT_ID:instance-profile/spot-train-profile"
+      ]
+    }
+  ]
+}

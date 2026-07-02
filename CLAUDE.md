@@ -80,10 +80,14 @@ box. S3 is the transport for dataset, checkpoints, and metrics.
   `dataset.py` (prepare-once → S3), `bootstrap.py` (user-data), `experiments.py`
   (baseline / spot), `__main__.py` (CLI: `setup|stage-data|baseline|spot`).
 
-**Credentials / who runs what:** the user's keys live in a git-ignored `.env`;
-boto3 resolves them at runtime and no code reads them. **The user runs every
-credentialed command** (`setup`/`stage-data`/`baseline`/`spot`); Claude only
-writes code and runs local CPU/lint/test.
+**Credentials / who runs what:** the user's creds live in a git-ignored `.env`
+(or an SSO profile); boto3 resolves them at runtime and no code reads them.
+Role-first design — the same `aws.py` works with laptop SSO/keys now and an
+attached instance-profile role when the orchestrator becomes a cloud node.
+Least-privilege policies for each principal are in `docs/iam/` (controller,
+worker, one-time setup). **The user runs every credentialed command**
+(`setup`/`stage-data`/`baseline`/`spot`); Claude only writes code and runs local
+CPU/lint/test.
 
 **Infra** (created by `spot-orchestrate setup`, idempotent)
 - One GPU (`g4dn.xlarge`, us-east-1) on the Deep Learning AMI, an S3 bucket, and
