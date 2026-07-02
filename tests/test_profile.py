@@ -96,6 +96,31 @@ def test_write_local(tmp_path):
     assert data["durations"]["train_s"] == 300.0
 
 
+def test_table_rows():
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    p.events = [
+        Event("launch", 1000.0, 1),
+        Event("first_log", 1090.0, 1),
+        Event("metrics", 1390.0, 1),
+    ]
+    assert p.duration_rows() == [
+        ["provision_s", 90.0],
+        ["train_s", 300.0],
+        ["total_s", 390.0],
+    ]
+    assert p.timeline_rows() == [
+        ["launch", 1, 0.0, 1000.0],
+        ["first_log", 1, 90.0, 1090.0],
+        ["metrics", 1, 390.0, 1390.0],
+    ]
+
+
+def test_table_rows_empty():
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    assert p.timeline_rows() == []
+    assert p.duration_rows() == []
+
+
 def test_wandb_disabled_is_noop():
     p = RunProfile("baseline-1", "baseline", "on-demand")
     cfg = types.SimpleNamespace(wandb_enabled=lambda: False)

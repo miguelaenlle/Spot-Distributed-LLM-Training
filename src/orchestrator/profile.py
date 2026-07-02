@@ -174,13 +174,46 @@ class RunProfile:
         )
         self._wb_step += 1
 
+    # -- table row builders (pure; unit-testable without wandb) ------------ #
+    def duration_rows(self) -> list[list]:
+        """Rows for the durations table/bar chart: [phase, seconds]."""
+        return [[k, v] for k, v in self.durations().items()]
+
+    def timeline_rows(self) -> list[list]:
+        """Rows for the timeline table: [event, segment, t_rel_s, t_wall]."""
+        if not self.events:
+            return []
+        t0 = self.events[0].t_wall
+        return [
+            [e.event, e.segment, round(e.t_wall - t0, 2), round(e.t_wall, 3)] for e in self.events
+        ]
+
     def _wb_finish(self) -> None:
         if self._wb is None:
             return
+        import wandb
+
+        # Comparable scalar columns in the runs table.
         for k, v in self.durations().items():
             self._wb.summary[k] = v
         if self.metrics:
             for k in ("train_loss", "val_loss", "steps", "stop_reason", "resumed"):
                 if k in self.metrics:
                     self._wb.summary[k] = self.metrics[k]
+
+        # Profiling tables + a durations bar chart, built programmatically (they
+        # render as panels in the run automatically — no UI setup). Use distinct
+        # Table objects: a wandb.Table can only be consumed by one log target.
+        timeline = wandb.Table(
+            columns=["event", "segment", "t_rel_s", "t_wall"], data=self.timeline_rows()
+        )
+        durations = wandb.Table(columns=["phase", "seconds"], data=self.duration_rows())
+        self._wb.log(
+            {
+                "profile/timeline": timeline,
+                "profile/durations": wandb.plot.bar(
+                    durations, "phase", "seconds", title="Run profile (seconds)"
+                ),
+            }
+        )
         self._wb.finish()
