@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Training artifacts
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+data/
+datasets/
+out/
+wandb/
+*.log
+
+# Terraform
+infra/terraform/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+
+# Go
+supervisor/bin/
+supervisor/*.out
+
+# Secrets / local
+.env
+*.pem
+credentials
+.DS_Store
+.idea/
+.vscode/
