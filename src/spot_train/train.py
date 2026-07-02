@@ -1,31 +1,34 @@
-"""Training entrypoint — one resume code path.
+"""Training entrypoint — one resume code path, one time-budgeted loop.
 
-Phase 1a: single node, single device (CPU for the determinism test, one GPU on
-spot). The model comes from the nanoGPT submodule; this file owns only the
+Phase 1a: single node, single device (CPU for the local test, one GPU on spot).
+The model comes from the nanoGPT submodule; this file owns only the
 fault-tolerance loop around it.
 
-The invariant the whole project rests on:
-
-    startup always tries to restore the latest checkpoint and falls back to
-    fresh — there is never a separate "resume" branch to drift out of sync.
+Invariants:
+  - startup always tries to restore the latest checkpoint and falls back to
+    fresh — there is never a separate "resume" branch to drift out of sync;
+  - the loop stops on a wall-clock budget (``max_seconds``), then evaluates and
+    writes ``metrics.json`` — so a launch is a fixed-duration unit of work the
+    orchestrator can schedule and kill.
 """
 
 from __future__ import annotations
 
+import json
 import sys
+import time
 
 import torch
 
-from .checkpoint import load_latest, restore_into, save
+from . import checkpoint, s3_store
 from .config import TrainConfig
 from .data import PositionedLoader
 from .interruption import InterruptionListener
 
 
-def build_model(cfg: TrainConfig):
+def build_model(cfg: TrainConfig, vocab_size: int):
     """Instantiate nanoGPT's GPT from the submodule. We import, never rewrite."""
-    # third_party/nanoGPT is on sys.path via editable install / conftest.
-    from model import GPT, GPTConfig  # type: ignore  # noqa: E402
+    from model import GPT, GPTConfig  # type: ignore
 
     gpt_cfg = GPTConfig(
         n_layer=cfg.n_layer,
@@ -33,59 +36,128 @@ def build_model(cfg: TrainConfig):
         n_embd=cfg.n_embd,
         block_size=cfg.block_size,
         dropout=cfg.dropout,
+        vocab_size=vocab_size,
     )
     return GPT(gpt_cfg)
 
 
-def train(cfg: TrainConfig) -> None:
+@torch.no_grad()
+def estimate_loss(model, loader: PositionedLoader, eval_iters: int) -> dict[str, float]:
+    """Mean train/val loss over ``eval_iters`` batches (nanoGPT-style)."""
+    model.eval()
+    out: dict[str, float] = {}
+    for split in ("train", "val"):
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            x, y = loader.next_batch(split)
+            _, loss = model(x, y)
+            losses[k] = loss.item()
+        out[split] = float(losses.mean().item())
+    model.train()
+    return out
+
+
+def _write_metrics(cfg: TrainConfig, metrics: dict) -> None:
+    s3_store.put_bytes(json.dumps(metrics, indent=2).encode(), cfg.metrics_uri)
+    print(f"[metrics] {json.dumps(metrics)}", file=sys.stderr)
+
+
+def train(cfg: TrainConfig) -> dict:
+    device_type = "cuda" if cfg.device.startswith("cuda") else "cpu"
     torch.manual_seed(cfg.seed)
 
-    model = build_model(cfg).to(cfg.device)
-    optimizer = model.configure_optimizers(
-        cfg.weight_decay, cfg.learning_rate, (0.9, 0.95), cfg.device
-    )
     loader = PositionedLoader(
-        dataset_dir="third_party/nanoGPT/data/shakespeare_char",
+        data_local_dir=cfg.data_local_dir,
         batch_size=cfg.batch_size,
         block_size=cfg.block_size,
         device=cfg.device,
+        data_uri=cfg.data_uri,
+    )
+    vocab_size = loader.vocab_size or 50304
+
+    def make_model():
+        return build_model(cfg, vocab_size)
+
+    model = make_model().to(cfg.device)
+    optimizer = model.configure_optimizers(
+        cfg.weight_decay, cfg.learning_rate, (0.9, 0.95), device_type
     )
 
     # --- the one resume code path --------------------------------------- #
-    blob = load_latest(cfg.checkpoint_uri, map_location=cfg.device)
-    start_step = restore_into(blob, model=model, optimizer=optimizer, loader=loader) if blob else 0
-    if blob:
+    blob = checkpoint.load_latest(cfg.checkpoint_uri, map_location=cfg.device)
+    resumed = blob is not None
+    if resumed:
+        start_step = checkpoint.restore_into(blob, model=model, optimizer=optimizer, loader=loader)
         print(f"[resume] restored from step {start_step}", file=sys.stderr)
     else:
+        start_step = 0
         print("[fresh] no checkpoint found, starting from step 0", file=sys.stderr)
 
     listener = InterruptionListener().start()
 
+    def do_checkpoint(step: int, ckpt_count: int) -> None:
+        ref = checkpoint.save(
+            model=model, optimizer=optimizer, loader=loader, step=step, uri=cfg.checkpoint_uri
+        )
+        # Every Nth checkpoint, prove the written artifact reconstructs a model.
+        if cfg.smoke_test_every and ckpt_count % cfg.smoke_test_every == 0:
+            good = checkpoint.verify(ref, map_location=cfg.device)
+            checkpoint.smoke_test(good, make_model, loader.next_batch("val"), cfg.device)
+            print(f"[verify] checkpoint at step {step} passed verify + smoke test", file=sys.stderr)
+
+    start_time = time.monotonic()
+    last_ckpt = start_time
     step = start_step
+    ckpt_count = 0
+    reason = "max_steps"
+
     while step < cfg.max_steps:
-        x, y = loader.next_batch()
+        x, y = loader.next_batch("train")
         _, loss = model(x, y)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         step += 1
 
-        # periodic checkpoint — bounds worst-case lost work to the interval
-        if step % cfg.checkpoint_interval == 0:
-            save(model=model, optimizer=optimizer, loader=loader, step=step, uri=cfg.checkpoint_uri)
+        now = time.monotonic()
+        if now - last_ckpt >= cfg.checkpoint_interval_seconds:
+            ckpt_count += 1
+            do_checkpoint(step, ckpt_count)
+            last_ckpt = now
 
-        # preemption notice -> final checkpoint + clean exit
         if listener.should_stop.is_set():
-            print(f"[preempt] signal at step {step}; final checkpoint", file=sys.stderr)
-            save(model=model, optimizer=optimizer, loader=loader, step=step, uri=cfg.checkpoint_uri)
-            listener.stop()
-            return
+            reason = "preempt"
+            break
+        if cfg.max_seconds is not None and now - start_time >= cfg.max_seconds:
+            reason = "time_budget"
+            break
 
+    # Final checkpoint so no tail work is lost, then evaluate + report.
+    ckpt_count += 1
+    do_checkpoint(step, ckpt_count)
     listener.stop()
+
+    final_step = step
+    losses = estimate_loss(model, loader, cfg.eval_iters)
+    metrics = {
+        "run_id": cfg.run_id,
+        "market": cfg.market,
+        "resumed": resumed,
+        "steps": final_step,
+        "steps_this_launch": final_step - start_step,
+        "train_loss": losses["train"],
+        "val_loss": losses["val"],
+        "wallclock_s": round(time.monotonic() - start_time, 2),
+        "stop_reason": reason,
+        "device": cfg.device,
+        "dataset": cfg.dataset,
+    }
+    _write_metrics(cfg, metrics)
+    return metrics
 
 
 def main() -> None:
-    train(TrainConfig())
+    train(TrainConfig.from_env())
 
 
 if __name__ == "__main__":

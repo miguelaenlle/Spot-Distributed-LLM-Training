@@ -47,41 +47,64 @@ engineer the training loop + control plane to survive it.
 
 ## Phase 1a — detailed plan (current focus)
 
-**Goal:** train NanoGPT on a single AWS spot GPU that survives preemption.
-**Success:** a killed-and-resumed run reaches the same loss as an
-uninterrupted one.
+**Shape:** a **local orchestrator** (`src/orchestrator/`, boto3) drives AWS and
+runs two experiments; a **remote trainer** (`src/spot_train/`) runs on the GPU
+box. S3 is the transport for dataset, checkpoints, and metrics.
 
-**Checkpoint** (`src/spot_train/checkpoint.py`)
-- Save model weights, optimizer state, step number, all RNG states, and
-  data-loader position.
-- Write to a temp key and atomically rename → upload to S3.
+**The two experiments**
+1. **Baseline (on-demand):** spin up a regular GPU, train NanoGPT for a
+   controllable budget (~5 min), report eval metrics + wallclock + cost.
+2. **Spot-with-kill:** spin up a spot GPU, train ~2 min, **kill it**
+   (`TerminateInstances`), then a second spot instance resumes from the S3
+   checkpoint and trains ~3 more min. **Success:** segment 2 reports
+   `resumed=true`, loss keeps dropping from the checkpoint (not reset), and
+   total cost < the baseline.
 
-**Interruption listener** (`src/spot_train/interruption.py`)
-- Background thread polling the IMDS spot-action endpoint every few seconds.
-- On notice: write a final checkpoint and exit cleanly.
-- SIGTERM handler as backup. Periodic checkpointing regardless.
+**Remote trainer** (`src/spot_train/`)
+- `train.py` — one resume code path (load-latest-or-fresh); a **wall-clock
+  budget** (`max_seconds`) ends a launch, then it evaluates and writes
+  `metrics.json` to S3.
+- `checkpoint.py` — full-state save (weights, optimizer, step, all RNG,
+  loader position) + `version`; `verify()` (keys + all-tensors-finite) and a
+  post-save **restore smoke test** are the tools that confirm a checkpoint is
+  comprehensive and valid.
+- `s3_store.py` — local + S3 behind one interface; **atomic** temp-key→rename;
+  S3 uploads carry a **SHA-256** checksum, downloads verify it.
+- `data.py` — nanoGPT memmap batches; pulls prepared bins from S3 on first use.
+- **Checkpointing is time-based** (`checkpoint_interval_seconds`, default 30) so
+  worst-case lost work is bounded in wall-clock, synchronous for the MVP.
 
-**Resume** (`src/spot_train/train.py`)
-- On startup, restore the latest S3 checkpoint if present, else start fresh —
-  one code path for both.
+**Local orchestrator** (`src/orchestrator/`)
+- `aws.py` — the **only** module that calls AWS; every mutating call logs first
+  and honors `--dry-run`. `setup.py` (bucket + IAM instance profile + SG),
+  `dataset.py` (prepare-once → S3), `bootstrap.py` (user-data), `experiments.py`
+  (baseline / spot), `__main__.py` (CLI: `setup|stage-data|baseline|spot`).
 
-**Infra** (`infra/`)
-- One spot GPU (`g4dn`/`g5.xlarge`), an S3 bucket in the **same region**, an
-  IAM role linking them.
-- ⚠️ **File the G-class spot quota increase today** — fresh accounts sit at
-  zero and approval takes days.
+**Credentials / who runs what:** the user's keys live in a git-ignored `.env`;
+boto3 resolves them at runtime and no code reads them. **The user runs every
+credentialed command** (`setup`/`stage-data`/`baseline`/`spot`); Claude only
+writes code and runs local CPU/lint/test.
+
+**Infra** (created by `spot-orchestrate setup`, idempotent)
+- One GPU (`g4dn.xlarge`, us-east-1) on the Deep Learning AMI, an S3 bucket, and
+  an IAM instance profile granting the box S3 access.
+- ⚠️ **File the G-class quota increase early** — needed for **both** on-demand
+  (baseline) and spot (spot run); fresh accounts sit at zero, approval takes days.
 
 **Order of work**
-1. Get checkpoint/resume passing the kill-and-resume test **locally on CPU**.
-2. Move to spot.
-3. Add the interruption listener.
-4. Catch a **real** preemption (force one with **AWS FIS**).
+1. **(done)** Trainer + orchestrator implemented; prove locally on CPU that a
+   time-budgeted run writes `metrics.json` and a killed+resumed run continues.
+2. `spot-orchestrate setup` → `stage-data`.
+3. `baseline` (on-demand).
+4. `spot` (controlled kill + resume).
 
-**Log:** lost-steps-per-interruption — should never exceed the checkpoint
-interval.
+**Log:** lost-work-per-interruption — should never exceed the checkpoint interval.
 
-**Out of scope for 1a:** DDP, rendezvous, node replacement, the Go supervisor,
-async checkpointing — all 1b onward.
+**Out of scope for 1a (moved later):** the IMDS spot listener + AWS FIS
+`SendSpotInstanceInterruptions` (real 2-min-notice preemption) — the controlled
+kill stands in for now; DDP, rendezvous, node replacement, the Go supervisor, and
+async checkpointing are all 1b onward. Bit-exact determinism is relaxed for the
+MVP (invariant: loss continues from the checkpoint).
 
 ---
 
@@ -106,28 +129,39 @@ async checkpointing — all 1b onward.
 
 ## Repository layout
 
-Kept **deliberately minimal** — only what Phase 1a (kill-and-resume on CPU)
-needs. Later phases add their own folders when they start (see "added later").
+Kept **deliberately minimal** — only what Phase 1a needs. Later phases add their
+own folders when they start (see "added later").
 
 ```
 CLAUDE.md              # this file — the plan of record
 README.md              # public overview
-pyproject.toml         # src-layout package `spot_train`
-src/spot_train/        # the fault-tolerance layer (Python) — OUR code
-  checkpoint.py        # atomic save/restore of full training state
-  s3_store.py          # S3 upload/download + atomic temp-key rename
+pyproject.toml         # src-layout; scripts: spot-train, spot-orchestrate
+.env.example           # AWS creds/bucket template → copy to git-ignored .env
+src/spot_train/        # remote trainer — OUR fault-tolerance loop
+  train.py             # entrypoint: one resume path + wall-clock budget + eval
+  checkpoint.py        # full-state save/restore + verify() + smoke test
+  s3_store.py          # local+S3 one interface; atomic rename + SHA-256
   rng.py               # capture/restore all RNG states
-  data.py              # data loader that tracks & restores its position
-  interruption.py      # IMDS spot poller + SIGTERM handler
-  config.py            # training/run configuration
-  train.py             # entrypoint: single resume code path
+  data.py              # nanoGPT memmap batches; pulls dataset from S3
+  config.py            # TrainConfig (+ from_env for the box)
+  interruption.py      # IMDS poller + SIGTERM handler — PARKED until real
+                       #   preemption handling (MVP uses controlled kills)
+src/orchestrator/      # local control plane (boto3) — you run this
+  aws.py               # the ONLY module that calls AWS; --dry-run + logging
+  setup.py             # idempotent: bucket + IAM instance profile + SG
+  dataset.py           # prepare-once → upload to S3
+  bootstrap.py         # EC2 user-data script builder
+  experiments.py       # run_baseline / run_spot (launch, kill, resume, poll)
+  config.py            # OrchestratorConfig (env-overridable)
+  __main__.py          # CLI: setup | stage-data | baseline | spot [--dry-run]
 third_party/nanoGPT/   # Karpathy's nanoGPT — git submodule, read-only.
                        #   we import GPT/GPTConfig from model.py; we do NOT
                        #   use their train.py — our loop owns fault tolerance.
-tests/                 # kill-and-resume determinism tests
+tests/                 # checkpoint/resume tests
 
+# S3 layout (created at runtime): data/<dataset>/{train,val}.bin,meta.pkl
+#                                  runs/<run_id>/checkpoints/  +  metrics.json
 # added later (do not create until the phase begins):
-#   infra/       — S3 bucket, IAM role, spot EC2, FIS drills   (1a→spot step)
 #   supervisor/  — Go control plane (observe/compare/act)      (Phase 1c)
 ```
 

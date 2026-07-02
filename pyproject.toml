@@ -13,8 +13,8 @@ authors = [{ name = "Miguel Enlle" }]
 dependencies = [
     "torch>=2.2",
     "numpy",
-    "boto3",          # S3 checkpoint store + IMDS
-    "requests",       # IMDS spot-action polling
+    "boto3",          # S3 store (checkpoints/data/metrics) + orchestrator AWS calls
+    "requests",       # nanoGPT prepare.py (dataset download); future IMDS polling
 ]
 
 [project.optional-dependencies]
@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 spot-train = "spot_train.train:main"
+spot-orchestrate = "orchestrator.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
