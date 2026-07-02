@@ -74,7 +74,9 @@ def _stream_until_metrics(cfg: OrchestratorConfig, run_id: str) -> dict | None:
     logs_key = cfg.run_logs_key(run_id)
     metrics_key = cfg.run_metrics_key(run_id)
     printed = 0
-    deadline = time.monotonic() + cfg.metrics_timeout_seconds
+    start = time.monotonic()
+    deadline = start + cfg.metrics_timeout_seconds
+    last_heartbeat = start
 
     def flush_log() -> None:
         nonlocal printed
@@ -90,9 +92,17 @@ def _stream_until_metrics(cfg: OrchestratorConfig, run_id: str) -> dict | None:
         if aws.object_exists(cfg.bucket, metrics_key):
             flush_log()  # capture the tail written just before metrics.json
             return json.loads(aws.get_text(cfg.bucket, metrics_key))
-        if time.monotonic() > deadline:
+        now = time.monotonic()
+        if now > deadline:
             print("\n[baseline] timeout waiting for metrics.json", file=sys.stderr)
             return None
+        # Before the box starts logging (boot takes ~1-2 min), show we're alive.
+        if printed == 0 and now - last_heartbeat >= 15:
+            print(
+                f"[baseline] waiting for the box to start logging… ({int(now - start)}s)",
+                file=sys.stderr,
+            )
+            last_heartbeat = now
         time.sleep(cfg.log_stream_seconds)
 
 

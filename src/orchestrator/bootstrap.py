@@ -65,6 +65,13 @@ def _provision_steps(cfg: OrchestratorConfig, exports: str) -> str:
     return f"""set -euxo pipefail
 cd /home/ubuntu
 
+# Interpreter: the DLAMI base shell only ships `python3`; plain `python` exists
+# only inside the pytorch venv, which the non-interactive login shell does NOT
+# reliably auto-activate. Use the venv python by absolute path (it has torch +
+# boto3 and always exists on this AMI); fall back to python3 on other images.
+VENV_PY=/opt/pytorch/bin/python
+[ -x "$VENV_PY" ] || VENV_PY="$(command -v python3)"
+
 # Code: clone the repo (idempotent) and populate the nanoGPT submodule. A plain
 # clone leaves third_party/nanoGPT EMPTY, and the trainer imports GPT from there,
 # so the submodule init is not optional.
@@ -74,9 +81,9 @@ git submodule update --init --depth 1
 
 # Deps: the DLAMI ships torch + numpy; boto3 is usually missing. Best-effort so a
 # broken pip doesn't wedge the whole boot.
-python -c "import boto3" 2>/dev/null \\
-  || python -m pip install boto3 \\
-  || python -m pip install --user boto3 || true
+"$VENV_PY" -c "import boto3" 2>/dev/null \\
+  || "$VENV_PY" -m pip install boto3 \\
+  || "$VENV_PY" -m pip install --user boto3 || true
 
 # Env: drop the trainer's config into a file you can `source` before a manual run.
 cat > /home/ubuntu/spot-train.env <<'ENV'
@@ -84,7 +91,7 @@ cat > /home/ubuntu/spot-train.env <<'ENV'
 ENV
 
 # Preflight: fail loudly IN THIS LOG if the torch/boto3 env is wrong.
-python - <<'PY'
+"$VENV_PY" - <<'PY'
 import torch, boto3, numpy  # noqa: F401
 print("preflight ok: torch", torch.__version__, "cuda", torch.cuda.is_available(), flush=True)
 PY
@@ -108,7 +115,8 @@ sudo -u ubuntu -i bash <<'BOOT'
 echo "[provision] DONE"
 echo "[provision] code: /home/ubuntu/app   env: /home/ubuntu/spot-train.env"
 echo "[provision] to train by hand:"
-echo "    cd /home/ubuntu/app && source /home/ubuntu/spot-train.env && python -m spot_train.train"
+echo "    cd /home/ubuntu/app && source /home/ubuntu/spot-train.env"
+echo "    /opt/pytorch/bin/python -m spot_train.train"
 BOOT
 echo "[provision] user-data exited rc=$? — box left UP for SSH (no training, no shutdown)"
 """
@@ -137,18 +145,23 @@ exec > /var/log/spot-train-boot.log 2>&1
 chmod 644 /var/log/spot-train-boot.log   # let the ubuntu log-uploader read it
 
 sudo -u ubuntu -i bash <<'BOOT'
-{steps}
+set -x
+cd /home/ubuntu
 
-# Explicitly activate the DLAMI PyTorch venv — don't rely on login-shell
-# auto-activation (see memory: dlami-source-activate).
-source /opt/pytorch/bin/activate 2>/dev/null || source activate pytorch 2>/dev/null || true
+# Interpreter: use the pytorch venv python by absolute path — the base shell only
+# has `python3`, and the login shell doesn't reliably auto-activate the venv, so
+# a bare `python` fails (command not found). Fall back to python3 on other AMIs.
+VENV_PY=/opt/pytorch/bin/python
+[ -x "$VENV_PY" ] || VENV_PY="$(command -v python3)"
 
-# From here we manage exit codes by hand (final log flush + teardown), so drop -e.
-set +e
-
-# Background uploader: sync the boot log to S3 every {interval}s so the orchestrator
-# can stream it. Uses the instance-profile role via IMDS (no creds in user-data).
-python - <<'PY' &
+# Start the S3 log uploader FIRST — before clone/pip — so the *entire* boot
+# (clone, submodule, deps, preflight, then training) streams to the orchestrator,
+# not just the training tail. boto3 is required for it, so ensure it up front
+# (the provision steps below install it too; this is idempotent). Uses the
+# instance-profile role via IMDS — no creds in user-data.
+"$VENV_PY" -c "import boto3" 2>/dev/null || "$VENV_PY" -m pip install boto3 2>/dev/null \
+  || "$VENV_PY" -m pip install --user boto3 2>/dev/null || true
+"$VENV_PY" - <<'PY' &
 import time, boto3
 c = boto3.client("s3")
 while True:
@@ -160,12 +173,17 @@ while True:
 PY
 UPLOADER_PID=$!
 
-python -u -m spot_train.train
+# Provision (clone repo + nanoGPT submodule, deps, env file, preflight) — now streamed.
+{steps}
+
+# From here we manage exit codes by hand (final log flush + teardown), so drop -e.
+set +e
+"$VENV_PY" -u -m spot_train.train
 RC=$?
 
 # Stop the uploader and push one final copy so the tail of the run is in S3.
 kill "$UPLOADER_PID" 2>/dev/null || true
-python - <<'PY'
+"$VENV_PY" - <<'PY'
 import boto3
 try:
     boto3.client("s3").upload_file("/var/log/spot-train-boot.log", "{bucket}", "{logs_key}")
