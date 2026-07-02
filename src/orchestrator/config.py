@@ -26,14 +26,15 @@ class OrchestratorConfig:
     # --- AWS placement -------------------------------------------------------
     region: str = field(default_factory=lambda: _env("AWS_REGION", "us-east-1"))
     instance_type: str = field(default_factory=lambda: _env("INSTANCE_TYPE", "g4dn.xlarge"))
-    # Deep Learning AMI, resolved from this public SSM parameter unless AMI_ID is
-    # set explicitly. DLAMI ships CUDA + PyTorch so user-data does no GPU setup.
+    # Deep Learning AMI. If AMI_ID is set we use it verbatim; otherwise we resolve
+    # the newest Amazon-owned image matching this name filter via DescribeImages.
+    # Default targets the PyTorch DLAMI (Ubuntu 22.04) so CUDA + PyTorch are
+    # preinstalled and user-data does no GPU/torch setup.
     ami_id: str = field(default_factory=lambda: _env("AMI_ID", ""))
-    ami_ssm_param: str = field(
+    ami_name_filter: str = field(
         default_factory=lambda: _env(
-            "AMI_SSM_PARAM",
-            "/aws/service/deep-learning/ami/x86_64/"
-            "base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id",
+            "AMI_NAME_FILTER",
+            "Deep Learning OSS Nvidia Driver AMI GPU PyTorch*Ubuntu 22.04*",
         )
     )
 

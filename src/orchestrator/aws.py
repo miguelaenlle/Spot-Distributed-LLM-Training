@@ -54,13 +54,31 @@ def _log(msg: str) -> None:
 # --------------------------------------------------------------------------- #
 # Read-only lookups
 # --------------------------------------------------------------------------- #
-def resolve_ami(ami_id: str, ssm_param: str) -> str:
+def resolve_ami(ami_id: str, name_filter: str) -> str:
+    """Return an explicit AMI id, or the newest Amazon-owned image whose name
+    matches ``name_filter`` (via DescribeImages — no SSM public parameters)."""
     if ami_id:
         return ami_id
     if _DRY_RUN:
-        _log(f"resolve AMI from SSM {ssm_param}")
+        _log(f"resolve AMI via DescribeImages name~={name_filter!r}")
         return "ami-DRYRUN"
-    return _client("ssm").get_parameter(Name=ssm_param)["Parameter"]["Value"]
+    r = _client("ec2").describe_images(
+        Owners=["amazon"],
+        Filters=[
+            {"Name": "name", "Values": [name_filter]},
+            {"Name": "state", "Values": ["available"]},
+            {"Name": "architecture", "Values": ["x86_64"]},
+        ],
+    )
+    images = sorted(r.get("Images", []), key=lambda i: i["CreationDate"])
+    if not images:
+        raise SystemExit(
+            f"No AMI matched {name_filter!r} in this region. Set AMI_ID explicitly "
+            f"(see README) or adjust AMI_NAME_FILTER."
+        )
+    chosen = images[-1]
+    _log(f"resolved AMI {chosen['ImageId']} ({chosen['Name']})")
+    return chosen["ImageId"]
 
 
 def object_exists(bucket: str, key: str) -> bool:

@@ -72,7 +72,7 @@ def _prepare(cfg: OrchestratorConfig) -> tuple[str, str]:
         raise SystemExit(
             f"dataset not staged at {cfg.data_uri()} — run `spot-orchestrate stage-data` first"
         )
-    ami = aws.resolve_ami(cfg.ami_id, cfg.ami_ssm_param)
+    ami = aws.resolve_ami(cfg.ami_id, cfg.ami_name_filter)
     sg_id = aws.ensure_security_group(cfg.security_group, cfg.region)
     return ami, sg_id
 

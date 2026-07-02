@@ -40,7 +40,7 @@
     {
       "Sid": "ReadOnlyLookups",
       "Effect": "Allow",
-      "Action": ["ssm:GetParameter", "servicequotas:GetServiceQuota"],
+      "Action": ["servicequotas:GetServiceQuota"],
       "Resource": "*"
     }
   ]
