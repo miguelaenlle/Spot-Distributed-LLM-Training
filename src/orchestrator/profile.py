@@ -311,7 +311,7 @@ def render_segments_png(title: str, segments: list[dict], path: str) -> bool:
     except ImportError:
         return False
 
-    fig, ax = plt.subplots(figsize=(9, 2.2))
+    fig, ax = plt.subplots(figsize=(10.5, 2.0))
     left = 0.0
     seen: set[str] = set()
     for s in segments:
@@ -333,14 +333,13 @@ def render_segments_png(title: str, segments: list[dict], path: str) -> bool:
     ax.set_yticks([])
     ax.set_xlabel("seconds")
     ax.set_title(title)
-    ax.legend(
-        ncol=max(1, len(seen)),
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.55),  # below the x-axis label so they don't overlap
+    # Legend on the right so it never collides with the "seconds" x-axis label.
+    legend = ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
         frameon=False,
         fontsize=8,
     )
-    fig.tight_layout()
-    fig.savefig(path, dpi=120, bbox_inches="tight")
+    fig.savefig(path, dpi=120, bbox_inches="tight", bbox_extra_artists=(legend,))
     plt.close(fig)
     return True
