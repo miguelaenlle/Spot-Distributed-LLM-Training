@@ -108,6 +108,55 @@ def get_text(bucket: str, key: str) -> str:
     return _client("s3").get_object(Bucket=bucket, Key=key)["Body"].read().decode()
 
 
+def max_checkpoint_step(bucket: str, prefix: str) -> int:
+    """Highest checkpoint step under ``prefix`` (ckpt-<step>.pt), or -1 if none.
+    Used to detect training-start (step advances past the resume point) and to
+    confirm the graceful SIGTERM checkpoint landed before we terminate the box."""
+    if _DRY_RUN:
+        _log(f"list checkpoints s3://{bucket}/{prefix}")
+        return -1
+    import contextlib
+
+    best = -1
+    paginator = _client("s3").get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            base = obj["Key"].rsplit("/", 1)[-1]
+            if base.startswith("ckpt-") and base.endswith(".pt"):
+                with contextlib.suppress(ValueError):
+                    best = max(best, int(base[len("ckpt-") : -len(".pt")]))
+    return best
+
+
+def ssm_online(instance_id: str) -> bool:
+    """True if the SSM agent on the instance is registered and online (so we can
+    send it a command). Boxes get AmazonSSMManagedInstanceCore via the instance
+    profile and outbound HTTPS via the public IP."""
+    if _DRY_RUN:
+        _log(f"ssm describe-instance-information {instance_id}")
+        return True
+    r = _client("ssm").describe_instance_information(
+        Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
+    )
+    info = r.get("InstanceInformationList", [])
+    return bool(info) and info[0].get("PingStatus") == "Online"
+
+
+def ssm_send(instance_id: str, commands: list[str]) -> str:
+    """Run shell commands on the instance via SSM RunCommand; returns command id.
+    This is how the orchestrator delivers the 'Spot' shutdown signal (SIGTERM to
+    the trainer) without SSH."""
+    _log(f"ssm send-command {instance_id}: {' && '.join(commands)}")
+    if _DRY_RUN:
+        return "cmd-DRYRUN"
+    r = _client("ssm").send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Parameters={"commands": commands},
+    )
+    return r["Command"]["CommandId"]
+
+
 def instance_state(instance_id: str) -> str:
     if _DRY_RUN:
         _log(f"describe {instance_id}")

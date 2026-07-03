@@ -57,6 +57,12 @@
       "Effect": "Allow",
       "Action": ["ssm:TerminateSession", "ssm:ResumeSession"],
       "Resource": "arn:aws:ssm:*:*:session/${aws:username}-*"
+    },
+    {
+      "Sid": "SsmRunCommandForPreemption",
+      "Effect": "Allow",
+      "Action": ["ssm:SendCommand", "ssm:DescribeInstanceInformation"],
+      "Resource": "*"
     }
   ]
 }

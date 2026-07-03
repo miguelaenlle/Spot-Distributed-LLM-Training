@@ -1,4 +1,4 @@
-"""CLI: ``spot-orchestrate {setup,stage-data,baseline,spot} [--dry-run]``.
+"""CLI: ``spot-orchestrate {setup,stage-data,baseline,spot,preempt} [--dry-run]``.
 
 You run this; it needs your AWS creds in the environment. A git-ignored ``.env``
 in the current directory is loaded into the environment on startup (values are
@@ -37,7 +37,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(prog="spot-orchestrate", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("setup", "stage-data", "baseline", "spot"):
+    for name in ("setup", "stage-data", "baseline", "spot", "preempt"):
         sub.add_parser(name, parents=[common])
 
     args = parser.parse_args()
@@ -59,6 +59,8 @@ def main() -> None:
         experiments.run_baseline(cfg)
     elif args.command == "spot":
         experiments.run_spot(cfg)
+    elif args.command == "preempt":
+        experiments.run_preempt(cfg)
     else:  # pragma: no cover — argparse enforces the choices
         parser.error(f"unknown command {args.command}")
 

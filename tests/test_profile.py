@@ -170,6 +170,40 @@ def test_segments_from_trainer_stamps():
     assert d["total_s"] == 170.0
 
 
+def test_segments_preempt_multi_segment():
+    # 3-segment preemption: provisioning/training/downtime/recovery repeat; the
+    # final training block is split via the trainer's stamps.
+    p = RunProfile("preempt-1", "preempt", "spot")
+    p.events = [
+        Event("launch", 0.0, 1),
+        Event("first_log", 40.0, 1),  # ignored by the mark walk
+        Event("train_start", 45.0, 1),
+        Event("kill", 65.0, 1),  # seg1 training 20
+        Event("relaunch", 70.0, 2),  # downtime 5
+        Event("train_start", 115.0, 2),  # recovery 45
+        Event("kill", 135.0, 2),  # seg2 training 20
+        Event("relaunch", 140.0, 3),  # downtime 5
+        Event("train_start", 185.0, 3),  # recovery 45
+        Event("metrics", 250.0, 3),  # final training block -> split via stamps
+    ]
+    p.from_metrics({"phases": {"train_s": 20.0, "save_s": 1.0, "eval_s": 44.0}})
+    assert [s["phase"] for s in p.segments()] == [
+        "provisioning",
+        "training",
+        "downtime",
+        "preemption_recovery",
+        "training",
+        "downtime",
+        "preemption_recovery",
+        "training",
+        "final_saves",
+        "evaluation",
+    ]
+    secs = [s["seconds"] for s in p.segments()]
+    assert secs[:8] == [45.0, 20.0, 5.0, 45.0, 20.0, 5.0, 45.0, 20.0]
+    assert secs[8:] == [1.0, 44.0]  # from stamps
+
+
 def test_wandb_disabled_is_noop():
     p = RunProfile("baseline-1", "baseline", "on-demand")
     cfg = types.SimpleNamespace(wandb_enabled=lambda: False)

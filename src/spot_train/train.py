@@ -185,6 +185,17 @@ def train(cfg: TrainConfig) -> dict:
             reason = "time_budget"
             break
 
+    # Graceful preemption (SIGTERM from the orchestrator — a stand-in for a Spot
+    # reclaim): checkpoint all work up to the signal, then exit FAST. No eval, no
+    # metrics.json — metrics.json is reserved for a COMPLETED budget, so the
+    # orchestrator can treat its appearance as an unambiguous "run done".
+    if reason == "preempt":
+        ckpt_count += 1
+        do_checkpoint(step, ckpt_count)
+        listener.stop()
+        print(f"[preempt] checkpointed at step {step}; exiting for replacement", file=sys.stderr)
+        return {"run_id": cfg.run_id, "stop_reason": "preempt", "steps": step, "resumed": resumed}
+
     # Training loop is done — stamp its wall-clock, then save + evaluate (each timed
     # separately so the run profile shows the real breakdown, not "eval as saves").
     train_s = round(time.monotonic() - start_time, 2)

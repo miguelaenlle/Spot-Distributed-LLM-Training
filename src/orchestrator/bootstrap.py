@@ -128,6 +128,7 @@ def build_user_data(
     run_id: str,
     market: str,
     max_seconds: int,
+    logs_key: str | None = None,
 ) -> str:
     """Full run: provision, then train under the wall-clock budget while syncing
     the boot log to S3 every ``log_stream_seconds`` so the orchestrator can stream
@@ -137,7 +138,7 @@ def build_user_data(
     env = _trainer_env(cfg, run_id=run_id, market=market, max_seconds=max_seconds)
     steps = _provision_steps(cfg, _export_block(env))
     bucket = cfg.bucket
-    logs_key = cfg.run_logs_key(run_id)
+    logs_key = logs_key or cfg.run_logs_key(run_id)
     interval = cfg.log_stream_seconds
     return f"""#!/bin/bash
 set -x

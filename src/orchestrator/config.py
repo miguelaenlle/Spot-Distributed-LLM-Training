@@ -71,6 +71,22 @@ class OrchestratorConfig:
     eval_iters: int = field(default_factory=lambda: _env_int("EVAL_ITERS", 200))
     batch_size: int = field(default_factory=lambda: _env_int("BATCH_SIZE", 12))
 
+    # --- preemption experiment ----------------------------------------------
+    # Total TRAINING seconds to accumulate across all segments (kills don't count).
+    train_total_seconds: int = field(default_factory=lambda: _env_int("TRAIN_TOTAL_SECONDS", 60))
+    # Fixed interval the orchestrator lets a segment train before preempting it. The
+    # node is NOT told this — it only gets its remaining budget as MAX_SECONDS.
+    preempt_interval_seconds: int = field(
+        default_factory=lambda: _env_int("PREEMPT_INTERVAL_SECONDS", 20)
+    )
+    # Seconds to wait for the trainer's SIGTERM checkpoint to land before terminating.
+    preempt_grace_seconds: int = field(default_factory=lambda: _env_int("PREEMPT_GRACE", 90))
+    # Small checkpoint interval during preemption so training-start is detectable fast
+    # (graceful SIGTERM also checkpoints, so lost work is ~0 regardless).
+    preempt_checkpoint_seconds: int = field(
+        default_factory=lambda: _env_int("PREEMPT_CHECKPOINT_SECONDS", 5)
+    )
+
     # --- polling -------------------------------------------------------------
     metrics_poll_seconds: int = 15
     metrics_timeout_seconds: int = field(default_factory=lambda: _env_int("METRICS_TIMEOUT", 1800))
@@ -96,13 +112,15 @@ class OrchestratorConfig:
     def run_metrics_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/metrics.json"
 
-    # The box's boot/training log, synced here every few seconds so the
-    # orchestrator can stream it back without SSH.
-    def run_logs_uri(self, run_id: str) -> str:
-        return f"s3://{self.bucket}/{self.run_prefix}/{run_id}/logs/boot.log"
+    # The box's boot/training log, synced here every few seconds so the orchestrator
+    # can stream it back without SSH. Preemption uses a per-segment key (seg-N.log)
+    # so a fresh instance doesn't overwrite the previous segment's log.
+    def run_logs_key(self, run_id: str, segment: int | None = None) -> str:
+        name = "boot.log" if segment is None else f"seg-{segment}.log"
+        return f"{self.run_prefix}/{run_id}/logs/{name}"
 
-    def run_logs_key(self, run_id: str) -> str:
-        return f"{self.run_prefix}/{run_id}/logs/boot.log"
+    def run_logs_uri(self, run_id: str, segment: int | None = None) -> str:
+        return f"s3://{self.bucket}/{self.run_logs_key(run_id, segment)}"
 
     # The tool-agnostic run profile (timeline + loss + merged metrics) the
     # orchestrator writes at end of run. W&B is just a mirror of this.

@@ -36,6 +36,18 @@ _SEGMENT_LABEL: dict[tuple[str, str], str] = {
     ("train_start", "end"): "training",  # metrics immediately after the last step
 }
 
+# Preemption timeline is built from control-plane MARKS (not per-step lines): each
+# consecutive (from_mark, to_mark) pair maps to a phase. Repeats for each segment.
+_PREEMPT_MARKS = {"launch", "relaunch", "train_start", "kill", "metrics", "timeout"}
+_MARK_PHASE: dict[tuple[str, str], str] = {
+    ("launch", "train_start"): "provisioning",
+    ("relaunch", "train_start"): "preemption_recovery",
+    ("train_start", "kill"): "training",
+    ("kill", "relaunch"): "downtime",
+    ("train_start", "metrics"): "training",  # final segment (split via stamps below)
+    ("train_start", "timeout"): "training",
+}
+
 # Stable colors per phase (used by the stacked timeline bar).
 _PHASE_COLORS: dict[str, str] = {
     "provisioning": "#4C78A8",
@@ -220,15 +232,51 @@ class RunProfile:
         )
         self._wb_step += 1
 
+    def _stamp_phases(self) -> list[dict]:
+        """training/final_saves/evaluation from the trainer's exact stamps, or []."""
+        ph = self.metrics.get("phases") if isinstance(self.metrics, dict) else None
+        if not isinstance(ph, dict):
+            return []
+        out = []
+        for phase, key in (
+            ("training", "train_s"),
+            ("final_saves", "save_s"),
+            ("evaluation", "eval_s"),
+        ):
+            secs = ph.get(key)
+            if secs:
+                out.append({"phase": phase, "seconds": round(secs, 2)})
+        return out
+
+    def _segments_from_marks(self) -> list[dict]:
+        """Preemption timeline: walk the control-plane marks into the repeated
+        provisioning/training/downtime/preemption_recovery sequence. The final
+        training block is split via the trainer's stamps."""
+        evs = [e for e in self.events if e.event in _PREEMPT_MARKS]
+        out: list[dict] = []
+        for a, b in zip(evs, evs[1:], strict=False):
+            phase = _MARK_PHASE.get((a.event, b.event))
+            if phase is None:
+                continue
+            if phase == "training" and b.event in ("metrics", "timeout"):
+                split = self._stamp_phases()
+                if split:
+                    out.extend(split)
+                    continue
+            out.append({"phase": phase, "seconds": round(b.t_wall - a.t_wall, 2)})
+        return out
+
     # -- phase segments (ordered, non-overlapping) ------------------------- #
     def segments(self) -> list[dict]:
         """The timeline as an ordered list of phases [{"phase", "seconds"}].
 
-        Prefer the trainer's EXACT wall-clock stamps in metrics.json
-        (train_started_at + phases{train_s,save_s,eval_s}) — these are measured on
-        the box, so training reflects the real loop regardless of step speed. Fall
-        back to the per-step-line milestone proxy when they're absent (timeout, or
-        an older trainer)."""
+        - Preemption runs (any "kill" mark): walk the control-plane marks into the
+          repeated provisioning/training/downtime/recovery sequence.
+        - Otherwise prefer the trainer's EXACT wall-clock stamps in metrics.json.
+        - Else fall back to the per-step-line milestone proxy (timeout / old trainer).
+        """
+        if any(e.event == "kill" for e in self.events):
+            return self._segments_from_marks()
         m = self.metrics
         launch = self._t("launch")
         if (
