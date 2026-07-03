@@ -50,11 +50,18 @@ def _launch(
     market: str,
     budget: int,
     logs_key: str | None = None,
+    nproc_per_node: int = 1,
 ) -> str:
     # Run mode: provision, then train under the wall-clock budget while the box
     # syncs its (per-segment) log to S3 — so we can stream it here without SSH.
+    # nproc_per_node > 1 => the box runs the trainer under torchrun (single-node DDP).
     ud = bootstrap.build_user_data(
-        cfg, run_id=run_id, market=market, max_seconds=budget, logs_key=logs_key
+        cfg,
+        run_id=run_id,
+        market=market,
+        max_seconds=budget,
+        logs_key=logs_key,
+        nproc_per_node=nproc_per_node,
     )
     iid = aws.launch(
         ami_id=ami,
@@ -138,30 +145,57 @@ def _prepare(cfg: OrchestratorConfig) -> tuple[str, str]:
     return ami, sg_id
 
 
-def run_baseline(cfg: OrchestratorConfig) -> dict | None:
+def _run_single_box(
+    cfg: OrchestratorConfig,
+    *,
+    kind: str,
+    market: str,
+    budget: int,
+    nproc_per_node: int = 1,
+) -> dict | None:
+    """One box, run to its wall-clock budget, stream the log, collect the run
+    profile, then terminate. Shared by `baseline` (1 process) and `ddp` (torchrun,
+    N processes) — the only difference is nproc_per_node."""
     ami, sg_id = _prepare(cfg)
-    run_id = _run_id("baseline")
-    print(f"[baseline] run_id={run_id} budget={cfg.baseline_seconds}s", file=sys.stderr)
+    run_id = _run_id(kind)
+    extra = f" nproc_per_node={nproc_per_node}" if nproc_per_node > 1 else ""
+    print(f"[{kind}] run_id={run_id} budget={budget}s{extra}", file=sys.stderr)
     # Collect a run profile (timeline + loss) and mirror to W&B if configured.
-    profile = RunProfile(run_id, kind="baseline", market="on-demand")
+    profile = RunProfile(run_id, kind=kind, market=market)
     profile.wandb_start(cfg)
-    iid = _launch(cfg, ami, sg_id, run_id, "on-demand", cfg.baseline_seconds)
+    iid = _launch(cfg, ami, sg_id, run_id, market, budget, nproc_per_node=nproc_per_node)
     profile.mark("launch")
     try:
         if aws.is_dry_run():
-            print("[baseline] dry-run: skipping stream/terminate", file=sys.stderr)
+            print(f"[{kind}] dry-run: skipping stream/terminate", file=sys.stderr)
             return None
         metrics = _stream_until_metrics(cfg, run_id, profile)
         profile.mark("metrics" if metrics is not None else "timeout")
         profile.from_metrics(metrics)
         profile.finalize(cfg)  # write profile.json to S3 + finish the W&B run
-        print(f"[baseline] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
+        print(f"[{kind}] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
         if metrics is not None:
-            print(f"\n[baseline] metrics: {json.dumps(metrics, indent=2)}")
+            print(f"\n[{kind}] metrics: {json.dumps(metrics, indent=2)}")
         return metrics
     finally:
         # Destroy the box when training finishes (also on timeout or Ctrl-C).
         aws.terminate(iid)
+
+
+def run_baseline(cfg: OrchestratorConfig) -> dict | None:
+    return _run_single_box(cfg, kind="baseline", market="on-demand", budget=cfg.baseline_seconds)
+
+
+def run_ddp(cfg: OrchestratorConfig) -> dict | None:
+    """Single-node, multi-process DDP via torchrun (Phase 1b). Same machinery as
+    baseline; the box runs the trainer under torchrun with ddp_nproc_per_node ranks."""
+    return _run_single_box(
+        cfg,
+        kind="ddp",
+        market="on-demand",
+        budget=cfg.baseline_seconds,
+        nproc_per_node=cfg.ddp_nproc_per_node,
+    )
 
 
 def _wait_train_start(

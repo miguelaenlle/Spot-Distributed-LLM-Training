@@ -89,6 +89,13 @@ class OrchestratorConfig:
     # experiment so frequent preemption checkpoints don't flood the loss output.
     smoke_test_every: int = field(default_factory=lambda: _env_int("SMOKE_TEST_EVERY", 1))
 
+    # --- DDP experiment (spot-orchestrate ddp) ------------------------------
+    # Processes torchrun launches on the box (the 1b "4 GPUs" target). On a 2-vCPU
+    # CPU box this oversubscribes and runs slow, but exercises the DDP machinery.
+    ddp_nproc_per_node: int = field(default_factory=lambda: _env_int("DDP_NPROC_PER_NODE", 4))
+    # "shard" (real data-parallel) | "replicate" (identical data, determinism check).
+    ddp_data_mode: str = field(default_factory=lambda: _env("DDP_DATA_MODE", "shard"))
+
     # --- polling -------------------------------------------------------------
     metrics_poll_seconds: int = 15
     metrics_timeout_seconds: int = field(default_factory=lambda: _env_int("METRICS_TIMEOUT", 1800))

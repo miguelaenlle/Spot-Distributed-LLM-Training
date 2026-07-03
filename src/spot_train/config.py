@@ -82,6 +82,12 @@ class TrainConfig:
     # ML training scripts normally do it). Set "cuda"/"cpu" to force.
     device: str = "auto"
 
+    # --- DDP (torchrun) ------------------------------------------------------
+    # "shard" => each rank seeds differently and draws different batches (real
+    # data-parallel, effective batch = world_size*batch_size). "replicate" => all
+    # ranks see identical data (bit-exact vs single-process; a plumbing check).
+    data_mode: str = "shard"
+
     @classmethod
     def from_env(cls) -> TrainConfig:
         """Build a config from environment variables (used on the remote box).
@@ -104,4 +110,5 @@ class TrainConfig:
             run_id=_env_str("RUN_ID", "local"),
             market=_env_str("MARKET", "local"),
             device=_env_str("DEVICE", "auto"),
+            data_mode=_env_str("DDP_DATA_MODE", "shard"),
         )

@@ -51,6 +51,7 @@ def _trainer_env(
         "RUN_ID": run_id,
         "MARKET": market,
         "DEVICE": "auto",  # trainer auto-detects cuda vs cpu on the box
+        "DDP_DATA_MODE": cfg.ddp_data_mode,  # only used when launched via torchrun
         "PYTHONUNBUFFERED": "1",  # unbuffered so `tail -f` shows per-step lines live
     }
 
@@ -130,17 +131,31 @@ def build_user_data(
     market: str,
     max_seconds: int,
     logs_key: str | None = None,
+    nproc_per_node: int = 1,
 ) -> str:
     """Full run: provision, then train under the wall-clock budget while syncing
     the boot log to S3 every ``log_stream_seconds`` so the orchestrator can stream
     it live without SSH. On success the box self-terminates as a cost backstop (the
     orchestrator also terminates it once it sees metrics.json). On failure the box
-    stays up for debugging; the orchestrator reaps it on the metrics timeout."""
+    stays up for debugging; the orchestrator reaps it on the metrics timeout.
+
+    ``nproc_per_node > 1`` runs the trainer under torchrun (single-node DDP); the
+    trainer detects RANK and joins the process group. =1 is the plain single-process
+    launch (baseline/preempt) — byte-identical to before."""
     env = _trainer_env(cfg, run_id=run_id, market=market, max_seconds=max_seconds)
     steps = _provision_steps(cfg, _export_block(env))
     bucket = cfg.bucket
     logs_key = logs_key or cfg.run_logs_key(run_id)
     interval = cfg.log_stream_seconds
+    if nproc_per_node > 1:
+        # OMP_NUM_THREADS=1: N gloo ranks on one box otherwise spawn N×cores threads
+        # and thrash. torchrun --standalone sets RANK/LOCAL_RANK/WORLD_SIZE/MASTER_*.
+        run_cmd = (
+            f'OMP_NUM_THREADS=1 "$VENV_PY" -m torch.distributed.run '
+            f"--standalone --nproc_per_node={nproc_per_node} -m spot_train.train"
+        )
+    else:
+        run_cmd = '"$VENV_PY" -u -m spot_train.train'
     return f"""#!/bin/bash
 set -x
 exec > /var/log/spot-train-boot.log 2>&1
@@ -183,7 +198,7 @@ set +e
 # Load the run config the trainer reads (PYTHONPATH so `spot_train` imports, plus
 # the S3 URIs, MAX_SECONDS, etc.). Provisioning wrote this file but doesn't source it.
 source /home/ubuntu/spot-train.env
-"$VENV_PY" -u -m spot_train.train
+{run_cmd}
 RC=$?
 
 # Stop the uploader and push one final copy so the tail of the run is in S3.
