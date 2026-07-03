@@ -268,9 +268,10 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
     kind = "ddp-preempt" if ddp else "preempt"
     run_id = _run_id(kind)
     total = cfg.train_total_seconds
-    # Split the total training evenly across (preempt_count + 1) segments, so
-    # preempt_count=1 => train `interval`, kill once, reboot, finish `interval`.
-    interval = math.ceil(total / (cfg.preempt_count + 1))
+    # Train-before-kill time: PREEMPT_AFTER if set (fast kills for debugging),
+    # otherwise split the total evenly across (preempt_count + 1) segments, so
+    # preempt_count=1 => train `interval`, kill once, reboot, finish the rest.
+    interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
     ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
     metrics_key = cfg.run_metrics_key(run_id)
     # Dense checkpoints so training-start is detectable quickly; graceful SIGTERM
@@ -289,7 +290,7 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
         file=sys.stderr,
     )
 
-    profile = RunProfile(run_id, kind=kind, market="spot")
+    profile = RunProfile(run_id, kind=kind, market=cfg.spot_market)
     profile.wandb_start(cfg)
 
     accumulated = 0.0
@@ -300,7 +301,10 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
         while True:
             remaining = total - accumulated
             budget = max(1, math.ceil(remaining))
-            final = remaining <= interval
+            # Final once all preemptions are spent (keeps the kill count at
+            # preempt_count even when PREEMPT_AFTER shrinks the interval) or when
+            # the remaining budget wouldn't outlast another interval anyway.
+            final = seg > cfg.preempt_count or remaining <= interval
             logs_key = cfg.run_logs_key(run_id, segment=seg)
             profile.segment = seg
             print(
@@ -314,7 +318,7 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
                 ami,
                 sg_id,
                 run_id,
-                "spot",
+                cfg.spot_market,
                 budget,
                 logs_key=logs_key,
                 ddp=ddp,
@@ -382,7 +386,7 @@ def run_spot(cfg: OrchestratorConfig) -> dict | None:
     )
 
     # --- segment 1: train, then kill mid-run ------------------------------ #
-    iid1 = _launch(cfg, ami, sg_id, run_id, "spot", _SEG1_TRAINER_BUDGET)
+    iid1 = _launch(cfg, ami, sg_id, run_id, cfg.spot_market, _SEG1_TRAINER_BUDGET)
     try:
         if aws.is_dry_run():
             print("[spot] dry-run: skipping wait/kill/resume", file=sys.stderr)
@@ -403,7 +407,7 @@ def run_spot(cfg: OrchestratorConfig) -> dict | None:
     print("[spot] segment 1 instance terminated (simulated preemption)", file=sys.stderr)
 
     # --- segment 2: resume from S3 and finish ----------------------------- #
-    iid2 = _launch(cfg, ami, sg_id, run_id, "spot", cfg.spot_seg2_seconds)
+    iid2 = _launch(cfg, ami, sg_id, run_id, cfg.spot_market, cfg.spot_seg2_seconds)
     try:
         metrics = _poll_metrics(cfg, run_id)
         print(f"[spot] metrics: {json.dumps(metrics, indent=2)}")

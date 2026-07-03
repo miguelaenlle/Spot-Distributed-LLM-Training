@@ -71,6 +71,11 @@ class OrchestratorConfig:
     eval_iters: int = field(default_factory=lambda: _env_int("EVAL_ITERS", 200))
     batch_size: int = field(default_factory=lambda: _env_int("BATCH_SIZE", 12))
 
+    # Market the spot-style experiments (spot/preempt/ddp-preempt) launch in.
+    # MARKET=on-demand runs the same kill/resume mechanics on on-demand capacity —
+    # useful when the spot vCPU quota is exhausted. baseline/ddp are always on-demand.
+    spot_market: str = field(default_factory=lambda: _env("MARKET", "spot"))
+
     # --- preemption experiment ----------------------------------------------
     # Total TRAINING seconds to accumulate across all segments (kills don't count).
     train_total_seconds: int = field(default_factory=lambda: _env_int("TRAIN_TOTAL_SECONDS", 180))
@@ -80,6 +85,10 @@ class OrchestratorConfig:
     preempt_count: int = field(default_factory=lambda: _env_int("PREEMPT_COUNT", 1))
     # Seconds to wait for the trainer's SIGTERM checkpoint to land before terminating.
     preempt_grace_seconds: int = field(default_factory=lambda: _env_int("PREEMPT_GRACE", 90))
+    # Seconds of training before each kill. 0 (default) = split train_total_seconds
+    # evenly across segments. Set small (e.g. PREEMPT_AFTER=15) to exercise the
+    # kill/resume path fast while debugging; the number of kills stays preempt_count.
+    preempt_after_seconds: int = field(default_factory=lambda: _env_int("PREEMPT_AFTER", 0))
     # Small checkpoint interval during preemption so training-start is detectable fast
     # (graceful SIGTERM also checkpoints, so lost work is ~0 regardless).
     preempt_checkpoint_seconds: int = field(

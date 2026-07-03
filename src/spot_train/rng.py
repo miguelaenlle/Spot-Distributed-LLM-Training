@@ -30,6 +30,8 @@ def restore(state: dict[str, Any]) -> None:
     """Restore RNG sources captured by :func:`capture`."""
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    # set_rng_state requires CPU ByteTensors, but a checkpoint loaded with
+    # map_location=cuda has moved these to the GPU — bring them back.
+    torch.set_rng_state(state["torch"].cpu())
     if "torch_cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+        torch.cuda.set_rng_state_all([s.cpu() for s in state["torch_cuda"]])
