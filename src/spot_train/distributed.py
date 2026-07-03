@@ -36,10 +36,11 @@ def init(device: str) -> Dist:
     if device.startswith("cuda"):
         device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
-        backend = "nccl"
+        # device_id binds the NCCL communicator to this rank's GPU eagerly, so
+        # collectives can't lazily pick the wrong device (and shutdown is clean).
+        dist.init_process_group(backend="nccl", device_id=torch.device(device))
     else:
-        backend = "gloo"
-    dist.init_process_group(backend=backend)
+        dist.init_process_group(backend="gloo")
     return Dist(
         enabled=True,
         rank=rank,
@@ -61,7 +62,10 @@ def all_reduce_stop(d: Dist, local_stop: bool) -> bool:
     blocking on the next backward's gradient all-reduce (deadlock avoidance)."""
     if not d.enabled:
         return local_stop
-    t = torch.tensor([1 if local_stop else 0], dtype=torch.int32)
+    # Collective tensors must live on the backend's device: nccl only reduces
+    # CUDA tensors (a CPU tensor raises "No backend type associated with device
+    # type cpu"); on gloo d.device is "cpu" so this is a no-op.
+    t = torch.tensor([1 if local_stop else 0], dtype=torch.int32, device=d.device)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return bool(t.item())
 
@@ -70,6 +74,6 @@ def mean_loss(d: Dist, loss_value: float) -> float:
     """Global mean loss across ranks for the reported log line (all ranks call it)."""
     if not d.enabled:
         return loss_value
-    t = torch.tensor([loss_value], dtype=torch.float32)
+    t = torch.tensor([loss_value], dtype=torch.float32, device=d.device)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return float(t.item()) / d.world_size

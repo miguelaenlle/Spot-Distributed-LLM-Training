@@ -90,9 +90,10 @@ class OrchestratorConfig:
     smoke_test_every: int = field(default_factory=lambda: _env_int("SMOKE_TEST_EVERY", 1))
 
     # --- DDP experiment (spot-orchestrate ddp) ------------------------------
-    # Processes torchrun launches on the box (the 1b "4 GPUs" target). On a 2-vCPU
-    # CPU box this oversubscribes and runs slow, but exercises the DDP machinery.
-    ddp_nproc_per_node: int = field(default_factory=lambda: _env_int("DDP_NPROC_PER_NODE", 4))
+    # Ranks torchrun launches on the box. 0 (default) = auto: one rank per GPU on
+    # the machine (torchrun --nproc_per_node=gpu). Set a positive value to force a
+    # fixed count — needed to exercise multi-rank DDP on a CPU-only box.
+    ddp_nproc_per_node: int = field(default_factory=lambda: _env_int("DDP_NPROC_PER_NODE", 0))
     # "shard" (real data-parallel) | "replicate" (identical data, determinism check).
     ddp_data_mode: str = field(default_factory=lambda: _env("DDP_DATA_MODE", "shard"))
 

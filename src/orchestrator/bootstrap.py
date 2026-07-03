@@ -131,7 +131,8 @@ def build_user_data(
     market: str,
     max_seconds: int,
     logs_key: str | None = None,
-    nproc_per_node: int = 1,
+    ddp: bool = False,
+    nproc_per_node: int = 0,
 ) -> str:
     """Full run: provision, then train under the wall-clock budget while syncing
     the boot log to S3 every ``log_stream_seconds`` so the orchestrator can stream
@@ -139,20 +140,24 @@ def build_user_data(
     orchestrator also terminates it once it sees metrics.json). On failure the box
     stays up for debugging; the orchestrator reaps it on the metrics timeout.
 
-    ``nproc_per_node > 1`` runs the trainer under torchrun (single-node DDP); the
-    trainer detects RANK and joins the process group. =1 is the plain single-process
-    launch (baseline/preempt) — byte-identical to before."""
+    ``ddp=True`` runs the trainer under torchrun (single-node DDP); the trainer
+    detects RANK and joins the process group. ``nproc_per_node <= 0`` auto-detects
+    one rank per GPU on the box (torchrun --nproc_per_node=gpu); a positive value
+    forces that count. ``ddp=False`` is the plain single-process launch
+    (baseline/preempt) — byte-identical to before."""
     env = _trainer_env(cfg, run_id=run_id, market=market, max_seconds=max_seconds)
     steps = _provision_steps(cfg, _export_block(env))
     bucket = cfg.bucket
     logs_key = logs_key or cfg.run_logs_key(run_id)
     interval = cfg.log_stream_seconds
-    if nproc_per_node > 1:
-        # OMP_NUM_THREADS=1: N gloo ranks on one box otherwise spawn N×cores threads
-        # and thrash. torchrun --standalone sets RANK/LOCAL_RANK/WORLD_SIZE/MASTER_*.
+    if ddp:
+        nproc = "gpu" if nproc_per_node <= 0 else str(nproc_per_node)
+        # nproc=gpu => torchrun uses torch.cuda.device_count() (one rank per GPU).
+        # OMP_NUM_THREADS=1: N gloo ranks on one CPU box otherwise spawn N×cores
+        # threads and thrash. torchrun --standalone sets RANK/LOCAL_RANK/WORLD_SIZE/MASTER_*.
         run_cmd = (
             f'OMP_NUM_THREADS=1 "$VENV_PY" -m torch.distributed.run '
-            f"--standalone --nproc_per_node={nproc_per_node} -m spot_train.train"
+            f"--standalone --nproc_per_node={nproc} -m spot_train.train"
         )
     else:
         run_cmd = '"$VENV_PY" -u -m spot_train.train'

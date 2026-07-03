@@ -64,7 +64,7 @@ def main() -> None:
     elif args.command == "ddp":
         experiments.run_ddp(cfg)
     elif args.command == "ddp-preempt":
-        experiments.run_preempt(cfg, nproc_per_node=cfg.ddp_nproc_per_node)
+        experiments.run_preempt(cfg, ddp=True)
     else:  # pragma: no cover — argparse enforces the choices
         parser.error(f"unknown command {args.command}")
 

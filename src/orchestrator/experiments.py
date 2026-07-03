@@ -50,17 +50,19 @@ def _launch(
     market: str,
     budget: int,
     logs_key: str | None = None,
-    nproc_per_node: int = 1,
+    ddp: bool = False,
+    nproc_per_node: int = 0,
 ) -> str:
     # Run mode: provision, then train under the wall-clock budget while the box
     # syncs its (per-segment) log to S3 — so we can stream it here without SSH.
-    # nproc_per_node > 1 => the box runs the trainer under torchrun (single-node DDP).
+    # ddp=True => the box runs the trainer under torchrun (single-node DDP).
     ud = bootstrap.build_user_data(
         cfg,
         run_id=run_id,
         market=market,
         max_seconds=budget,
         logs_key=logs_key,
+        ddp=ddp,
         nproc_per_node=nproc_per_node,
     )
     iid = aws.launch(
@@ -151,19 +153,20 @@ def _run_single_box(
     kind: str,
     market: str,
     budget: int,
-    nproc_per_node: int = 1,
+    ddp: bool = False,
+    nproc_per_node: int = 0,
 ) -> dict | None:
     """One box, run to its wall-clock budget, stream the log, collect the run
     profile, then terminate. Shared by `baseline` (1 process) and `ddp` (torchrun,
-    N processes) — the only difference is nproc_per_node."""
+    N processes) — the only difference is the ddp/torchrun launch."""
     ami, sg_id = _prepare(cfg)
     run_id = _run_id(kind)
-    extra = f" nproc_per_node={nproc_per_node}" if nproc_per_node > 1 else ""
+    extra = f" nproc_per_node={nproc_per_node or 'auto(gpu)'}" if ddp else ""
     print(f"[{kind}] run_id={run_id} budget={budget}s{extra}", file=sys.stderr)
     # Collect a run profile (timeline + loss) and mirror to W&B if configured.
     profile = RunProfile(run_id, kind=kind, market=market)
     profile.wandb_start(cfg)
-    iid = _launch(cfg, ami, sg_id, run_id, market, budget, nproc_per_node=nproc_per_node)
+    iid = _launch(cfg, ami, sg_id, run_id, market, budget, ddp=ddp, nproc_per_node=nproc_per_node)
     profile.mark("launch")
     try:
         if aws.is_dry_run():
@@ -194,6 +197,7 @@ def run_ddp(cfg: OrchestratorConfig) -> dict | None:
         kind="ddp",
         market="on-demand",
         budget=cfg.baseline_seconds,
+        ddp=True,
         nproc_per_node=cfg.ddp_nproc_per_node,
     )
 
@@ -248,18 +252,20 @@ def _preempt_instance(cfg: OrchestratorConfig, iid: str, ckpt_prefix: str) -> No
     aws.terminate(iid)
 
 
-def run_preempt(cfg: OrchestratorConfig, *, nproc_per_node: int = 1) -> dict | None:
+def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
     """Orchestrator-driven preemption: play the role of AWS Spot by killing the
     training instance at a FIXED interval the node isn't told about, accumulating
     ``train_total_seconds`` of TRAINING across segments. Each kill is unrecoverable —
     a FRESH instance is provisioned that resumes from the S3 checkpoint.
 
-    ``nproc_per_node > 1`` runs each segment under torchrun (single-node DDP): a
-    preemption kills the whole box (all ranks together), and the replacement box
-    brings up a fresh N-rank group that resumes from rank-0's S3 checkpoint. The
-    trainer's coordinated stop + all-ranks-resume make this deadlock-free."""
+    ``ddp=True`` runs each segment under torchrun (single-node DDP), one rank per
+    GPU on the box (or ``ddp_nproc_per_node`` if forced): a preemption kills the
+    whole box (all ranks together), and the replacement box brings up a fresh
+    N-rank group that resumes from rank-0's S3 checkpoint. The trainer's coordinated
+    stop + all-ranks-resume make this deadlock-free."""
     ami, sg_id = _prepare(cfg)
-    kind = "ddp-preempt" if nproc_per_node > 1 else "preempt"
+    nproc_per_node = cfg.ddp_nproc_per_node if ddp else 1
+    kind = "ddp-preempt" if ddp else "preempt"
     run_id = _run_id(kind)
     total = cfg.train_total_seconds
     # Split the total training evenly across (preempt_count + 1) segments, so
@@ -275,10 +281,10 @@ def run_preempt(cfg: OrchestratorConfig, *, nproc_per_node: int = 1) -> dict | N
     # Keep the checkpoint verify+smoke cadence ~30s (like baseline) so the frequent
     # preemption checkpoints don't flood the streamed loss lines.
     cfg.smoke_test_every = max(1, round(30 / cfg.checkpoint_interval_seconds))
-    ddp = f" nproc_per_node={nproc_per_node}" if nproc_per_node > 1 else ""
+    ddp_note = f" nproc_per_node={nproc_per_node or 'auto(gpu)'}" if ddp else ""
     print(
         f"[{kind}] run_id={run_id} total_train={total}s preemptions={cfg.preempt_count} "
-        f"interval={interval}s ckpt_every={cfg.checkpoint_interval_seconds}s{ddp} — fresh "
+        f"interval={interval}s ckpt_every={cfg.checkpoint_interval_seconds}s{ddp_note} — fresh "
         f"instance per segment, node not told the schedule",
         file=sys.stderr,
     )
@@ -311,6 +317,7 @@ def run_preempt(cfg: OrchestratorConfig, *, nproc_per_node: int = 1) -> dict | N
                 "spot",
                 budget,
                 logs_key=logs_key,
+                ddp=ddp,
                 nproc_per_node=nproc_per_node,
             )
             profile.mark("launch" if seg == 1 else "relaunch")
