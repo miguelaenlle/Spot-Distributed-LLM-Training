@@ -106,6 +106,16 @@ class OrchestratorConfig:
     # "shard" (real data-parallel) | "replicate" (identical data, determinism check).
     ddp_data_mode: str = field(default_factory=lambda: _env("DDP_DATA_MODE", "shard"))
 
+    # --- multi-node experiment (spot-orchestrate multinode) ------------------
+    # Nodes in the training group; each runs torchrun with one rank per GPU.
+    # Node 0 hosts the c10d rendezvous store and publishes its private IP to S3
+    # (runs/<run_id>/rdzv.json); the other nodes poll that key before starting.
+    node_count: int = field(default_factory=lambda: _env_int("NODES", 2))
+    rdzv_port: int = field(default_factory=lambda: _env_int("RDZV_PORT", 29400))
+    # Collective timeout exported to multi-node boxes so survivors' collectives
+    # abort fast when a peer node dies (torch's default is 10 minutes).
+    nccl_timeout_seconds: int = field(default_factory=lambda: _env_int("NCCL_TIMEOUT", 60))
+
     # --- polling -------------------------------------------------------------
     metrics_poll_seconds: int = 15
     metrics_timeout_seconds: int = field(default_factory=lambda: _env_int("METRICS_TIMEOUT", 1800))
@@ -133,13 +143,21 @@ class OrchestratorConfig:
 
     # The box's boot/training log, synced here every few seconds so the orchestrator
     # can stream it back without SSH. Preemption uses a per-segment key (seg-N.log)
-    # so a fresh instance doesn't overwrite the previous segment's log.
-    def run_logs_key(self, run_id: str, segment: int | None = None) -> str:
-        name = "boot.log" if segment is None else f"seg-{segment}.log"
-        return f"{self.run_prefix}/{run_id}/logs/{name}"
+    # so a fresh instance doesn't overwrite the previous segment's log; multi-node
+    # adds a per-node suffix so the boxes don't clobber each other.
+    def run_logs_key(self, run_id: str, segment: int | None = None, node: int | None = None) -> str:
+        name = "boot" if segment is None else f"seg-{segment}"
+        if node is not None:
+            name += f"-node{node}"
+        return f"{self.run_prefix}/{run_id}/logs/{name}.log"
 
     def run_logs_uri(self, run_id: str, segment: int | None = None) -> str:
         return f"s3://{self.bucket}/{self.run_logs_key(run_id, segment)}"
+
+    # Multi-node rendezvous bootstrap: node 0 writes its private IP here at boot;
+    # the other nodes poll it, then all run torchrun against node 0's TCPStore.
+    def run_rdzv_key(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/rdzv.json"
 
     # The tool-agnostic run profile (timeline + loss + merged metrics) the
     # orchestrator writes at end of run. W&B is just a mirror of this.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -33,14 +34,19 @@ def init(device: str) -> Dist:
         return Dist(enabled=False, rank=0, local_rank=0, world_size=1, master=True, device=device)
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+    # Collective timeout: how long a rank blocks on a peer before aborting. The
+    # multi-node orchestrator exports a short NCCL_TIMEOUT so survivors of a node
+    # kill crash fast and their elastic agent can re-rendezvous; unset (single
+    # node) keeps torch's 10-minute default.
+    timeout = timedelta(seconds=int(os.environ.get("NCCL_TIMEOUT", "600")))
     if device.startswith("cuda"):
         device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
         # device_id binds the NCCL communicator to this rank's GPU eagerly, so
         # collectives can't lazily pick the wrong device (and shutdown is clean).
-        dist.init_process_group(backend="nccl", device_id=torch.device(device))
+        dist.init_process_group(backend="nccl", device_id=torch.device(device), timeout=timeout)
     else:
-        dist.init_process_group(backend="gloo")
+        dist.init_process_group(backend="gloo", timeout=timeout)
     return Dist(
         enabled=True,
         rank=rank,

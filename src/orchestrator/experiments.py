@@ -202,6 +202,187 @@ def run_ddp(cfg: OrchestratorConfig) -> dict | None:
     )
 
 
+def _launch_node(
+    cfg: OrchestratorConfig,
+    ami: str,
+    sg_id: str,
+    run_id: str,
+    market: str,
+    budget: int,
+    *,
+    node_index: int,
+    logs_key: str,
+) -> str:
+    """Launch one member of an N-node DDP group (see bootstrap._rdzv_block for
+    how the nodes find each other). Does not wait for 'running'."""
+    ud = bootstrap.build_user_data(
+        cfg,
+        run_id=run_id,
+        market=market,
+        max_seconds=budget,
+        logs_key=logs_key,
+        ddp=True,
+        nproc_per_node=cfg.ddp_nproc_per_node,
+        nodes=cfg.node_count,
+        node_index=node_index,
+    )
+    return aws.launch(
+        ami_id=ami,
+        instance_type=cfg.instance_type,
+        profile_name=cfg.instance_profile,
+        security_group_id=sg_id,
+        user_data=ud,
+        market=market,
+        run_id=run_id,
+        key_name=cfg.key_name,
+    )
+
+
+def run_multinode(cfg: OrchestratorConfig) -> dict | None:
+    """N nodes × one-rank-per-GPU DDP via torchrun c10d rendezvous, run to the
+    wall-clock budget. Node 0 hosts the rendezvous store and its rank 0 does all
+    checkpointing/metrics; the orchestrator streams node 0's log."""
+    ami, sg_id = _prepare(cfg)
+    run_id = _run_id("multinode")
+    budget = cfg.baseline_seconds
+    market = cfg.spot_market
+    print(
+        f"[multinode] run_id={run_id} nodes={cfg.node_count} budget={budget}s market={market}",
+        file=sys.stderr,
+    )
+    profile = RunProfile(run_id, kind="multinode", market=market)
+    profile.wandb_start(cfg)
+    iids: list[str] = []
+    try:
+        for i in range(cfg.node_count):
+            iids.append(
+                _launch_node(
+                    cfg,
+                    ami,
+                    sg_id,
+                    run_id,
+                    market,
+                    budget,
+                    node_index=i,
+                    logs_key=cfg.run_logs_key(run_id, node=i),
+                )
+            )
+        for iid in iids:
+            aws.wait_running(iid)
+        profile.mark("launch")
+        if aws.is_dry_run():
+            print("[multinode] dry-run: skipping stream/terminate", file=sys.stderr)
+            return None
+        metrics = _stream_until_metrics(
+            cfg, run_id, profile, logs_key=cfg.run_logs_key(run_id, node=0)
+        )
+        profile.mark("metrics" if metrics is not None else "timeout")
+        profile.from_metrics(metrics)
+        profile.finalize(cfg)
+        print(f"[multinode] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
+        if metrics is not None:
+            print(f"\n[multinode] metrics: {json.dumps(metrics, indent=2)}")
+        return metrics
+    finally:
+        for iid in iids:
+            aws.terminate(iid)
+
+
+def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
+    """Multi-node preemption: HARD-terminate one non-master node mid-run (no
+    SIGTERM — a graceful stop would coordinate a clean whole-group shutdown, which
+    is not the failure we want). Survivors' collectives abort after NCCL_TIMEOUT,
+    their elastic agents re-enter rendezvous, and a replacement box with the same
+    node index joins; every worker then restarts through the one resume path from
+    the latest S3 checkpoint. Lost work is bounded by the densified checkpoint
+    interval. One preemption per run; MAX_SECONDS restarts with the workers, so
+    total training ≈ PREEMPT_AFTER + TRAIN_TOTAL_SECONDS."""
+    if cfg.node_count < 2:
+        raise SystemExit("multinode-preempt needs NODES >= 2")
+    ami, sg_id = _prepare(cfg)
+    run_id = _run_id("multinode-preempt")
+    budget = cfg.train_total_seconds
+    market = cfg.spot_market
+    interval = cfg.preempt_after_seconds or math.ceil(budget / 2)
+    victim = cfg.node_count - 1
+    ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
+    metrics_key = cfg.run_metrics_key(run_id)
+    # Dense checkpoints: a hard kill gives no warning, so lost work is bounded by
+    # this interval (same knobs as run_preempt).
+    cfg.checkpoint_interval_seconds = min(
+        cfg.checkpoint_interval_seconds, cfg.preempt_checkpoint_seconds
+    )
+    cfg.smoke_test_every = max(1, round(30 / cfg.checkpoint_interval_seconds))
+    print(
+        f"[multinode-preempt] run_id={run_id} nodes={cfg.node_count} budget={budget}s "
+        f"market={market} — hard-kill node {victim} after ~{interval}s of training",
+        file=sys.stderr,
+    )
+    profile = RunProfile(run_id, kind="multinode-preempt", market=market)
+    profile.wandb_start(cfg)
+    live: dict[int, str] = {}
+    try:
+        for i in range(cfg.node_count):
+            live[i] = _launch_node(
+                cfg,
+                ami,
+                sg_id,
+                run_id,
+                market,
+                budget,
+                node_index=i,
+                logs_key=cfg.run_logs_key(run_id, node=i),
+            )
+        for iid in live.values():
+            aws.wait_running(iid)
+        profile.mark("launch")
+        if aws.is_dry_run():
+            print("[multinode-preempt] dry-run: not waiting/killing", file=sys.stderr)
+            return None
+
+        node0_log = cfg.run_logs_key(run_id, node=0)
+        state = {"printed": 0}
+        _wait_train_start(cfg, ckpt_prefix, 0, node0_log, profile, state, metrics_key)
+        profile.mark("train_start")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < interval:
+            _pull_log(cfg, node0_log, profile, state)
+            time.sleep(cfg.log_stream_seconds)
+        print(
+            f"[multinode-preempt] hard-terminating node {victim} after "
+            f"~{time.monotonic() - t0:.0f}s training (no warning)",
+            file=sys.stderr,
+        )
+        aws.terminate(live[victim])
+        profile.mark("kill")
+        # Free the vCPU quota before the replacement — at an 8-vCPU G quota,
+        # 2 nodes + a replacement can't coexist.
+        aws.wait_terminated(live.pop(victim))
+        live[victim] = _launch_node(
+            cfg,
+            ami,
+            sg_id,
+            run_id,
+            market,
+            budget,
+            node_index=victim,
+            logs_key=cfg.run_logs_key(run_id, segment=2, node=victim),
+        )
+        profile.mark("relaunch")
+
+        metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=node0_log)
+        profile.mark("metrics" if metrics is not None else "timeout")
+        profile.from_metrics(metrics)
+        profile.finalize(cfg)
+        print(f"[multinode-preempt] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
+        if metrics is not None:
+            print(f"\n[multinode-preempt] metrics: {json.dumps(metrics, indent=2)}")
+        return metrics
+    finally:
+        for iid in live.values():
+            aws.terminate(iid)
+
+
 def _wait_train_start(
     cfg: OrchestratorConfig,
     ckpt_prefix: str,

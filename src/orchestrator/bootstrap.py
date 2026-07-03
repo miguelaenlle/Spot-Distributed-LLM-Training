@@ -124,6 +124,46 @@ echo "[provision] user-data exited rc=$? — box left UP for SSH (no training, n
 """
 
 
+def _rdzv_block(cfg: OrchestratorConfig, *, run_id: str, nodes: int, node_index: int) -> str:
+    """Bash for the multi-node rendezvous bootstrap. Node 0 publishes its private
+    IP to S3; the others poll it (bounded — a node that never sees the key exits
+    nonzero and is left up for debugging, like any failed boot). Sets RDZV_ADDR."""
+    bucket = cfg.bucket
+    rdzv_key = cfg.run_rdzv_key(run_id)
+    if node_index == 0:
+        return f"""
+# --- multi-node rendezvous: node 0 hosts the store, publish our IP ----------
+RDZV_ADDR=$(hostname -I | awk '{{print $1}}')
+"$VENV_PY" - <<PY
+import boto3, json
+boto3.client("s3").put_object(
+    Bucket="{bucket}", Key="{rdzv_key}",
+    Body=json.dumps({{"addr": "$RDZV_ADDR", "node_count": {nodes}}}).encode(),
+)
+PY
+echo "[rdzv] node 0/{nodes}: published $RDZV_ADDR:{cfg.rdzv_port}"
+"""
+    return f"""
+# --- multi-node rendezvous: poll S3 for node 0's address --------------------
+"$VENV_PY" - <<'PY' > /tmp/rdzv_addr
+import json, sys, time
+import boto3
+s3 = boto3.client("s3")
+for _ in range(300):  # ~15 min; node 0 publishes within seconds of booting
+    try:
+        body = s3.get_object(Bucket="{bucket}", Key="{rdzv_key}")["Body"].read()
+        print(json.loads(body)["addr"])
+        sys.exit(0)
+    except Exception:
+        time.sleep(3)
+sys.exit(1)
+PY
+RDZV_ADDR=$(cat /tmp/rdzv_addr)
+[ -n "$RDZV_ADDR" ] || {{ echo "[rdzv] node {node_index}: never saw {rdzv_key}"; exit 1; }}
+echo "[rdzv] node {node_index}/{nodes}: joining $RDZV_ADDR:{cfg.rdzv_port}"
+"""
+
+
 def build_user_data(
     cfg: OrchestratorConfig,
     *,
@@ -133,6 +173,8 @@ def build_user_data(
     logs_key: str | None = None,
     ddp: bool = False,
     nproc_per_node: int = 0,
+    nodes: int = 1,
+    node_index: int = 0,
 ) -> str:
     """Full run: provision, then train under the wall-clock budget while syncing
     the boot log to S3 every ``log_stream_seconds`` so the orchestrator can stream
@@ -144,13 +186,34 @@ def build_user_data(
     detects RANK and joins the process group. ``nproc_per_node <= 0`` auto-detects
     one rank per GPU on the box (torchrun --nproc_per_node=gpu); a positive value
     forces that count. ``ddp=False`` is the plain single-process launch
-    (baseline/preempt) — byte-identical to before."""
+    (baseline/preempt) — byte-identical to before.
+
+    ``nodes > 1`` (implies ddp) joins an N-node group via c10d rendezvous: node 0
+    hosts the TCPStore and publishes its private IP to S3 (rdzv.json); the other
+    nodes poll that key before starting torchrun. ``--max-restarts`` lets a
+    surviving node's elastic agent re-rendezvous after a peer dies, so a
+    replacement box (same node_index) rejoins and every worker restarts through
+    the one resume path."""
     env = _trainer_env(cfg, run_id=run_id, market=market, max_seconds=max_seconds)
+    if nodes > 1:
+        # Short collective timeout so survivors of a node kill abort fast (see
+        # distributed.init); single-node keeps torch's default.
+        env["NCCL_TIMEOUT"] = str(cfg.nccl_timeout_seconds)
     steps = _provision_steps(cfg, _export_block(env))
     bucket = cfg.bucket
     logs_key = logs_key or cfg.run_logs_key(run_id)
     interval = cfg.log_stream_seconds
-    if ddp:
+    rdzv_block = ""
+    if nodes > 1:
+        nproc = "gpu" if nproc_per_node <= 0 else str(nproc_per_node)
+        rdzv_block = _rdzv_block(cfg, run_id=run_id, nodes=nodes, node_index=node_index)
+        run_cmd = (
+            f'OMP_NUM_THREADS=1 "$VENV_PY" -m torch.distributed.run '
+            f"--nnodes={nodes} --nproc_per_node={nproc} "
+            f'--rdzv_backend=c10d --rdzv_endpoint="$RDZV_ADDR:{cfg.rdzv_port}" '
+            f"--rdzv_id={run_id} --max-restarts=3 -m spot_train.train"
+        )
+    elif ddp:
         nproc = "gpu" if nproc_per_node <= 0 else str(nproc_per_node)
         # nproc=gpu => torchrun uses torch.cuda.device_count() (one rank per GPU).
         # OMP_NUM_THREADS=1: N gloo ranks on one CPU box otherwise spawn N×cores
@@ -203,6 +266,7 @@ set +e
 # Load the run config the trainer reads (PYTHONPATH so `spot_train` imports, plus
 # the S3 URIs, MAX_SECONDS, etc.). Provisioning wrote this file but doesn't source it.
 source /home/ubuntu/spot-train.env
+{rdzv_block}
 {run_cmd}
 RC=$?
 

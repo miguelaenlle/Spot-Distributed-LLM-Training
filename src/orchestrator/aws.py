@@ -306,6 +306,26 @@ def ensure_security_group(name: str, region: str) -> str:
     except Exception as e:  # noqa: BLE001 — boto ClientError; duplicate rule is fine
         if "InvalidPermission.Duplicate" not in str(e):
             raise
+    # Multi-node DDP: allow ALL TCP between instances in this group (the c10d
+    # rendezvous TCPStore on node 0 plus the NCCL/gloo data-plane sockets, which
+    # use ephemeral ports). Self-referencing, so nothing new is exposed publicly.
+    try:
+        ec2.authorize_security_group_ingress(
+            GroupId=gid,
+            IpPermissions=[
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 0,
+                    "ToPort": 65535,
+                    "UserIdGroupPairs": [
+                        {"GroupId": gid, "Description": "intra-group DDP (rendezvous + NCCL)"}
+                    ],
+                }
+            ],
+        )
+    except Exception as e:  # noqa: BLE001 — boto ClientError; duplicate rule is fine
+        if "InvalidPermission.Duplicate" not in str(e):
+            raise
     return gid
 
 
@@ -386,6 +406,15 @@ def terminate(instance_id: str) -> None:
     if _DRY_RUN:
         return
     _client("ec2").terminate_instances(InstanceIds=[instance_id])
+
+
+def wait_terminated(instance_id: str) -> None:
+    """Block until the instance is fully terminated — needed before launching a
+    replacement when the vCPU quota can't hold both at once."""
+    _log(f"wait until terminated: {instance_id}")
+    if _DRY_RUN:
+        return
+    _client("ec2").get_waiter("instance_terminated").wait(InstanceIds=[instance_id])
 
 
 def _ignore_exists(fn) -> None:
