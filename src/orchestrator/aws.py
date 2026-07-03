@@ -16,6 +16,7 @@ functions; they never import boto3 themselves.
 from __future__ import annotations
 
 import sys
+import time
 from typing import Any
 
 _DRY_RUN = False
@@ -408,13 +409,20 @@ def terminate(instance_id: str) -> None:
     _client("ec2").terminate_instances(InstanceIds=[instance_id])
 
 
-def wait_terminated(instance_id: str) -> None:
-    """Block until the instance is fully terminated — needed before launching a
-    replacement when the vCPU quota can't hold both at once."""
-    _log(f"wait until terminated: {instance_id}")
+def wait_quota_released(instance_id: str) -> None:
+    """Block until the instance leaves pending/running — the point at which it
+    stops counting against the vCPU quota, so a replacement can launch. Do NOT
+    wait for full 'terminated': shutting-down can linger for minutes (a hung OS
+    shutdown holds it until AWS force-kills) and the quota is already free."""
+    _log(f"wait until instance stops counting against quota: {instance_id}")
     if _DRY_RUN:
         return
-    _client("ec2").get_waiter("instance_terminated").wait(InstanceIds=[instance_id])
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        if instance_state(instance_id) not in ("pending", "running"):
+            return
+        time.sleep(5)
+    raise TimeoutError(f"{instance_id} still running 300s after TerminateInstances")
 
 
 def _ignore_exists(fn) -> None:

@@ -356,8 +356,9 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
         aws.terminate(live[victim])
         profile.mark("kill")
         # Free the vCPU quota before the replacement — at an 8-vCPU G quota,
-        # 2 nodes + a replacement can't coexist.
-        aws.wait_terminated(live.pop(victim))
+        # 2 nodes + a replacement can't coexist. Quota releases when the instance
+        # leaves 'running' (seconds), not when it reaches 'terminated' (minutes).
+        aws.wait_quota_released(live.pop(victim))
         live[victim] = _launch_node(
             cfg,
             ami,
