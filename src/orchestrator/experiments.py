@@ -248,13 +248,19 @@ def _preempt_instance(cfg: OrchestratorConfig, iid: str, ckpt_prefix: str) -> No
     aws.terminate(iid)
 
 
-def run_preempt(cfg: OrchestratorConfig) -> dict | None:
+def run_preempt(cfg: OrchestratorConfig, *, nproc_per_node: int = 1) -> dict | None:
     """Orchestrator-driven preemption: play the role of AWS Spot by killing the
     training instance at a FIXED interval the node isn't told about, accumulating
     ``train_total_seconds`` of TRAINING across segments. Each kill is unrecoverable —
-    a FRESH instance is provisioned that resumes from the S3 checkpoint."""
+    a FRESH instance is provisioned that resumes from the S3 checkpoint.
+
+    ``nproc_per_node > 1`` runs each segment under torchrun (single-node DDP): a
+    preemption kills the whole box (all ranks together), and the replacement box
+    brings up a fresh N-rank group that resumes from rank-0's S3 checkpoint. The
+    trainer's coordinated stop + all-ranks-resume make this deadlock-free."""
     ami, sg_id = _prepare(cfg)
-    run_id = _run_id("preempt")
+    kind = "ddp-preempt" if nproc_per_node > 1 else "preempt"
+    run_id = _run_id(kind)
     total = cfg.train_total_seconds
     # Split the total training evenly across (preempt_count + 1) segments, so
     # preempt_count=1 => train `interval`, kill once, reboot, finish `interval`.
@@ -269,14 +275,15 @@ def run_preempt(cfg: OrchestratorConfig) -> dict | None:
     # Keep the checkpoint verify+smoke cadence ~30s (like baseline) so the frequent
     # preemption checkpoints don't flood the streamed loss lines.
     cfg.smoke_test_every = max(1, round(30 / cfg.checkpoint_interval_seconds))
+    ddp = f" nproc_per_node={nproc_per_node}" if nproc_per_node > 1 else ""
     print(
-        f"[preempt] run_id={run_id} total_train={total}s preemptions={cfg.preempt_count} "
-        f"interval={interval}s ckpt_every={cfg.checkpoint_interval_seconds}s — fresh "
+        f"[{kind}] run_id={run_id} total_train={total}s preemptions={cfg.preempt_count} "
+        f"interval={interval}s ckpt_every={cfg.checkpoint_interval_seconds}s{ddp} — fresh "
         f"instance per segment, node not told the schedule",
         file=sys.stderr,
     )
 
-    profile = RunProfile(run_id, kind="preempt", market="spot")
+    profile = RunProfile(run_id, kind=kind, market="spot")
     profile.wandb_start(cfg)
 
     accumulated = 0.0
@@ -296,7 +303,16 @@ def run_preempt(cfg: OrchestratorConfig) -> dict | None:
                 f"~{accumulated:.0f}/{total}s trained so far",
                 file=sys.stderr,
             )
-            iid = _launch(cfg, ami, sg_id, run_id, "spot", budget, logs_key=logs_key)
+            iid = _launch(
+                cfg,
+                ami,
+                sg_id,
+                run_id,
+                "spot",
+                budget,
+                logs_key=logs_key,
+                nproc_per_node=nproc_per_node,
+            )
             profile.mark("launch" if seg == 1 else "relaunch")
 
             if aws.is_dry_run():
