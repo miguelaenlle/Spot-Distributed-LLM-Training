@@ -92,6 +92,7 @@ class TrainConfig:
         return cls(
             max_seconds=_env_float("MAX_SECONDS", None),
             checkpoint_interval_seconds=_env_float("CHECKPOINT_INTERVAL_SECONDS", 30.0),
+            smoke_test_every=_env_int("SMOKE_TEST_EVERY", 1),
             log_interval_steps=_env_int("LOG_INTERVAL_STEPS", 10),
             checkpoint_uri=_env_str("CHECKPOINT_URI", "checkpoints/"),
             metrics_uri=_env_str("METRICS_URI", "checkpoints/metrics.json"),

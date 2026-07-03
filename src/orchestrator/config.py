@@ -73,12 +73,11 @@ class OrchestratorConfig:
 
     # --- preemption experiment ----------------------------------------------
     # Total TRAINING seconds to accumulate across all segments (kills don't count).
-    train_total_seconds: int = field(default_factory=lambda: _env_int("TRAIN_TOTAL_SECONDS", 60))
-    # Fixed interval the orchestrator lets a segment train before preempting it. The
-    # node is NOT told this — it only gets its remaining budget as MAX_SECONDS.
-    preempt_interval_seconds: int = field(
-        default_factory=lambda: _env_int("PREEMPT_INTERVAL_SECONDS", 20)
-    )
+    train_total_seconds: int = field(default_factory=lambda: _env_int("TRAIN_TOTAL_SECONDS", 180))
+    # Number of preemptions to perform. The total training is split evenly across
+    # (preempt_count + 1) segments — so 1 => train, kill once, reboot, finish. The
+    # node is NOT told the schedule; it only gets its remaining budget as MAX_SECONDS.
+    preempt_count: int = field(default_factory=lambda: _env_int("PREEMPT_COUNT", 1))
     # Seconds to wait for the trainer's SIGTERM checkpoint to land before terminating.
     preempt_grace_seconds: int = field(default_factory=lambda: _env_int("PREEMPT_GRACE", 90))
     # Small checkpoint interval during preemption so training-start is detectable fast
@@ -86,6 +85,9 @@ class OrchestratorConfig:
     preempt_checkpoint_seconds: int = field(
         default_factory=lambda: _env_int("PREEMPT_CHECKPOINT_SECONDS", 5)
     )
+    # How often the trainer runs the (noisy) checkpoint verify+smoke test. Set per
+    # experiment so frequent preemption checkpoints don't flood the loss output.
+    smoke_test_every: int = field(default_factory=lambda: _env_int("SMOKE_TEST_EVERY", 1))
 
     # --- polling -------------------------------------------------------------
     metrics_poll_seconds: int = 15

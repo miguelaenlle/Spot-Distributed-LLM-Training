@@ -222,7 +222,9 @@ def run_preempt(cfg: OrchestratorConfig) -> dict | None:
     ami, sg_id = _prepare(cfg)
     run_id = _run_id("preempt")
     total = cfg.train_total_seconds
-    interval = cfg.preempt_interval_seconds
+    # Split the total training evenly across (preempt_count + 1) segments, so
+    # preempt_count=1 => train `interval`, kill once, reboot, finish `interval`.
+    interval = math.ceil(total / (cfg.preempt_count + 1))
     ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
     metrics_key = cfg.run_metrics_key(run_id)
     # Dense checkpoints so training-start is detectable quickly; graceful SIGTERM
@@ -230,10 +232,13 @@ def run_preempt(cfg: OrchestratorConfig) -> dict | None:
     cfg.checkpoint_interval_seconds = min(
         cfg.checkpoint_interval_seconds, cfg.preempt_checkpoint_seconds
     )
+    # Keep the checkpoint verify+smoke cadence ~30s (like baseline) so the frequent
+    # preemption checkpoints don't flood the streamed loss lines.
+    cfg.smoke_test_every = max(1, round(30 / cfg.checkpoint_interval_seconds))
     print(
-        f"[preempt] run_id={run_id} total_train={total}s interval={interval}s "
-        f"ckpt_every={cfg.checkpoint_interval_seconds}s — fresh instance per segment, "
-        f"node not told the schedule",
+        f"[preempt] run_id={run_id} total_train={total}s preemptions={cfg.preempt_count} "
+        f"interval={interval}s ckpt_every={cfg.checkpoint_interval_seconds}s — fresh "
+        f"instance per segment, node not told the schedule",
         file=sys.stderr,
     )
 

@@ -45,6 +45,7 @@ def _trainer_env(
         "DATA_LOCAL_DIR": f"/home/ubuntu/app/third_party/nanoGPT/data/{cfg.dataset}",
         "MAX_SECONDS": str(max_seconds),
         "CHECKPOINT_INTERVAL_SECONDS": str(cfg.checkpoint_interval_seconds),
+        "SMOKE_TEST_EVERY": str(cfg.smoke_test_every),
         "EVAL_ITERS": str(cfg.eval_iters),
         "BATCH_SIZE": str(cfg.batch_size),
         "RUN_ID": run_id,
