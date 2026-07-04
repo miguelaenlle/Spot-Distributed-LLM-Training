@@ -12,8 +12,10 @@ feed Grafana or anything else later.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -95,6 +97,21 @@ class ValSample:
 
 
 @dataclass
+class InstanceCost:
+    """One cost-ledger row: an EC2 box billed per-second from ``running`` to
+    terminate — each instance separately, matching AWS billing. ``hourly_usd``
+    is the actual spot price at launch (per-AZ) or the on-demand rate; None
+    means unknown (sums skip the row; cost_dict counts it so nothing hides)."""
+
+    instance_id: str
+    market: str
+    az: str
+    hourly_usd: float | None
+    started_at: float
+    stopped_at: float | None = None
+
+
+@dataclass
 class RunProfile:
     """Accumulates a run's timeline + loss samples, writes profile.json, and
     optionally mirrors to W&B. One instance per run (per run_id)."""
@@ -110,6 +127,8 @@ class RunProfile:
     # {"step", "params", "samples": [{"prompt", "sample_index", "completion"}]}.
     text_samples: list[dict] = field(default_factory=list)
     metrics: dict | None = None
+    # Cost ledger: one row per EC2 box this run launched (see InstanceCost).
+    instances: list[InstanceCost] = field(default_factory=list)
     _seen: set[tuple[int, int]] = field(default_factory=set)  # (segment, step) dedup
     _seen_val: set[tuple[int, int]] = field(default_factory=set)
     _wb: object | None = field(default=None, repr=False)  # wandb run handle or None
@@ -175,6 +194,101 @@ class RunProfile:
         self.text_samples.append(doc)
         self.text_samples.sort(key=lambda d: d.get("step", 0))
 
+    # -- cost ledger --------------------------------------------------------- #
+    def instance_started(
+        self,
+        instance_id: str,
+        market: str,
+        az: str,
+        hourly_usd: float | None,
+        t: float | None = None,
+    ) -> None:
+        """Open a ledger row when a box reaches ``running`` (billing starts)."""
+        self.instances.append(
+            InstanceCost(instance_id, market, az, hourly_usd, t if t is not None else time.time())
+        )
+        self._wb_config_cost()
+
+    def instance_stopped(self, instance_id: str, t: float | None = None) -> None:
+        """Close the open row for ``instance_id`` (no-op if unknown/closed)."""
+        for row in self.instances:
+            if row.instance_id == instance_id and row.stopped_at is None:
+                row.stopped_at = t if t is not None else time.time()
+                return
+
+    def close_open_instances(self) -> None:
+        """Stamp any still-open rows at now — called at finalize, where the
+        remaining boxes are terminated immediately after."""
+        now = time.time()
+        for row in self.instances:
+            if row.stopped_at is None:
+                row.stopped_at = now
+
+    def cost_at(self, t_wall: float) -> float:
+        """Cumulative USD across the ledger at wall-clock ``t_wall``. Rows with
+        an unknown rate contribute 0 (cost_dict flags how many were skipped)."""
+        total = 0.0
+        for row in self.instances:
+            if row.hourly_usd is None:
+                continue
+            end = row.stopped_at if row.stopped_at is not None else t_wall
+            total += max(0.0, min(end, t_wall) - row.started_at) * row.hourly_usd / 3600.0
+        return total
+
+    def cost_now(self) -> float:
+        return self.cost_at(time.time())
+
+    def hourly_rate_now(self) -> float | None:
+        """Rate of the newest still-open row (the box currently training)."""
+        for row in reversed(self.instances):
+            if row.stopped_at is None:
+                return row.hourly_usd
+        return None
+
+    def cost_dict(self) -> dict | None:
+        """The ``cost`` section of profile.json, or None with an empty ledger."""
+        if not self.instances:
+            return None
+        now = time.time()
+        items = []
+        for row in self.instances:
+            end = row.stopped_at if row.stopped_at is not None else now
+            seconds = round(max(0.0, end - row.started_at), 2)
+            usd = None
+            if row.hourly_usd is not None:
+                usd = round(seconds * row.hourly_usd / 3600.0, 6)
+            items.append(
+                {
+                    "instance_id": row.instance_id,
+                    "market": row.market,
+                    "az": row.az,
+                    "hourly_usd": row.hourly_usd,
+                    "started_at": round(row.started_at, 3),
+                    "stopped_at": round(row.stopped_at, 3) if row.stopped_at is not None else None,
+                    "billed_seconds": seconds,
+                    "usd": usd,
+                }
+            )
+        return {
+            "instances": items,
+            "total_usd": round(self.cost_at(now), 6),
+            "rate_unknown_count": sum(1 for r in self.instances if r.hourly_usd is None),
+        }
+
+    def cost_curve(self) -> tuple[list[float], list[float]]:
+        """Piecewise-linear cumulative cost: (t_rel seconds, USD) sampled at
+        every ledger breakpoint (each box's start/stop), relative to the run's
+        first event. Exact — cost is linear between breakpoints."""
+        if not self.instances:
+            return [], []
+        t0 = self.events[0].t_wall if self.events else min(r.started_at for r in self.instances)
+        pts = {t0}
+        for r in self.instances:
+            pts.add(r.started_at)
+            pts.add(r.stopped_at if r.stopped_at is not None else time.time())
+        xs = sorted(pts)
+        return [round(x - t0, 2) for x in xs], [round(self.cost_at(x), 6) for x in xs]
+
     # -- derived (pure) ---------------------------------------------------- #
     def _t(self, name: str, segment: int | None = None) -> float | None:
         for e in self.events:
@@ -238,6 +352,7 @@ class RunProfile:
             "val_samples": [vars(v) for v in self.val_samples],
             "text_samples": self.text_samples,
             "metrics": self.metrics,
+            "cost": self.cost_dict(),
         }
 
     # -- outputs ----------------------------------------------------------- #
@@ -250,8 +365,16 @@ class RunProfile:
         )
 
     def finalize(self, cfg) -> None:
-        """Write the S3 artifact, push the W&B summary, and finish the W&B run."""
+        """Close the cost ledger, write the S3 artifacts (profile.json +
+        cost.png), push the W&B summary, and finish the W&B run."""
+        self.close_open_instances()
         self.write(cfg)
+        png = os.path.join(tempfile.gettempdir(), f"{self.run_id}-cost.png")
+        if self.render_cost_png(png):
+            from spot_train import s3_store
+
+            s3_store.put_file(png, cfg.run_cost_png_uri(self.run_id))
+            print(f"[profile] cost graph: {cfg.run_cost_png_uri(self.run_id)}", file=sys.stderr)
         self._wb_finish()
 
     # -- optional W&B mirror (all no-op when self._wb is None) ------------- #
@@ -283,21 +406,34 @@ class RunProfile:
             },
         )
 
+    def _wb_config_cost(self) -> None:
+        """Mirror the newest box's rate into the run config (Overview panel)."""
+        if self._wb is None or not self.instances:
+            return
+        row = self.instances[-1]
+        if row.hourly_usd is not None:
+            self._wb.config.update(
+                {"hourly_usd": row.hourly_usd, "az": row.az}, allow_val_change=True
+            )
+
     def _wb_log_step(self, s: Sample) -> None:
         if self._wb is None:
             return
-        self._wb.log(
+        payload = {
             # t_rel/train_step let the W&B x-axis switch to wall-clock (gaps
             # visible) or the trainer's own step (resume overlaps visible).
-            {
-                "loss": s.loss,
-                "ms_per_step": s.ms_per_step,
-                "tok_s": s.tok_s,
-                "t_rel": s.t_rel,
-                "train_step": s.step,
-            },
-            step=self._wb_step,
-        )
+            "loss": s.loss,
+            "ms_per_step": s.ms_per_step,
+            "tok_s": s.tok_s,
+            "t_rel": s.t_rel,
+            "train_step": s.step,
+        }
+        if self.instances:
+            payload["cost/cumulative_usd"] = round(self.cost_now(), 6)
+            rate = self.hourly_rate_now()
+            if rate is not None:
+                payload["cost/hourly_usd"] = rate
+        self._wb.log(payload, step=self._wb_step)
         self._wb_step += 1
 
     def _wb_log_val(self, v: ValSample) -> None:
@@ -416,6 +552,17 @@ class RunProfile:
         """Rows for the periodic exact-eval table: [step, val_loss, t_rel_s]."""
         return [[v.step, v.loss, v.t_rel] for v in self.val_samples]
 
+    def cost_rows(self) -> list[list]:
+        """Rows for the cost table: [instance_id, market, az, hourly_usd,
+        billed_seconds, usd] — one per launched box."""
+        cost = self.cost_dict()
+        if cost is None:
+            return []
+        return [
+            [r["instance_id"], r["market"], r["az"], r["hourly_usd"], r["billed_seconds"], r["usd"]]
+            for r in cost["instances"]
+        ]
+
     def timeline_rows(self) -> list[list]:
         """Rows for the timeline table: [event, segment, t_rel_s, t_wall]."""
         if not self.events:
@@ -429,17 +576,75 @@ class RunProfile:
         """Render this run's phases as a stacked timeline bar to ``path``."""
         return render_segments_png(f"Run timeline — {self.run_id}", self.segments(), path)
 
+    def render_cost_png(self, path: str) -> bool:
+        """Render the two-panel cost graph to ``path``: cumulative $ vs
+        wall-clock (kill/relaunch markers) over loss vs cumulative $ (the
+        loss-per-dollar curve). False without matplotlib, ledger rows, or any
+        known rate."""
+        xs, ys = self.cost_curve()
+        if not xs or all(r.hourly_usd is None for r in self.instances):
+            return False
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")  # headless
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return False
+
+        t0 = self.events[0].t_wall if self.events else min(r.started_at for r in self.instances)
+        # Exact val evals when present, else the (noisier) per-step train loss.
+        series: list = self.val_samples or self.samples
+        fig, axes = plt.subplots(
+            2 if series else 1, 1, figsize=(10.5, 6.5 if series else 3.2), squeeze=False
+        )
+        ax0 = axes[0][0]
+        ax0.plot(xs, ys, color=_PHASE_COLORS["provisioning"], linewidth=1.5)
+        for e in self.events:
+            if e.event in ("kill", "relaunch"):
+                ax0.axvline(
+                    e.t_wall - t0,
+                    color=_PHASE_COLORS["downtime" if e.event == "kill" else "preemption_recovery"],
+                    linestyle="--",
+                    linewidth=0.9,
+                )
+        ax0.set_xlabel("seconds since launch")
+        ax0.set_ylabel("cumulative USD")
+        ax0.set_title(f"Cost — {self.run_id} (total ${ys[-1]:.4f})")
+
+        if series:
+            ax1 = axes[1][0]
+            cx = [self.cost_at(t0 + p.t_rel) for p in series]
+            cy = [p.loss for p in series]
+            is_val = bool(self.val_samples)
+            ax1.plot(
+                cx,
+                cy,
+                marker="o" if is_val else None,
+                markersize=3,
+                linewidth=1.0,
+                color=_PHASE_COLORS["training"],
+                label="val_loss" if is_val else "train loss",
+            )
+            ax1.set_xlabel("cumulative USD")
+            ax1.set_ylabel("loss")
+            ax1.legend(frameon=False, fontsize=8)
+        fig.tight_layout()
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        return True
+
     def _wb_finish(self) -> None:
         if self._wb is None:
             return
-        import os
-        import tempfile
-
         import wandb
 
         # Comparable scalar columns in the runs table.
         for k, v in self.durations().items():
             self._wb.summary[k] = v
+        cost = self.cost_dict()
+        if cost is not None:
+            self._wb.summary["total_usd"] = cost["total_usd"]
         if self.metrics:
             for k in ("train_loss", "val_loss", "steps", "stop_reason", "resumed"):
                 if k in self.metrics:
@@ -465,9 +670,19 @@ class RunProfile:
             log["eval/val_table"] = wandb.Table(
                 columns=["step", "val_loss", "t_rel_s"], data=val_rows
             )
+        if self.instances:
+            log["profile/cost"] = wandb.Table(
+                columns=["instance_id", "market", "az", "hourly_usd", "billed_seconds", "usd"],
+                data=self.cost_rows(),
+            )
         png = os.path.join(tempfile.gettempdir(), f"{self.run_id}-timeline.png")
         if self.render_timeline_png(png):
             log["profile/timeline_bar"] = wandb.Image(png)
+        cost_png = os.path.join(tempfile.gettempdir(), f"{self.run_id}-cost.png")
+        # finalize() renders this before uploading to S3; render here only if
+        # _wb_finish is reached some other way.
+        if os.path.exists(cost_png) or self.render_cost_png(cost_png):
+            log["cost/graph"] = wandb.Image(cost_png)
         self._wb.log(log)
         self._wb.finish()
 

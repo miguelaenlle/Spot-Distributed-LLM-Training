@@ -21,6 +21,11 @@ def _env_int(name: str, default: int) -> int:
     return int(v) if v not in (None, "") else default
 
 
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    return float(v) if v not in (None, "") else default
+
+
 # Trainer knobs the orchestrator relays verbatim (only when set in ITS
 # environment): the convergence recipe + periodic eval/sample cadence. The
 # orchestrator never branches on these values, so they stay untyped strings —
@@ -56,6 +61,18 @@ _INSTANCE_VCPUS = {
     "g5.12xlarge": 48,
     "g6.xlarge": 4,
     "g6.12xlarge": 48,
+}
+
+
+# On-demand $/hr (us-east-1, Linux) for the cost ledger. Spot rates are NOT
+# listed here — they move hourly and vary per AZ, so they're queried live at
+# launch (aws.spot_hourly_rate). Types missing from this table need HOURLY_USD.
+ON_DEMAND_HOURLY_USD = {
+    "g4dn.xlarge": 0.526,
+    "g4dn.2xlarge": 0.752,
+    "g4dn.12xlarge": 3.912,
+    "g5.xlarge": 1.006,
+    "g6.xlarge": 0.805,
 }
 
 
@@ -100,6 +117,10 @@ class OrchestratorConfig:
 
     # --- experiment knobs ----------------------------------------------------
     dataset: str = field(default_factory=lambda: _env("DATASET", "shakespeare_char"))
+    # $/hr override for the cost ledger: pins the on-demand rate when the
+    # instance type isn't in ON_DEMAND_HOURLY_USD (or to correct it for another
+    # region). 0 = use the table. Spot rows always use the live queried price.
+    hourly_usd: float = field(default_factory=lambda: _env_float("HOURLY_USD", 0.0))
     baseline_seconds: int = field(default_factory=lambda: _env_int("BASELINE_SECONDS", 300))
     spot_seg1_seconds: int = field(default_factory=lambda: _env_int("SPOT_SEG1_SECONDS", 120))
     spot_seg2_seconds: int = field(default_factory=lambda: _env_int("SPOT_SEG2_SECONDS", 180))
@@ -269,10 +290,21 @@ class OrchestratorConfig:
     def run_budget_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/budget.json"
 
+    def on_demand_hourly_usd(self) -> float | None:
+        """$/hr for on-demand ledger rows: HOURLY_USD override, else the table.
+        None => unknown (the ledger row is kept but flagged, cost sums skip it)."""
+        if self.hourly_usd:
+            return self.hourly_usd
+        return ON_DEMAND_HOURLY_USD.get(self.instance_type)
+
     # The tool-agnostic run profile (timeline + loss + merged metrics) the
     # orchestrator writes at end of run. W&B is just a mirror of this.
     def run_profile_uri(self, run_id: str) -> str:
         return f"s3://{self.bucket}/{self.run_prefix}/{run_id}/profile.json"
+
+    # The cost graph (cumulative $ + loss-per-dollar) rendered at finalize.
+    def run_cost_png_uri(self, run_id: str) -> str:
+        return f"s3://{self.bucket}/{self.run_prefix}/{run_id}/cost.png"
 
     def run_profile_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/profile.json"

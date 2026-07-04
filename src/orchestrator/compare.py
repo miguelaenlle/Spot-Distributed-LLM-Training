@@ -22,11 +22,8 @@ import sys
 import time
 
 from . import aws
-from .config import OrchestratorConfig
+from .config import ON_DEMAND_HOURLY_USD, OrchestratorConfig
 from .profile import render_multi_timeline_png
-
-# On-demand $/hr for cost estimates in the report (us-east-1; extend as needed).
-_HOURLY_USD = {"g4dn.xlarge": 0.526}
 
 
 def _fetch_profile(cfg: OrchestratorConfig, run_id: str) -> dict:
@@ -39,10 +36,15 @@ def _fetch_profile(cfg: OrchestratorConfig, run_id: str) -> dict:
 
 
 def _cost_estimate(cfg: OrchestratorConfig, profile: dict) -> float | None:
-    """Rough box-cost: total wall-clock x nodes x hourly rate. Multinode runs
-    bill every live node for the full run (replacements overlap the victims'
-    teardown by at most minutes — inside the estimate's precision)."""
-    rate = _HOURLY_USD.get(cfg.instance_type)
+    """The run's RECORDED cost when the profile carries a ledger (per-instance,
+    actual spot rates — see RunProfile.cost_dict); otherwise the old rough
+    estimate: total wall-clock x nodes x on-demand hourly rate. Multinode
+    estimates bill every live node for the full run (replacements overlap the
+    victims' teardown by at most minutes — inside the estimate's precision)."""
+    recorded = (profile.get("cost") or {}).get("total_usd")
+    if recorded is not None:
+        return recorded
+    rate = ON_DEMAND_HOURLY_USD.get(cfg.instance_type)
     total = (profile.get("durations") or {}).get("total_s")
     if rate is None or not total:
         return None

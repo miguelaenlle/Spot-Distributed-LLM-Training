@@ -188,6 +188,34 @@ def public_ip(instance_id: str) -> str:
     return r["Reservations"][0]["Instances"][0].get("PublicIpAddress", "")
 
 
+def instance_az(instance_id: str) -> str:
+    """Availability zone the instance landed in (spot prices are per-AZ)."""
+    if _DRY_RUN:
+        _log(f"describe {instance_id} (az)")
+        return f"{_region}a"
+    r = _client("ec2").describe_instances(InstanceIds=[instance_id])
+    return r["Reservations"][0]["Instances"][0]["Placement"]["AvailabilityZone"]
+
+
+def spot_hourly_rate(instance_type: str, az: str) -> float | None:
+    """Current spot $/hr for ``instance_type`` in ``az`` — the newest point in
+    DescribeSpotPriceHistory, which is what a fresh spot launch starts billing
+    at. Returns None if AWS returns no price point."""
+    if _DRY_RUN:
+        _log(f"describe-spot-price-history {instance_type} in {az}")
+        return 0.0
+    from datetime import datetime, timezone
+
+    r = _client("ec2").describe_spot_price_history(
+        InstanceTypes=[instance_type],
+        ProductDescriptions=["Linux/UNIX"],
+        AvailabilityZone=az,
+        StartTime=datetime.now(timezone.utc),
+    )
+    hist = r.get("SpotPriceHistory", [])
+    return float(hist[0]["SpotPrice"]) if hist else None
+
+
 # --------------------------------------------------------------------------- #
 # Mutating: S3
 # --------------------------------------------------------------------------- #

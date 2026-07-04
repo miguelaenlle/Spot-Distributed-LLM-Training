@@ -71,6 +71,27 @@ def _launch_gated(cfg: OrchestratorConfig, do_launch):
     )
 
 
+def _record_instance(cfg: OrchestratorConfig, profile: RunProfile, iid: str, market: str) -> None:
+    """Open a cost-ledger row for a box that just reached ``running``: its AZ
+    plus the rate it's actually billed at — the live per-AZ spot price, or the
+    on-demand table / HOURLY_USD override."""
+    az = aws.instance_az(iid)
+    rate = (
+        aws.spot_hourly_rate(cfg.instance_type, az)
+        if market == "spot"
+        else (cfg.on_demand_hourly_usd())
+    )
+    profile.instance_started(iid, market, az, rate)
+    if rate is not None:
+        print(f"[cost] {iid} ({market}, {az}) @ ${rate:.4f}/hr", file=sys.stderr)
+    else:
+        print(
+            f"[cost] {iid} ({market}, {az}) rate unknown — set HOURLY_USD for "
+            f"{cfg.instance_type}",
+            file=sys.stderr,
+        )
+
+
 def _launch(
     cfg: OrchestratorConfig,
     ami: str,
@@ -81,6 +102,7 @@ def _launch(
     logs_key: str | None = None,
     ddp: bool = False,
     nproc_per_node: int = 0,
+    profile: RunProfile | None = None,
 ) -> str:
     # Run mode: provision, then train under the wall-clock budget while the box
     # syncs its (per-segment) log to S3 — so we can stream it here without SSH.
@@ -108,6 +130,8 @@ def _launch(
         ),
     )
     aws.wait_running(iid)
+    if profile is not None:
+        _record_instance(cfg, profile, iid, market)
     print(
         f"[launch] instance {iid} ({market}) — training; streaming its log below "
         f"(boot + clone take ~1-2 min before the first lines appear).",
@@ -229,8 +253,19 @@ def _run_single_box(
     print(f"[{kind}] run_id={run_id} budget={budget}s{extra}", file=sys.stderr)
     # Collect a run profile (timeline + loss) and mirror to W&B if configured.
     profile = RunProfile(run_id, kind=kind, market=market)
-    profile.wandb_start(cfg)
-    iid = _launch(cfg, ami, sg_id, run_id, market, budget, ddp=ddp, nproc_per_node=nproc_per_node)
+    if not aws.is_dry_run():  # dry-run must not create a real W&B run
+        profile.wandb_start(cfg)
+    iid = _launch(
+        cfg,
+        ami,
+        sg_id,
+        run_id,
+        market,
+        budget,
+        ddp=ddp,
+        nproc_per_node=nproc_per_node,
+        profile=profile,
+    )
     profile.mark("launch")
     try:
         if aws.is_dry_run():
@@ -239,6 +274,7 @@ def _run_single_box(
         metrics = _stream_until_metrics(cfg, run_id, profile)
         profile.mark("metrics" if metrics is not None else "timeout")
         profile.from_metrics(metrics)
+        profile.instance_stopped(iid)  # ledger stop ~= the terminate call below
         profile.finalize(cfg)  # write profile.json to S3 + finish the W&B run
         print(f"[{kind}] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
         if metrics is not None:
@@ -303,6 +339,7 @@ def run_resume(
         logs_key=logs_key,
         ddp=ddp,
         nproc_per_node=cfg.ddp_nproc_per_node if ddp else 0,
+        profile=profile,  # prints the [cost] rate line; profile is never finalized
     )
     try:
         if aws.is_dry_run():
@@ -384,7 +421,8 @@ def run_multinode(cfg: OrchestratorConfig) -> dict | None:
         file=sys.stderr,
     )
     profile = RunProfile(run_id, kind="multinode", market=market)
-    profile.wandb_start(cfg)
+    if not aws.is_dry_run():  # dry-run must not create a real W&B run
+        profile.wandb_start(cfg)
     iids: list[str] = []
     try:
         # One up-front gate for the whole group (the per-launch gate inside
@@ -406,6 +444,8 @@ def run_multinode(cfg: OrchestratorConfig) -> dict | None:
             )
         for iid in iids:
             aws.wait_running(iid)
+        for iid in iids:
+            _record_instance(cfg, profile, iid, market)
         profile.mark("launch")
         if aws.is_dry_run():
             print("[multinode] dry-run: skipping stream/terminate", file=sys.stderr)
@@ -477,7 +517,8 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
         file=sys.stderr,
     )
     profile = RunProfile(run_id, kind="multinode-preempt", market=market)
-    profile.wandb_start(cfg)
+    if not aws.is_dry_run():  # dry-run must not create a real W&B run
+        profile.wandb_start(cfg)
 
     metrics: dict | None = None
     live: dict[int, str] = {}
@@ -509,6 +550,8 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             )
         for iid in live.values():
             aws.wait_running(iid)
+        for iid in live.values():
+            _record_instance(cfg, profile, iid, market)
         # A fresh node 0 means a fresh log file — restart the stream from byte 0.
         node0_log = cfg.run_logs_key(run_id, node=0, attempt=seq)
         state = {"printed": 0}
@@ -534,6 +577,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             logs_key=cfg.run_logs_key(run_id, node=victim, attempt=seq),
         )
         aws.wait_running(live[victim])
+        _record_instance(cfg, profile, live[victim], market)
         if victim == 0:
             profile.segment += 1
             node0_log = cfg.run_logs_key(run_id, node=0, attempt=seq)
@@ -592,6 +636,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             )
             pre_kill_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
             aws.terminate(live[victim])
+            profile.instance_stopped(live[victim])
             profile.mark("kill")
             # Publish the new remaining budget IMMEDIATELY: the survivors' crash
             # (~NCCL_TIMEOUT away) must read the post-kill value, not the stale one.
@@ -626,6 +671,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
                 )
                 for iid in live.values():
                     aws.terminate(iid)
+                    profile.instance_stopped(iid)
                 for iid in live.values():
                     aws.wait_quota_released(iid)
                 live.clear()
@@ -644,6 +690,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
         profile.from_metrics(metrics)
         for iid in live.values():
             aws.terminate(iid)
+            profile.instance_stopped(iid)
         live.clear()
 
         profile.finalize(cfg)
@@ -747,7 +794,8 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
     )
 
     profile = RunProfile(run_id, kind=kind, market=cfg.spot_market)
-    profile.wandb_start(cfg)
+    if not aws.is_dry_run():  # dry-run must not create a real W&B run
+        profile.wandb_start(cfg)
 
     accumulated = 0.0
     seg = 1
@@ -779,6 +827,7 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
                 logs_key=logs_key,
                 ddp=ddp,
                 nproc_per_node=nproc_per_node,
+                profile=profile,
             )
             profile.mark("launch" if seg == 1 else "relaunch")
 
@@ -804,6 +853,7 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
                 profile.mark("metrics" if metrics is not None else "timeout")
                 profile.from_metrics(metrics)
                 done, iid = iid, None
+                profile.instance_stopped(done)
                 aws.terminate(done)
                 break
 
@@ -818,6 +868,7 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
             )
             _preempt_instance(cfg, iid, ckpt_prefix)
             profile.mark("kill")
+            profile.instance_stopped(iid)
             iid = None
             accumulated += trained
             seg += 1
