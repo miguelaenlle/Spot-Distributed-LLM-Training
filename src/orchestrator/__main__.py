@@ -1,5 +1,6 @@
 """CLI: ``spot-orchestrate {setup,stage-data,baseline,spot,preempt,ddp,ddp-preempt,
-multinode,multinode-preempt} [--dry-run]`` and
+multinode,multinode-preempt} [--dry-run]``,
+``spot-orchestrate resume <run_id> [--budget N] [--market ...]``, and
 ``spot-orchestrate compare <run_id> [<run_id> ...]``.
 
 You run this; it needs your AWS creds in the environment. A git-ignored ``.env``
@@ -51,6 +52,17 @@ def main() -> None:
         "multinode-preempt",
     ):
         sub.add_parser(name, parents=[common])
+    res_parser = sub.add_parser("resume", parents=[common])
+    res_parser.add_argument("run_id", help="existing run id to resume from its latest checkpoint")
+    res_parser.add_argument(
+        "--budget", type=int, default=None, help="training seconds (default: BASELINE_SECONDS)"
+    )
+    res_parser.add_argument(
+        "--market",
+        choices=["on-demand", "spot"],
+        default=None,
+        help="instance market (default: inferred from the run id's kind)",
+    )
     cmp_parser = sub.add_parser("compare", parents=[common])
     cmp_parser.add_argument("run_ids", nargs="+", help="run ids to compare (2+ recommended)")
 
@@ -83,6 +95,8 @@ def main() -> None:
         experiments.run_multinode(cfg)
     elif args.command == "multinode-preempt":
         experiments.run_multinode_preempt(cfg)
+    elif args.command == "resume":
+        experiments.run_resume(cfg, args.run_id, budget=args.budget, market=args.market)
     elif args.command == "compare":
         from . import compare
 

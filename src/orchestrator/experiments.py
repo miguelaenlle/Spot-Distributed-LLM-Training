@@ -253,6 +253,71 @@ def run_baseline(cfg: OrchestratorConfig) -> dict | None:
     return _run_single_box(cfg, kind="baseline", market="on-demand", budget=cfg.baseline_seconds)
 
 
+def run_resume(
+    cfg: OrchestratorConfig,
+    run_id: str,
+    budget: int | None = None,
+    market: str | None = None,
+) -> dict | None:
+    """Salvage a crashed/interrupted run: launch ONE fresh box against the same
+    run prefix and let the trainer's one resume path pick up the latest S3
+    checkpoint. Refuses if the run already completed (metrics.json exists) or
+    never checkpointed (nothing to resume from). The new box logs to a fresh
+    ``boot-rK`` key so the crashed segment's log survives in S3. profile.json /
+    W&B are NOT rewritten — this is a salvage tool, not a profiled experiment.
+    """
+    kind = run_id.split("-", 1)[0]
+    if kind == "multinode":
+        raise SystemExit(
+            "resume handles single-box runs; multinode runs restart their whole "
+            "group via the multinode-preempt machinery"
+        )
+    ami, sg_id = _prepare(cfg)
+    budget = budget or cfg.baseline_seconds
+    market = market or ("on-demand" if kind in ("baseline", "ddp") else cfg.spot_market)
+    ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
+    if not aws.is_dry_run():
+        if aws.object_exists(cfg.bucket, cfg.run_metrics_key(run_id)):
+            raise SystemExit(f"{run_id} already wrote metrics.json — nothing to resume")
+        if not aws.any_object_under(cfg.bucket, ckpt_prefix):
+            raise SystemExit(
+                f"no checkpoints under s3://{cfg.bucket}/{ckpt_prefix} — nothing to resume from"
+            )
+    attempt = 1
+    while not aws.is_dry_run() and aws.object_exists(
+        cfg.bucket, cfg.run_logs_key(run_id, attempt=attempt)
+    ):
+        attempt += 1
+    logs_key = cfg.run_logs_key(run_id, attempt=attempt)
+    ddp = kind == "ddp"
+    print(f"[resume] run_id={run_id} budget={budget}s market={market}", file=sys.stderr)
+    # Profile object only feeds log ingestion/streaming; never started or finalized.
+    profile = RunProfile(run_id, kind=kind, market=market)
+    iid = _launch(
+        cfg,
+        ami,
+        sg_id,
+        run_id,
+        market,
+        budget,
+        logs_key=logs_key,
+        ddp=ddp,
+        nproc_per_node=cfg.ddp_nproc_per_node if ddp else 0,
+    )
+    try:
+        if aws.is_dry_run():
+            print("[resume] dry-run: skipping stream/terminate", file=sys.stderr)
+            return None
+        metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=logs_key)
+        if metrics is not None:
+            if not metrics.get("resumed"):
+                print("[resume] WARNING: trainer did not report resumed=true", file=sys.stderr)
+            print(f"\n[resume] metrics: {json.dumps(metrics, indent=2)}")
+        return metrics
+    finally:
+        aws.terminate(iid)
+
+
 def run_ddp(cfg: OrchestratorConfig) -> dict | None:
     """Single-node, multi-process DDP via torchrun (Phase 1b). Same machinery as
     baseline; the box runs the trainer under torchrun with ddp_nproc_per_node ranks."""
