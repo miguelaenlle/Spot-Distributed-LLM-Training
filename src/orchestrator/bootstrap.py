@@ -188,12 +188,15 @@ def build_user_data(
     forces that count. ``ddp=False`` is the plain single-process launch
     (baseline/preempt) — byte-identical to before.
 
-    ``nodes > 1`` (implies ddp) joins an N-node group via c10d rendezvous: node 0
-    hosts the TCPStore and publishes its private IP to S3 (rdzv.json); the other
-    nodes poll that key before starting torchrun. ``--max-restarts`` lets a
-    surviving node's elastic agent re-rendezvous after a peer dies, so a
-    replacement box (same node_index) rejoins and every worker restarts through
-    the one resume path."""
+    ``nodes > 1`` (implies ddp) joins an N-node group via torchrun's STATIC
+    rendezvous: node 0 publishes its private IP to S3 (rdzv.json), the others
+    poll it, and every node runs with ``--node_rank`` + ``--master_addr`` so
+    global rank 0 and the worker-group store are always on node 0 (c10d elastic
+    assigned both arbitrarily — killing the wrong node stranded survivors dialing
+    a dead store). ``--max-restarts=0``: a peer death crashes the survivors'
+    collectives after NCCL_TIMEOUT and the agents exit; recovery is a fresh
+    whole-group segment that resumes from the S3 checkpoint (the one proven
+    resume path), orchestrated by run_multinode_preempt."""
     env = _trainer_env(cfg, run_id=run_id, market=market, max_seconds=max_seconds)
     if nodes > 1:
         # Short collective timeout so survivors of a node kill abort fast (see
@@ -209,9 +212,9 @@ def build_user_data(
         rdzv_block = _rdzv_block(cfg, run_id=run_id, nodes=nodes, node_index=node_index)
         run_cmd = (
             f'OMP_NUM_THREADS=1 "$VENV_PY" -m torch.distributed.run '
-            f"--nnodes={nodes} --nproc_per_node={nproc} "
-            f'--rdzv_backend=c10d --rdzv_endpoint="$RDZV_ADDR:{cfg.rdzv_port}" '
-            f"--rdzv_id={run_id} --max-restarts=3 -m spot_train.train"
+            f"--nnodes={nodes} --nproc_per_node={nproc} --node_rank={node_index} "
+            f'--master_addr="$RDZV_ADDR" --master_port={cfg.rdzv_port} '
+            f"--max-restarts=0 -m spot_train.train"
         )
     elif ddp:
         nproc = "gpu" if nproc_per_node <= 0 else str(nproc_per_node)

@@ -24,19 +24,26 @@ The trainer (`src/spot_train/`) is topology-agnostic today:
 
 ## Design decisions
 
-### 1. Rendezvous: c10d on node 0, endpoint discovered via S3
+### 1. Rendezvous: STATIC, master on node 0, endpoint discovered via S3
 
-torchrun replaces `--standalone` with:
+torchrun replaces `--standalone` with the classic static multi-node form:
 
 ```
-torchrun --nnodes=$NODE_COUNT --nproc_per_node=gpu \
-  --rdzv_backend=c10d --rdzv_endpoint=$RDZV_ADDR:29400 --rdzv_id=$RUN_ID \
-  --max-restarts=3 -m spot_train.train
+torchrun --nnodes=$NODE_COUNT --nproc_per_node=gpu --node_rank=$NODE_INDEX \
+  --master_addr=$RDZV_ADDR --master_port=29400 --max-restarts=0 \
+  -m spot_train.train
 ```
 
-The c10d TCPStore is hosted by the node whose address matches the endpoint —
-**node 0**. No new infra (the 1c plan's dedicated t3.micro store is deferred;
-it only matters once node 0 itself must be replaceable mid-run).
+Static pins the topology: **node 0 is always agent rank 0, hosts the worker
+process-group store, and holds global rank 0** — so node 0's log always carries
+the losses and "kill a non-master node" is actually enforceable.
+
+> **Why not c10d elastic (what we tried first):** the c10d backend assigns
+> agent/worker ranks arbitrarily. In the first real 2-node run, rank 0 *and*
+> the worker-group TCPStore landed on the node we killed; the survivor's
+> restarted worker then spun on `No route to host` retries dialing the dead
+> box's store. In-place elastic rejoin is only robust with the store off-node —
+> that's the 1c t3.micro. No new infra needed for the MVP.
 
 **Endpoint discovery** (chicken-and-egg: user-data is built before any node has
 an IP): node 0's user-data publishes its private IP to
@@ -59,32 +66,31 @@ g4dn.xlarge has no EFA; NCCL runs over TCP sockets (up to 25 Gbps). Fine at
 NanoGPT scale — and the eventual bandwidth ceiling is a 1c/1d measurement, not
 a blocker.
 
-### 3. Failure model: one node dies → elastic restart → same resume path
+### 3. Failure model: one node dies → whole-group restart → same resume path
 
-`--max-restarts=3` puts the elastic agent in charge on every node:
+The standard production model (OPT/BLOOM-style): a lost node kills the job;
+recovery is a fresh gang restarting from the last checkpoint.
 
-1. Orchestrator SIGTERM-kills / terminates one **non-master** node (the same
-   `_preempt_instance` machinery as today).
-2. Survivors' collectives abort quickly — we set
-   `init_process_group(timeout=60s)` (default is 10 min, far too slow) and rely
-   on NCCL async error handling (on by default) to crash the worker rather than
-   hang it.
-3. Each surviving elastic agent catches its worker's death, tears down, and
-   re-enters rendezvous (up to `max_restarts` times), waiting for `nnodes` to
-   be satisfied again.
-4. The orchestrator launches a **replacement node** (same user-data, same
-   `NODE_INDEX`), it joins rendezvous, and every worker restarts `train()` —
-   which is just the existing one-resume-path: load latest S3 checkpoint,
-   continue. Loss continues from the checkpoint; nothing new to write in the
-   trainer.
+1. Orchestrator HARD-terminates one **non-master** node — no SIGTERM. (A
+   graceful SIGTERM triggers the trainer's coordinated stop, which cleanly
+   shuts down the *whole group* — a different, gentler experiment. A real Spot
+   reclaim warns nobody.)
+2. Survivors' collectives abort quickly — `init_process_group(timeout=60s)`
+   via `NCCL_TIMEOUT` (torch default is 10 min, uselessly slow) and NCCL async
+   error handling crash the worker rather than hang it.
+3. `--max-restarts=0`: the agents exit on the worker crash. The orchestrator
+   tears down the remaining boxes, waits for the vCPU quota to release, and
+   launches a **fresh full segment** — every node reruns `train()`, which is
+   the existing one-resume-path: load latest S3 checkpoint, continue. Loss
+   continues; the trainer needed zero changes.
+4. Lost work per kill ≤ the densified checkpoint interval (5s default here).
 
-Killing **node 0** kills the TCPStore and takes the whole group down; the
-orchestrator handles that as a full-group relaunch (today's ddp-preempt
-semantics, N boxes instead of 1). The dedicated rendezvous box that makes node
-0 non-special is exactly the 1c t3.micro — out of scope here.
+In-place elastic rejoin (survivors idle-wait, replacement slots in) is
+deferred to 1c: it needs the rendezvous/worker store off-node (the t3.micro)
+so no victim can take the coordination state down with it.
 
-Quota note: terminate the victim **before** launching its replacement — at an
-8-vCPU quota, 3 concurrent g4dn.xlarge (12 vCPUs) would be rejected.
+Quota note: `wait_quota_released` (instance left `running`) gates each
+segment's launches — at an 8-vCPU quota, two segments' boxes can't coexist.
 
 ### 4. Static group for the MVP (`--nnodes=N`, not `min:max`)
 
@@ -129,11 +135,11 @@ NODES=2 MARKET=on-demand TRAIN_TOTAL_SECONDS=120 PREEMPT_AFTER=20 EVAL_ITERS=20 
 
 **Success criteria**
 
-- A: node 0 log shows `[ddp] world_size=2`; `metrics.json` lands;
-  loss stream is sane.
-- B: after the kill, the survivor's agent re-rendezvouses; the replacement
-  joins; log shows `[resume] restored from step N` and `world_size=2` again;
-  loss continues from the checkpoint (not reset); `metrics.json` reports
+- A: node 0 log shows `[ddp] world_size=2` **and the loss lines** (rank 0 is
+  pinned to node 0 by static rendezvous); `metrics.json` lands.
+- B: segment 1 trains, the kill lands, the group is torn down; segment 2's
+  node 0 log shows `[resume] restored from step N` and `world_size=2`; loss
+  continues from the checkpoint (not reset); `metrics.json` reports
   `resumed=true`.
 
 **Cost:** 2 × $0.526/hr on-demand; a ~12-min end-to-end run ≈ **$0.21**

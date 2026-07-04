@@ -101,13 +101,19 @@ def _pull_log(cfg: OrchestratorConfig, logs_key: str, profile: RunProfile, state
 
 
 def _stream_until_metrics(
-    cfg: OrchestratorConfig, run_id: str, profile: RunProfile, logs_key: str | None = None
+    cfg: OrchestratorConfig,
+    run_id: str,
+    profile: RunProfile,
+    logs_key: str | None = None,
+    state: dict | None = None,
 ) -> dict | None:
     """Stream the box log until ``metrics.json`` appears (trainer writes it last =>
-    done) or ``metrics_timeout_seconds`` elapses. Returns parsed metrics, or None."""
+    done) or ``metrics_timeout_seconds`` elapses. Returns parsed metrics, or None.
+    Pass ``state`` to continue a stream whose head was already printed elsewhere
+    (otherwise the log is re-echoed from byte 0)."""
     logs_key = logs_key or cfg.run_logs_key(run_id)
     metrics_key = cfg.run_metrics_key(run_id)
-    state = {"printed": 0}
+    state = state if state is not None else {"printed": 0}
     start = time.monotonic()
     deadline = start + cfg.metrics_timeout_seconds
     last_heartbeat = start
@@ -289,21 +295,26 @@ def run_multinode(cfg: OrchestratorConfig) -> dict | None:
 
 
 def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
-    """Multi-node preemption: HARD-terminate one non-master node mid-run (no
-    SIGTERM — a graceful stop would coordinate a clean whole-group shutdown, which
-    is not the failure we want). Survivors' collectives abort after NCCL_TIMEOUT,
-    their elastic agents re-enter rendezvous, and a replacement box with the same
-    node index joins; every worker then restarts through the one resume path from
-    the latest S3 checkpoint. Lost work is bounded by the densified checkpoint
-    interval. One preemption per run; MAX_SECONDS restarts with the workers, so
-    total training ≈ PREEMPT_AFTER + TRAIN_TOTAL_SECONDS."""
+    """Multi-node preemption with WHOLE-GROUP restart. Per non-final segment:
+    launch all N nodes, let them train a hidden interval, then HARD-terminate one
+    node (no SIGTERM — a graceful stop would coordinate a clean group shutdown,
+    which is not the failure we want; a real Spot reclaim gives none of the peers
+    any warning either). The survivors' collectives abort after NCCL_TIMEOUT and
+    their agents exit (--max-restarts=0); the orchestrator tears the group down
+    and launches a fresh full segment that resumes from the latest S3 checkpoint —
+    the same proven semantics as run_preempt, N boxes per segment instead of 1.
+
+    Static rendezvous pins rank 0 (and the worker store) to node 0, so node 0's
+    log always carries the losses and the victim (last node) is never the master.
+    In-place elastic rejoin is deferred to Phase 1c (needs the rendezvous store
+    off-node). Lost work per kill is bounded by the densified checkpoint interval."""
     if cfg.node_count < 2:
         raise SystemExit("multinode-preempt needs NODES >= 2")
     ami, sg_id = _prepare(cfg)
     run_id = _run_id("multinode-preempt")
-    budget = cfg.train_total_seconds
+    total = cfg.train_total_seconds
     market = cfg.spot_market
-    interval = cfg.preempt_after_seconds or math.ceil(budget / 2)
+    interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
     victim = cfg.node_count - 1
     ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
     metrics_key = cfg.run_metrics_key(run_id)
@@ -314,66 +325,100 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
     )
     cfg.smoke_test_every = max(1, round(30 / cfg.checkpoint_interval_seconds))
     print(
-        f"[multinode-preempt] run_id={run_id} nodes={cfg.node_count} budget={budget}s "
-        f"market={market} — hard-kill node {victim} after ~{interval}s of training",
+        f"[multinode-preempt] run_id={run_id} nodes={cfg.node_count} total_train={total}s "
+        f"preemptions={cfg.preempt_count} interval={interval}s market={market} — hard-kill "
+        f"node {victim}, then relaunch the whole group (resumes from S3)",
         file=sys.stderr,
     )
     profile = RunProfile(run_id, kind="multinode-preempt", market=market)
     profile.wandb_start(cfg)
+
+    accumulated = 0.0
+    seg = 1
+    metrics: dict | None = None
     live: dict[int, str] = {}
     try:
-        for i in range(cfg.node_count):
-            live[i] = _launch_node(
-                cfg,
-                ami,
-                sg_id,
-                run_id,
-                market,
-                budget,
-                node_index=i,
-                logs_key=cfg.run_logs_key(run_id, node=i),
+        while True:
+            remaining = total - accumulated
+            budget = max(1, math.ceil(remaining))
+            final = seg > cfg.preempt_count or remaining <= interval
+            node0_log = cfg.run_logs_key(run_id, segment=seg, node=0)
+            profile.segment = seg
+            print(
+                f"[multinode-preempt] segment {seg}: launch {cfg.node_count} nodes "
+                f"({'final' if final else 'will preempt'}), MAX_SECONDS={budget}, "
+                f"~{accumulated:.0f}/{total}s trained so far",
+                file=sys.stderr,
             )
-        for iid in live.values():
-            aws.wait_running(iid)
-        profile.mark("launch")
-        if aws.is_dry_run():
-            print("[multinode-preempt] dry-run: not waiting/killing", file=sys.stderr)
-            return None
+            for i in range(cfg.node_count):
+                live[i] = _launch_node(
+                    cfg,
+                    ami,
+                    sg_id,
+                    run_id,
+                    market,
+                    budget,
+                    node_index=i,
+                    logs_key=cfg.run_logs_key(run_id, segment=seg, node=i),
+                )
+            for iid in live.values():
+                aws.wait_running(iid)
+            profile.mark("launch" if seg == 1 else "relaunch")
 
-        node0_log = cfg.run_logs_key(run_id, node=0)
-        state = {"printed": 0}
-        _wait_train_start(cfg, ckpt_prefix, 0, node0_log, profile, state, metrics_key)
-        profile.mark("train_start")
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < interval:
-            _pull_log(cfg, node0_log, profile, state)
-            time.sleep(cfg.log_stream_seconds)
-        print(
-            f"[multinode-preempt] hard-terminating node {victim} after "
-            f"~{time.monotonic() - t0:.0f}s training (no warning)",
-            file=sys.stderr,
-        )
-        aws.terminate(live[victim])
-        profile.mark("kill")
-        # Free the vCPU quota before the replacement — at an 8-vCPU G quota,
-        # 2 nodes + a replacement can't coexist. Quota releases when the instance
-        # leaves 'running' (seconds), not when it reaches 'terminated' (minutes).
-        aws.wait_quota_released(live.pop(victim))
-        live[victim] = _launch_node(
-            cfg,
-            ami,
-            sg_id,
-            run_id,
-            market,
-            budget,
-            node_index=victim,
-            logs_key=cfg.run_logs_key(run_id, segment=2, node=victim),
-        )
-        profile.mark("relaunch")
+            if aws.is_dry_run():
+                print("[multinode-preempt] dry-run: not waiting/killing", file=sys.stderr)
+                for iid in live.values():
+                    aws.terminate(iid)
+                live.clear()
+                if final:
+                    return None
+                accumulated += interval
+                seg += 1
+                continue
 
-        metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=node0_log)
-        profile.mark("metrics" if metrics is not None else "timeout")
-        profile.from_metrics(metrics)
+            base_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
+            state = {"printed": 0}
+            _wait_train_start(cfg, ckpt_prefix, base_step, node0_log, profile, state, metrics_key)
+            profile.mark("train_start")
+            t0 = time.monotonic()
+
+            if final:
+                metrics = _stream_until_metrics(
+                    cfg, run_id, profile, logs_key=node0_log, state=state
+                )
+                profile.mark("metrics" if metrics is not None else "timeout")
+                profile.from_metrics(metrics)
+                for iid in live.values():
+                    aws.terminate(iid)
+                live.clear()
+                break
+
+            # Non-final: train one hidden interval, then the "Spot reclaim".
+            while time.monotonic() - t0 < interval:
+                _pull_log(cfg, node0_log, profile, state)
+                time.sleep(cfg.log_stream_seconds)
+            trained = time.monotonic() - t0
+            print(
+                f"[multinode-preempt] segment {seg}: hard-terminating node {victim} after "
+                f"~{trained:.0f}s training (no warning); survivors abort on NCCL timeout",
+                file=sys.stderr,
+            )
+            aws.terminate(live[victim])
+            profile.mark("kill")
+            # Tear down the rest of the group — with --max-restarts=0 the survivors
+            # are exiting anyway; the next segment is a fresh full group.
+            for i, iid in live.items():
+                if i != victim:
+                    aws.terminate(iid)
+            # Free the vCPU quota before relaunching — at an 8-vCPU G quota the
+            # next segment's boxes can't coexist with this one's. Quota releases
+            # when instances leave 'running' (seconds), not at 'terminated'.
+            for iid in live.values():
+                aws.wait_quota_released(iid)
+            live.clear()
+            accumulated += trained
+            seg += 1
+
         profile.finalize(cfg)
         print(f"[multinode-preempt] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
         if metrics is not None:
