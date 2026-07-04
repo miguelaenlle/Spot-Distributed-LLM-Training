@@ -23,6 +23,8 @@ Two tools answer "is this checkpoint comprehensive and valid?":
 from __future__ import annotations
 
 import os
+import shutil
+import sys
 import tempfile
 from collections.abc import Callable
 from typing import Any
@@ -56,8 +58,30 @@ def save(*, model, optimizer, loader, step: int, uri: str) -> str:
     }
     fd, tmp_path = tempfile.mkstemp(suffix=".pt")
     os.close(fd)
-    torch.save(blob, tmp_path)
-    return s3_store.save_atomic(tmp_path, uri, _ckpt_name(step))
+    try:
+        torch.save(blob, tmp_path)
+        _warn_if_low_disk(os.path.getsize(tmp_path))
+        return s3_store.save_atomic(tmp_path, uri, _ckpt_name(step))
+    finally:
+        # The local backend renames tmp_path away; the S3 backend uploads a
+        # copy and leaves it — without this, every save leaks a checkpoint
+        # into /tmp until the disk fills.
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _warn_if_low_disk(ckpt_bytes: int) -> None:
+    """One save+verify cycle needs ~2x the checkpoint transiently; warn at 4x
+    so the operator sees the disk shrinking before a write fails mid-run."""
+    free = shutil.disk_usage(tempfile.gettempdir()).free
+    if free < 4 * ckpt_bytes:
+        print(
+            f"[checkpoint] WARNING: {free / 1e9:.1f} GB free on "
+            f"{tempfile.gettempdir()} < 4x checkpoint size "
+            f"({ckpt_bytes / 1e9:.2f} GB) — the next save/verify may fail",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def load_latest(uri: str, map_location: str = "cpu") -> dict[str, Any] | None:
@@ -65,8 +89,8 @@ def load_latest(uri: str, map_location: str = "cpu") -> dict[str, Any] | None:
     ref = s3_store.latest(uri)
     if ref is None:
         return None
-    local = s3_store.download(ref)  # no-op for local refs; downloads+verifies S3
-    return torch.load(local, map_location=map_location, weights_only=False)
+    with s3_store.fetch(ref) as local:  # no-op for local refs; downloads+verifies S3
+        return torch.load(local, map_location=map_location, weights_only=False)
 
 
 def restore_into(blob: dict[str, Any], *, model, optimizer, loader) -> int:
@@ -112,8 +136,8 @@ def verify(ref: str, map_location: str = "cpu") -> dict[str, Any]:
     Raises :class:`CheckpointError` on any problem; ``torch.load`` itself raises on
     a truncated/corrupt file.
     """
-    local = s3_store.download(ref)
-    return _verify_blob(torch.load(local, map_location=map_location, weights_only=False))
+    with s3_store.fetch(ref) as local:
+        return _verify_blob(torch.load(local, map_location=map_location, weights_only=False))
 
 
 def smoke_test(

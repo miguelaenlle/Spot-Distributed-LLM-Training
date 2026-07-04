@@ -18,6 +18,7 @@ resolves them from the ambient environment/instance profile at call time, and
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import tempfile
@@ -118,7 +119,11 @@ def latest(uri: str) -> str | None:
 def download(ref: str, verify: bool = True) -> str:
     """Return a local path for ``ref``. For S3, download to a temp file (and let
     S3/boto3 validate the SHA-256 when ``verify``). For local, ``ref`` already is
-    a path, so return it unchanged."""
+    a path, so return it unchanged.
+
+    The caller OWNS the returned temp file and must remove (or move) it — a
+    30-second checkpoint loop that forgets will fill the disk. Prefer
+    :func:`fetch` unless you are taking ownership of the bytes."""
     if not is_s3(ref):
         return ref
     bucket, key = _split(ref)
@@ -127,6 +132,19 @@ def download(ref: str, verify: bool = True) -> str:
     extra = {"ChecksumMode": "ENABLED"} if verify else {}
     _client().download_file(bucket, key, local, ExtraArgs=extra)
     return local
+
+
+@contextlib.contextmanager
+def fetch(ref: str, verify: bool = True):
+    """Context manager around :func:`download` that deletes the temp copy on
+    exit. Local refs are yielded unchanged and never deleted."""
+    local = download(ref, verify=verify)
+    try:
+        yield local
+    finally:
+        if local != ref:
+            with contextlib.suppress(OSError):
+                os.remove(local)
 
 
 def put_file(local_path: str, uri: str) -> None:
