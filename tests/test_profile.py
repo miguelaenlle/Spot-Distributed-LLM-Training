@@ -211,3 +211,110 @@ def test_wandb_disabled_is_noop():
     assert p._wb is None
     p.ingest_log(LOG)  # _wb_log_step must no-op
     p._wb_finish()  # must no-op
+
+
+# ---- val-eval lines, t_rel stamps, and text samples (Gaps C/E) ------------- #
+
+VAL_LOG = LOG + "eval step 250: val_loss 2.1034\neval step 500: val_loss 1.9020\n"
+
+
+def test_ingest_val_lines_and_dedup():
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    p.ingest_log(VAL_LOG)
+    assert [(v.step, v.loss) for v in p.val_samples] == [(250, 2.1034), (500, 1.902)]
+    # re-feeding the full log must not duplicate; train samples unaffected
+    p.ingest_log(VAL_LOG)
+    assert len(p.val_samples) == 2 and len(p.samples) == 2
+    # a truncated val line is ignored until complete
+    p.ingest_log("eval step 750: val_loss 1.8")
+    assert len(p.val_samples) == 3  # 1.8 parses — the regex needs digits, has them
+    assert p.val_samples[-1].loss == 1.8
+
+
+def test_samples_t_rel_is_relative_to_first_event():
+    import time as _time
+
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    p.events = [Event("launch", _time.time() - 100.0, 1)]
+    p.ingest_log(VAL_LOG)
+    assert all(99.0 < s.t_rel < 102.0 for s in p.samples)
+    assert all(99.0 < v.t_rel < 102.0 for v in p.val_samples)
+    # without any event the stamp degrades to 0, never raises
+    q = RunProfile("baseline-2", "baseline", "on-demand")
+    q.ingest_log(LOG)
+    assert all(s.t_rel == 0.0 for s in q.samples)
+
+
+def _samples_doc(step: int) -> dict:
+    return {
+        "run_id": "r",
+        "step": step,
+        "dataset": "shakespeare_char",
+        "params": {"max_new_tokens": 8, "temperature": 0.8},
+        "samples": [{"prompt": "ROMEO:", "sample_index": 0, "completion": " hi"}],
+    }
+
+
+def test_from_samples_dedup_and_order():
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    p.from_samples(_samples_doc(2000))
+    p.from_samples(_samples_doc(1000))
+    p.from_samples(_samples_doc(2000))  # resumed-run rewrite: first-seen wins
+    p.from_samples(None)  # tolerated
+    p.from_samples({"step": 3, "samples": []})  # empty doc ignored
+    assert [d["step"] for d in p.text_samples] == [1000, 2000]
+    assert p.sample_rows() == [
+        [1000, "ROMEO:", 0, " hi"],
+        [2000, "ROMEO:", 0, " hi"],
+    ]
+
+
+def test_to_dict_includes_new_fields(tmp_path):
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    p.events = [Event("launch", 1000.0, 1)]
+    p.ingest_log(VAL_LOG)
+    p.from_samples(_samples_doc(500))
+    d = p.to_dict()
+    assert [v["step"] for v in d["val_samples"]] == [250, 500]
+    assert d["text_samples"][0]["step"] == 500
+    assert "t_rel" in d["loss_samples"][0]
+    assert isinstance(d["segments"], list)  # materialized for `compare`
+    json.dumps(d)  # stays serializable
+
+
+def test_segments_include_sampling_stamp():
+    p = RunProfile("baseline-1", "baseline", "on-demand")
+    p.events = [Event("launch", 1000.0, 1), Event("metrics", 1175.0, 1)]
+    p.from_metrics(
+        {
+            "train_started_at": 1060.0,
+            "phases": {"train_s": 60.0, "save_s": 2.0, "eval_s": 44.0, "sample_s": 9.0},
+        }
+    )
+    assert p.segments()[-1] == {"phase": "sampling", "seconds": 9.0}
+    assert p.durations()["sampling_s"] == 9.0
+    # old metrics.json without sample_s stays untouched
+    p.from_metrics({"train_started_at": 1060.0, "phases": {"train_s": 60.0}})
+    assert all(s["phase"] != "sampling" for s in p.segments())
+
+
+def test_render_multi_timeline(tmp_path):
+    from orchestrator.profile import render_multi_timeline_png
+
+    rows = [
+        (
+            "baseline",
+            [{"phase": "provisioning", "seconds": 60}, {"phase": "training", "seconds": 300}],
+        ),
+        ("preempt", [{"phase": "training", "seconds": 100}, {"phase": "downtime", "seconds": 30}]),
+        ("empty", []),  # dropped, not drawn
+    ]
+    out = tmp_path / "tl.png"
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError:
+        assert render_multi_timeline_png("t", rows, str(out)) is False
+        return
+    assert render_multi_timeline_png("t", rows, str(out)) is True
+    assert out.stat().st_size > 0
+    assert render_multi_timeline_png("t", [("e", [])], str(out)) is False

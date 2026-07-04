@@ -15,12 +15,13 @@ Invariants:
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 
 import torch
 
-from . import checkpoint, distributed, s3_store
+from . import checkpoint, distributed, s3_store, sampling
 from .config import TrainConfig
 from .data import PositionedLoader
 from .interruption import InterruptionListener
@@ -60,6 +61,21 @@ def build_model(cfg: TrainConfig, vocab_size: int):
 
 
 @torch.no_grad()
+def eval_full(model, loader: PositionedLoader, split: str = "val") -> float:
+    """Mean loss over ONE deterministic full pass of ``split`` (exact — the same
+    windows every call and every run, and zero RNG consumed; see
+    ``PositionedLoader.iter_eval_batches``)."""
+    model.eval()
+    total, count = 0.0, 0
+    for x, y in loader.iter_eval_batches(split):
+        _, loss = model(x, y)
+        total += loss.item() * x.size(0)
+        count += x.size(0)
+    model.train()
+    return total / max(1, count)
+
+
+@torch.no_grad()
 def estimate_loss(model, loader: PositionedLoader, eval_iters: int) -> dict[str, float]:
     """Mean train/val loss over ``eval_iters`` batches (nanoGPT-style)."""
     model.eval()
@@ -73,6 +89,21 @@ def estimate_loss(model, loader: PositionedLoader, eval_iters: int) -> dict[str,
         out[split] = float(losses.mean().item())
     model.train()
     return out
+
+
+def get_lr(cfg: TrainConfig, step: int) -> float:
+    """nanoGPT-style schedule: linear warmup -> cosine decay -> min_lr. A pure
+    function of the step number, so a resumed run computes the same LR the dead
+    one would have — no schedule state in the checkpoint."""
+    if cfg.lr_decay_steps <= 0:
+        return cfg.learning_rate  # schedule disabled: constant LR
+    if step < cfg.warmup_steps:
+        return cfg.learning_rate * (step + 1) / (cfg.warmup_steps + 1)
+    if step >= cfg.lr_decay_steps:
+        return cfg.min_lr
+    decay = (step - cfg.warmup_steps) / (cfg.lr_decay_steps - cfg.warmup_steps)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay))
+    return cfg.min_lr + coeff * (cfg.learning_rate - cfg.min_lr)
 
 
 def _write_metrics(cfg: TrainConfig, metrics: dict) -> None:
@@ -177,10 +208,15 @@ def train(cfg: TrainConfig) -> dict:
     reason = "max_steps"
 
     while step < cfg.max_steps:
+        lr = get_lr(cfg, step)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
         x, y = loader.next_batch("train")
         _, loss = model(x, y)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()  # DDP averages gradients across ranks here
+        if cfg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
         step += 1
 
@@ -199,6 +235,28 @@ def train(cfg: TrainConfig) -> dict:
                     flush=True,
                 )
                 last_log_time, last_log_step = t, step
+
+        # Periodic exact eval + inference snapshots — step-keyed, so every run
+        # produces points at identical steps and a resumed run self-heals onto
+        # the same schedule. ALL ranks execute both blocks (no collectives
+        # inside, but a rank that skipped them would run ahead and stall DDP at
+        # the next backward until NCCL_TIMEOUT); only rank 0 prints/writes.
+        if cfg.eval_interval_steps and step % cfg.eval_interval_steps == 0:
+            vloss = eval_full(raw_model, loader)
+            if ddp.master:
+                print(f"eval step {step}: val_loss {vloss:.4f}", file=sys.stderr, flush=True)
+        if cfg.sample_interval_steps and step % cfg.sample_interval_steps == 0:
+            doc = sampling.generate_samples(
+                raw_model,
+                cfg,
+                step,
+                prompts=cfg.sample_prompts[: cfg.sample_interval_prompts],
+                max_new_tokens=cfg.sample_interval_tokens,
+            )
+            if ddp.master and doc is not None:
+                uri = sampling.snapshot_uri(cfg, step)
+                sampling.write_samples(doc, uri)
+                log(f"[sample] step {step}: {len(doc['samples'])} samples -> {uri}")
 
         now = time.monotonic()
         if now - last_ckpt >= cfg.checkpoint_interval_seconds:
@@ -221,7 +279,9 @@ def train(cfg: TrainConfig) -> dict:
     if ddp.enabled:
         if distributed.all_reduce_stop(ddp, reason == "preempt"):
             reason = "preempt"
-        elif reason == "max_steps":
+        elif reason == "max_steps" and step < cfg.max_steps:
+            # This rank was stopped by a peer's budget, not by exhausting steps.
+            # (A genuine max_steps finish exhausts on every rank at once.)
             reason = "time_budget"
 
     # Graceful preemption (SIGTERM from the orchestrator — a stand-in for a Spot
@@ -257,6 +317,16 @@ def train(cfg: TrainConfig) -> dict:
     losses = estimate_loss(raw_model, loader, cfg.eval_iters)  # unwrapped: no collective
     eval_s = round(time.monotonic() - eval_t0, 2)
 
+    # Representative outputs: the full prompt series against the final weights.
+    # Written BEFORE metrics.json — metrics is the orchestrator's done-signal, so
+    # samples.json is guaranteed present the moment the run reads as finished.
+    sample_t0 = time.monotonic()
+    samples_doc = sampling.generate_samples(raw_model, cfg, final_step)
+    if samples_doc is not None:
+        sampling.write_samples(samples_doc, cfg.samples_uri)
+        log(f"[sample] wrote {len(samples_doc['samples'])} samples -> {cfg.samples_uri}")
+    sample_s = round(time.monotonic() - sample_t0, 2)
+
     metrics = {
         "run_id": cfg.run_id,
         "market": cfg.market,
@@ -269,7 +339,7 @@ def train(cfg: TrainConfig) -> dict:
         # Exact per-phase wall-clock for the run-profile timeline. train_started_at
         # (epoch) lets the orchestrator derive provisioning = train_started_at - launch.
         "train_started_at": round(train_started_at, 3),
-        "phases": {"train_s": train_s, "save_s": save_s, "eval_s": eval_s},
+        "phases": {"train_s": train_s, "save_s": save_s, "eval_s": eval_s, "sample_s": sample_s},
         "stop_reason": reason,
         "device": cfg.device,
         "cuda": cuda_ok,

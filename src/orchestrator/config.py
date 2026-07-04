@@ -21,6 +21,29 @@ def _env_int(name: str, default: int) -> int:
     return int(v) if v not in (None, "") else default
 
 
+# Trainer knobs the orchestrator relays verbatim (only when set in ITS
+# environment): the convergence recipe + periodic eval/sample cadence. The
+# orchestrator never branches on these values, so they stay untyped strings —
+# TrainConfig.from_env parses them on the box.
+_TRAINER_PASSTHROUGH = (
+    "MAX_STEPS",
+    "LEARNING_RATE",
+    "WEIGHT_DECAY",
+    "DROPOUT",
+    "WARMUP_STEPS",
+    "LR_DECAY_STEPS",
+    "MIN_LR",
+    "GRAD_CLIP",
+    "EVAL_INTERVAL_STEPS",
+    "SAMPLE_INTERVAL_STEPS",
+    "SAMPLE_INTERVAL_PROMPTS",
+    "SAMPLE_INTERVAL_TOKENS",
+    "SAMPLE_MAX_NEW_TOKENS",
+    "SAMPLE_TEMPERATURE",
+    "SAMPLE_TOP_K",
+    "SAMPLES_PER_PROMPT",
+)
+
 # vCPUs per instance type, for the quota-headroom gate. Only the types this
 # project plausibly launches; anything else needs INSTANCE_VCPUS set explicitly.
 _INSTANCE_VCPUS = {
@@ -113,6 +136,20 @@ class OrchestratorConfig:
     # experiment so frequent preemption checkpoints don't flood the loss output.
     smoke_test_every: int = field(default_factory=lambda: _env_int("SMOKE_TEST_EVERY", 1))
 
+    # --- end-of-run + periodic text samples ----------------------------------
+    # JSON array of prompts the trainer samples from at the end of a run (and at
+    # SAMPLE_INTERVAL_STEPS snapshots). Relayed to the box base64-encoded so the
+    # env file's export K="v" quoting can't be broken by quotes/newlines.
+    sample_prompts: str = field(
+        default_factory=lambda: _env("SAMPLE_PROMPTS", '["ROMEO:", "JULIET:", "First Citizen:"]')
+    )
+
+    # --- multinode-preempt victim schedule ------------------------------------
+    # Comma-separated node index to hard-kill per preemption round, e.g. "1,0"
+    # (kill node 1 first, then node 0 — the master; its replacement republishes
+    # rdzv.json on the same generation code path). Empty = always the last node.
+    preempt_victims: str = field(default_factory=lambda: _env("PREEMPT_VICTIMS", ""))
+
     # --- DDP experiment (spot-orchestrate ddp) ------------------------------
     # Ranks torchrun launches on the box. 0 (default) = auto: one rank per GPU on
     # the machine (torchrun --nproc_per_node=gpu). Set a positive value to force a
@@ -156,6 +193,9 @@ class OrchestratorConfig:
     # Logging happens on the ORCHESTRATOR only; spot boxes never see the key.
     wandb_project: str = field(default_factory=lambda: _env("WANDB_PROJECT", "spot-train"))
     wandb_entity: str = field(default_factory=lambda: _env("WANDB_ENTITY", ""))
+    # Optional W&B group for a comparison suite (e.g. shakespeare-convergence);
+    # empty keeps the historical group-by-market behavior.
+    wandb_group: str = field(default_factory=lambda: _env("WANDB_GROUP", ""))
 
     # -- derived S3 locations ------------------------------------------------ #
     def data_uri(self) -> str:
@@ -169,6 +209,22 @@ class OrchestratorConfig:
 
     def run_metrics_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/metrics.json"
+
+    # End-of-run consolidated text samples (trainer writes it just before
+    # metrics.json, so it's always present when the done-signal appears).
+    def run_samples_uri(self, run_id: str) -> str:
+        return f"s3://{self.bucket}/{self.run_prefix}/{run_id}/samples.json"
+
+    def run_samples_key(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/samples.json"
+
+    # Mid-training inference snapshots (samples/step-<12-digit>.json), written
+    # immediately at each SAMPLE_INTERVAL_STEPS gate so they survive preemption.
+    def run_samples_prefix_uri(self, run_id: str) -> str:
+        return f"s3://{self.bucket}/{self.run_prefix}/{run_id}/samples/"
+
+    def run_samples_prefix(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/samples/"
 
     # The box's boot/training log, synced here every few seconds so the orchestrator
     # can stream it back without SSH. Preemption uses a per-segment key (seg-N.log)
@@ -239,6 +295,36 @@ class OrchestratorConfig:
                 f"Unknown vCPU count for instance type {self.instance_type!r} — "
                 "set INSTANCE_VCPUS=<n> in your .env so the quota gate can count it."
             ) from None
+
+    def trainer_passthrough(self) -> dict[str, str]:
+        """Recipe/cadence env vars relayed to the box verbatim — only the ones
+        actually set here, so an unset knob keeps the trainer's own default."""
+        return {k: os.environ[k] for k in _TRAINER_PASSTHROUGH if os.environ.get(k)}
+
+    def preempt_victim_schedule(self) -> list[int]:
+        """Node index to kill per preemption round. Empty PREEMPT_VICTIMS keeps
+        the proven default (always the last node); otherwise one index per round,
+        each in [0, node_count) — 0 (the master) is allowed."""
+        raw = self.preempt_victims.strip()
+        if not raw:
+            return [self.node_count - 1] * self.preempt_count
+        try:
+            victims = [int(v) for v in raw.split(",")]
+        except ValueError:
+            raise SystemExit(
+                f"PREEMPT_VICTIMS={raw!r} — must be comma-separated node indices"
+            ) from None
+        if len(victims) != self.preempt_count:
+            raise SystemExit(
+                f"PREEMPT_VICTIMS has {len(victims)} entries but PREEMPT_COUNT is "
+                f"{self.preempt_count} — one victim per kill round"
+            )
+        bad = [v for v in victims if not 0 <= v < self.node_count]
+        if bad:
+            raise SystemExit(
+                f"PREEMPT_VICTIMS contains {bad} — node indices must be in [0, {self.node_count})"
+            )
+        return victims
 
     def require_bucket(self) -> None:
         if not self.bucket:

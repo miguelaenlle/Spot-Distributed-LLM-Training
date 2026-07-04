@@ -21,6 +21,10 @@ from dataclasses import dataclass, field
 #   "step 20: loss 2.9876, 80ms/step, 15300 tok/s"
 _STEP_RE = re.compile(r"step\s+(\d+):\s+loss\s+([0-9.]+),\s+(\d+)ms/step,\s+(\d+)\s+tok/s")
 
+# Matches the trainer's periodic exact-eval line (Gap E):
+#   "eval step 250: val_loss 2.1034"
+_EVAL_RE = re.compile(r"eval\s+step\s+(\d+):\s+val_loss\s+([0-9.]+)")
+
 # The timeline is a sequence of phases running between ordered milestones. Crucially
 # train_start / train_end come from the FIRST / LAST per-step line actually observed
 # (not "first log byte"), so the training phase reflects the loop (~max_seconds) and
@@ -56,6 +60,7 @@ _PHASE_COLORS: dict[str, str] = {
     "preemption_recovery": "#F58518",
     "evaluation": "#72B7B2",
     "final_saves": "#B279A2",
+    "sampling": "#E45756",
 }
 
 
@@ -74,6 +79,19 @@ class Sample:
     loss: float
     ms_per_step: int
     tok_s: int
+    # Seconds since the run's first event, stamped when the line was OBSERVED
+    # (log-poll granularity, ~3s). Lets loss curves overlay on a wall-clock axis
+    # where preemption gaps are visible.
+    t_rel: float = 0.0
+
+
+@dataclass
+class ValSample:
+    """A periodic exact-eval point (`eval step N: val_loss X`)."""
+
+    step: int
+    loss: float
+    t_rel: float = 0.0
 
 
 @dataclass
@@ -87,8 +105,13 @@ class RunProfile:
     segment: int = 1  # bump to 2 before a spot relaunch (future); baseline stays 1
     events: list[Event] = field(default_factory=list)
     samples: list[Sample] = field(default_factory=list)
+    val_samples: list[ValSample] = field(default_factory=list)
+    # Text-sample documents (end-of-run samples.json + per-step snapshots), each
+    # {"step", "params", "samples": [{"prompt", "sample_index", "completion"}]}.
+    text_samples: list[dict] = field(default_factory=list)
     metrics: dict | None = None
     _seen: set[tuple[int, int]] = field(default_factory=set)  # (segment, step) dedup
+    _seen_val: set[tuple[int, int]] = field(default_factory=set)
     _wb: object | None = field(default=None, repr=False)  # wandb run handle or None
     _wb_step: int = 0  # monotonic step for W&B (survives spot step-number resets)
     # Wall-clock of the first/last per-step line observed => training-phase bounds.
@@ -99,6 +122,10 @@ class RunProfile:
     def mark(self, event: str) -> None:
         """Record a control-plane transition at the current wall clock."""
         self.events.append(Event(event, time.time(), self.segment))
+
+    def _t_rel_now(self, now: float) -> float:
+        """Seconds since the run's first event (0 if nothing marked yet)."""
+        return round(now - self.events[0].t_wall, 2) if self.events else 0.0
 
     def ingest_log(self, text: str) -> None:
         """Parse per-step lines from the FULL boot log, dedup on (segment, step),
@@ -111,16 +138,42 @@ class RunProfile:
             if key in self._seen:
                 continue
             self._seen.add(key)
-            s = Sample(step, float(m.group(2)), int(m.group(3)), int(m.group(4)))
-            self.samples.append(s)
             now = time.time()  # observation time bounds the training phase
+            s = Sample(
+                step,
+                float(m.group(2)),
+                int(m.group(3)),
+                int(m.group(4)),
+                t_rel=self._t_rel_now(now),
+            )
+            self.samples.append(s)
             if self._first_sample_wall is None:
                 self._first_sample_wall = now
             self._last_sample_wall = now
             self._wb_log_step(s)
+        for m in _EVAL_RE.finditer(text):
+            step = int(m.group(1))
+            key = (self.segment, step)
+            if key in self._seen_val:
+                continue
+            self._seen_val.add(key)
+            v = ValSample(step, float(m.group(2)), t_rel=self._t_rel_now(time.time()))
+            self.val_samples.append(v)
+            self._wb_log_val(v)
 
     def from_metrics(self, metrics: dict | None) -> None:
         self.metrics = metrics
+
+    def from_samples(self, doc: dict | None) -> None:
+        """Attach a text-samples document (final samples.json or a per-step
+        snapshot). Dedup by step — a resumed run rewrites a snapshot key with
+        byte-identical content, so first-seen wins."""
+        if not doc or not doc.get("samples"):
+            return
+        if any(d.get("step") == doc.get("step") for d in self.text_samples):
+            return
+        self.text_samples.append(doc)
+        self.text_samples.sort(key=lambda d: d.get("step", 0))
 
     # -- derived (pure) ---------------------------------------------------- #
     def _t(self, name: str, segment: int | None = None) -> float | None:
@@ -169,6 +222,9 @@ class RunProfile:
             "schema_version": 1,
             "created_at": round(time.time(), 3),
             "durations": self.durations(),
+            # Materialized so `spot-orchestrate compare` can rebuild timelines
+            # from profile.json alone (no live RunProfile needed).
+            "segments": self.segments(),
             "events": [
                 {
                     "event": e.event,
@@ -179,6 +235,8 @@ class RunProfile:
                 for e in self.events
             ],
             "loss_samples": [vars(s) for s in self.samples],
+            "val_samples": [vars(v) for v in self.val_samples],
+            "text_samples": self.text_samples,
             "metrics": self.metrics,
         }
 
@@ -214,7 +272,9 @@ class RunProfile:
             project=cfg.wandb_project,
             entity=cfg.wandb_entity or None,
             name=self.run_id,
-            group=self.market,
+            # A comparison suite groups its runs explicitly (WANDB_GROUP);
+            # otherwise keep the historical group-by-market behavior.
+            group=cfg.wandb_group or self.market,
             config={
                 "kind": self.kind,
                 "market": self.market,
@@ -227,10 +287,27 @@ class RunProfile:
         if self._wb is None:
             return
         self._wb.log(
-            {"loss": s.loss, "ms_per_step": s.ms_per_step, "tok_s": s.tok_s},
+            # t_rel/train_step let the W&B x-axis switch to wall-clock (gaps
+            # visible) or the trainer's own step (resume overlaps visible).
+            {
+                "loss": s.loss,
+                "ms_per_step": s.ms_per_step,
+                "tok_s": s.tok_s,
+                "t_rel": s.t_rel,
+                "train_step": s.step,
+            },
             step=self._wb_step,
         )
         self._wb_step += 1
+
+    def _wb_log_val(self, v: ValSample) -> None:
+        if self._wb is None:
+            return
+        # Same monotonic W&B step counter, no increment: the val point merges
+        # into the current x position between two train samples.
+        self._wb.log(
+            {"val_loss": v.loss, "t_rel": v.t_rel, "train_step": v.step}, step=self._wb_step
+        )
 
     def _stamp_phases(self) -> list[dict]:
         """training/final_saves/evaluation from the trainer's exact stamps, or []."""
@@ -242,6 +319,7 @@ class RunProfile:
             ("training", "train_s"),
             ("final_saves", "save_s"),
             ("evaluation", "eval_s"),
+            ("sampling", "sample_s"),
         ):
             secs = ph.get(key)
             if secs:
@@ -290,11 +368,12 @@ class RunProfile:
             prov = round(m["train_started_at"] - launch, 2)
             if prov > 0:
                 out.append({"phase": "provisioning", "seconds": prov})
-            # order matches the trainer: loop -> final checkpoint -> eval
+            # order matches the trainer: loop -> final checkpoint -> eval -> sample
             for phase, key in (
                 ("training", "train_s"),
                 ("final_saves", "save_s"),
                 ("evaluation", "eval_s"),
+                ("sampling", "sample_s"),
             ):
                 secs = ph.get(key)
                 if secs:
@@ -323,6 +402,19 @@ class RunProfile:
     def duration_rows(self) -> list[list]:
         """Rows for the durations table/bar chart: [phase, seconds]."""
         return [[k, v] for k, v in self.durations().items()]
+
+    def sample_rows(self) -> list[list]:
+        """Rows for the text-samples table: [step, prompt, sample_index, completion],
+        one per generated sample across all snapshots + the final document."""
+        return [
+            [doc.get("step", 0), s["prompt"], s.get("sample_index", 0), s["completion"]]
+            for doc in self.text_samples
+            for s in doc.get("samples", [])
+        ]
+
+    def val_rows(self) -> list[list]:
+        """Rows for the periodic exact-eval table: [step, val_loss, t_rel_s]."""
+        return [[v.step, v.loss, v.t_rel] for v in self.val_samples]
 
     def timeline_rows(self) -> list[list]:
         """Rows for the timeline table: [event, segment, t_rel_s, t_wall]."""
@@ -363,6 +455,16 @@ class RunProfile:
                 columns=["phase", "seconds", "start_s"], data=self.segment_rows()
             ),
         }
+        sample_rows = self.sample_rows()
+        if sample_rows:
+            log["samples/text"] = wandb.Table(
+                columns=["step", "prompt", "sample_index", "completion"], data=sample_rows
+            )
+        val_rows = self.val_rows()
+        if val_rows:
+            log["eval/val_table"] = wandb.Table(
+                columns=["step", "val_loss", "t_rel_s"], data=val_rows
+            )
         png = os.path.join(tempfile.gettempdir(), f"{self.run_id}-timeline.png")
         if self.render_timeline_png(png):
             log["profile/timeline_bar"] = wandb.Image(png)
@@ -374,6 +476,52 @@ class RunProfile:
 # Rendering (module-level so it can preview arbitrary phase sequences — a single
 # run now, a multi-node Gantt later)
 # --------------------------------------------------------------------------- #
+def render_multi_timeline_png(title: str, rows: list[tuple[str, list[dict]]], path: str) -> bool:
+    """Render several runs' phase sequences as stacked horizontal bars sharing
+    one time axis — the side-by-side timeline for `spot-orchestrate compare`.
+    ``rows`` is [(label, segments), ...] top-to-bottom. Returns False if
+    matplotlib is absent or there is nothing to draw."""
+    rows = [(label, segs) for label, segs in rows if segs]
+    if not rows:
+        return False
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")  # headless
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return False
+
+    fig, ax = plt.subplots(figsize=(10.5, 0.9 * len(rows) + 1.2))
+    seen: set[str] = set()
+    for y, (_label, segments) in enumerate(reversed(rows)):
+        left = 0.0
+        for s in segments:
+            color = _PHASE_COLORS.get(s["phase"], "#777777")
+            legend_label = None if s["phase"] in seen else s["phase"]
+            seen.add(s["phase"])
+            ax.barh(y, s["seconds"], left=left, color=color, edgecolor="white", label=legend_label)
+            if s["seconds"] > 0:
+                ax.text(
+                    left + s["seconds"] / 2,
+                    y,
+                    f"{s['seconds']:.0f}s",
+                    ha="center",
+                    va="center",
+                    color="white",
+                    fontsize=7,
+                )
+            left += s["seconds"]
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([label for label, _ in reversed(rows)], fontsize=8)
+    ax.set_xlabel("seconds")
+    ax.set_title(title)
+    legend = ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False, fontsize=8)
+    fig.savefig(path, dpi=120, bbox_inches="tight", bbox_extra_artists=(legend,))
+    plt.close(fig)
+    return True
+
+
 def render_segments_png(title: str, segments: list[dict], path: str) -> bool:
     """Render an ordered list of ``{"phase", "seconds"}`` as one horizontal
     STACKED bar (segment width = seconds, colored per phase) to ``path``. Returns

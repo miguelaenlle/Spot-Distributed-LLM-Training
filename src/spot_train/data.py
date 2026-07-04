@@ -127,6 +127,36 @@ class PositionedLoader:
             self.state.step += 1
         return x, y
 
+    def iter_eval_batches(self, split: str = "val"):
+        """Deterministic FULL pass over ``split``: consecutive non-overlapping
+        block_size windows batched batch_size at a time (remainder windows kept
+        as a final short batch). Draws NOTHING from any RNG — the training data
+        stream is bit-identical whether or not an eval ran — and yields the same
+        batches every call, so eval losses are exactly comparable across steps
+        and across runs."""
+        path = os.path.join(self.data_local_dir, f"{split}.bin")
+        data = np.memmap(path, dtype=np.uint16, mode="r")
+        n_windows = (len(data) - 1) // self.block_size
+        for start in range(0, n_windows, self.batch_size):
+            offsets = [
+                w * self.block_size for w in range(start, min(start + self.batch_size, n_windows))
+            ]
+            x = torch.stack(
+                [torch.from_numpy(data[i : i + self.block_size].astype(np.int64)) for i in offsets]
+            )
+            y = torch.stack(
+                [
+                    torch.from_numpy(data[i + 1 : i + 1 + self.block_size].astype(np.int64))
+                    for i in offsets
+                ]
+            )
+            if self.device.startswith("cuda"):
+                x = x.pin_memory().to(self.device, non_blocking=True)
+                y = y.pin_memory().to(self.device, non_blocking=True)
+            else:
+                x, y = x.to(self.device), y.to(self.device)
+            yield x, y
+
     # -- resumable position ------------------------------------------------- #
     def state_dict(self) -> dict[str, Any]:
         return {"step": self.state.step, "epoch": self.state.epoch}

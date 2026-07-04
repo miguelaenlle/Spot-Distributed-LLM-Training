@@ -105,10 +105,17 @@ on its own, and nobody busy-retries against a box that is still booting):
   gen G **only after all N−1 ready markers for G exist**, then immediately
   starts torchrun — its TCPStore comes up seconds before the workers dial,
   well inside the store's client connect window.
-- If the *master* dies (real preemption; the experiment always kills the last
-  node), its replacement reads the stale `rdzv.json`, waits for the
+- If the *master* dies (real preemption, or a `PREEMPT_VICTIMS` schedule that
+  includes node 0), its replacement reads the stale `rdzv.json`, waits for the
   survivors' gen+1 ready markers, and publishes its own new IP — same code
-  path, no special case.
+  path, no special case. Orchestrator-side, a node-0 kill additionally switches
+  the streamed log to the replacement's attempt key (fresh file ⇒ profile
+  segment bump + printed-offset reset).
+- Known self-healing wrinkle: ready markers are never deleted, so after a
+  whole-group-restart fallback, stale `gen<G+1>` markers from the failed
+  attempt can let the fresh master publish before its workers are up; the
+  join then times out and everyone converges at G+2 — worst case one wasted
+  generation, no intervention needed.
 - `metrics.json` appearing in S3 is the group-wide done signal. The budget is
   **orchestrator-authoritative**: `budget.json` (next to `rdzv.json`) holds
   the remaining seconds, recomputed after every kill from *observed* training

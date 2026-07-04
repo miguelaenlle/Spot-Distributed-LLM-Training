@@ -27,6 +27,9 @@ The trainer pulls the dataset and reads/writes S3 via the instance profile role
 
 from __future__ import annotations
 
+import base64
+import json
+
 from .config import OrchestratorConfig
 
 
@@ -36,10 +39,19 @@ def _trainer_env(
     """Environment the trainer reads via ``TrainConfig.from_env`` (spot_train
     config). Written to a ``source``-able file so you can run training by hand
     after sshing in, and exported inline for the full-run builder."""
-    return {
+    env = {
         "PYTHONPATH": "/home/ubuntu/app/src",
         "CHECKPOINT_URI": cfg.run_checkpoint_uri(run_id),
         "METRICS_URI": cfg.run_metrics_uri(run_id),
+        "SAMPLES_URI": cfg.run_samples_uri(run_id),
+        "SAMPLES_PREFIX_URI": cfg.run_samples_prefix_uri(run_id),
+        # base64(JSON array): the env file is `export K="v"` lines, and prompt
+        # text (quotes, spaces, newlines) must survive that quoting untouched.
+        # The loads/dumps round-trip fails fast here on a malformed .env value —
+        # before any instance is launched.
+        "SAMPLE_PROMPTS": base64.b64encode(
+            json.dumps(json.loads(cfg.sample_prompts)).encode()
+        ).decode(),
         "DATA_URI": cfg.data_uri(),
         "DATASET": cfg.dataset,
         "DATA_LOCAL_DIR": f"/home/ubuntu/app/third_party/nanoGPT/data/{cfg.dataset}",
@@ -54,6 +66,10 @@ def _trainer_env(
         "DDP_DATA_MODE": cfg.ddp_data_mode,  # only used when launched via torchrun
         "PYTHONUNBUFFERED": "1",  # unbuffered so `tail -f` shows per-step lines live
     }
+    # Recipe/cadence knobs (MAX_STEPS, LR schedule, EVAL/SAMPLE intervals, …)
+    # relay verbatim, and only when set — unset keeps the trainer's defaults.
+    env.update(cfg.trainer_passthrough())
+    return env
 
 
 def _export_block(env: dict[str, str]) -> str:

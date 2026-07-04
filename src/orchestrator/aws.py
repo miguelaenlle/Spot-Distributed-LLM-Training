@@ -129,6 +129,19 @@ def max_checkpoint_step(bucket: str, prefix: str) -> int:
     return best
 
 
+def list_keys(bucket: str, prefix: str) -> list[str]:
+    """All object keys under ``prefix``, sorted. Used to collect the trainer's
+    per-step sample snapshots (runs/<run_id>/samples/step-*.json)."""
+    if _DRY_RUN:
+        _log(f"list s3://{bucket}/{prefix}")
+        return []
+    keys: list[str] = []
+    paginator = _client("s3").get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        keys.extend(obj["Key"] for obj in page.get("Contents", []))
+    return sorted(keys)
+
+
 def ssm_online(instance_id: str) -> bool:
     """True if the SSM agent on the instance is registered and online (so we can
     send it a command). Boxes get AmazonSSMManagedInstanceCore via the instance

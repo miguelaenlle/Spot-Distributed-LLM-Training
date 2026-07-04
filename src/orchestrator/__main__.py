@@ -1,5 +1,6 @@
 """CLI: ``spot-orchestrate {setup,stage-data,baseline,spot,preempt,ddp,ddp-preempt,
-multinode,multinode-preempt} [--dry-run]``.
+multinode,multinode-preempt} [--dry-run]`` and
+``spot-orchestrate compare <run_id> [<run_id> ...]``.
 
 You run this; it needs your AWS creds in the environment. A git-ignored ``.env``
 in the current directory is loaded into the environment on startup (values are
@@ -50,6 +51,8 @@ def main() -> None:
         "multinode-preempt",
     ):
         sub.add_parser(name, parents=[common])
+    cmp_parser = sub.add_parser("compare", parents=[common])
+    cmp_parser.add_argument("run_ids", nargs="+", help="run ids to compare (2+ recommended)")
 
     args = parser.parse_args()
 
@@ -80,6 +83,10 @@ def main() -> None:
         experiments.run_multinode(cfg)
     elif args.command == "multinode-preempt":
         experiments.run_multinode_preempt(cfg)
+    elif args.command == "compare":
+        from . import compare
+
+        compare.run_compare(cfg, args.run_ids)
     else:  # pragma: no cover — argparse enforces the choices
         parser.error(f"unknown command {args.command}")
 

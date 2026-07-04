@@ -134,3 +134,62 @@ def test_instance_vcpu_count():
     cfg.instance_type = "p9.superlarge"
     with pytest.raises(SystemExit, match="INSTANCE_VCPUS"):
         cfg.instance_vcpu_count()
+
+
+def test_trainer_env_exports_sampling_and_prompts_base64():
+    import base64
+    import json
+
+    ud = _ud()
+    assert 'export SAMPLES_URI="s3://test-bucket/runs/run-1/samples.json"' in ud
+    assert 'export SAMPLES_PREFIX_URI="s3://test-bucket/runs/run-1/samples/"' in ud
+    # SAMPLE_PROMPTS is base64(JSON) — no raw quote can break the export line.
+    env = bootstrap._trainer_env(_cfg(), run_id="run-1", market="on-demand", max_seconds=60)
+    decoded = json.loads(base64.b64decode(env["SAMPLE_PROMPTS"]).decode())
+    assert decoded == ["ROMEO:", "JULIET:", "First Citizen:"]
+    assert '"' not in env["SAMPLE_PROMPTS"]
+
+
+def test_trainer_env_rejects_malformed_prompts():
+    cfg = _cfg()
+    cfg.sample_prompts = "not-json"
+    with pytest.raises(ValueError):
+        bootstrap._trainer_env(cfg, run_id="run-1", market="on-demand", max_seconds=60)
+
+
+def test_trainer_passthrough_only_when_set(monkeypatch):
+    for var in ("MAX_STEPS", "LEARNING_RATE", "EVAL_INTERVAL_STEPS"):
+        monkeypatch.delenv(var, raising=False)
+    env = bootstrap._trainer_env(_cfg(), run_id="run-1", market="on-demand", max_seconds=60)
+    assert "MAX_STEPS" not in env  # unset => trainer defaults untouched
+    monkeypatch.setenv("MAX_STEPS", "5000")
+    monkeypatch.setenv("LEARNING_RATE", "1e-3")
+    monkeypatch.setenv("EVAL_INTERVAL_STEPS", "250")
+    env = bootstrap._trainer_env(_cfg(), run_id="run-1", market="on-demand", max_seconds=60)
+    assert env["MAX_STEPS"] == "5000"
+    assert env["LEARNING_RATE"] == "1e-3"
+    assert env["EVAL_INTERVAL_STEPS"] == "250"
+    ud = _ud()
+    assert 'export MAX_STEPS="5000"' in ud
+
+
+def test_preempt_victim_schedule():
+    cfg = _cfg()  # NODES=2, PREEMPT_COUNT=1 defaults
+    assert cfg.preempt_victim_schedule() == [1]  # empty => last node (proven path)
+    cfg.preempt_count = 3
+    assert cfg.preempt_victim_schedule() == [1, 1, 1]
+    # the staggered case: node 1 at t1, node 0 (master) at t2
+    cfg.preempt_count = 2
+    cfg.preempt_victims = "1,0"
+    assert cfg.preempt_victim_schedule() == [1, 0]
+    cfg.preempt_victims = " 1 , 0 "  # whitespace tolerated
+    assert cfg.preempt_victim_schedule() == [1, 0]
+    cfg.preempt_victims = "1"
+    with pytest.raises(SystemExit, match="PREEMPT_COUNT"):
+        cfg.preempt_victim_schedule()
+    cfg.preempt_victims = "1,2"
+    with pytest.raises(SystemExit, match="node indices"):
+        cfg.preempt_victim_schedule()
+    cfg.preempt_victims = "1,x"
+    with pytest.raises(SystemExit, match="comma-separated"):
+        cfg.preempt_victim_schedule()

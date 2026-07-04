@@ -8,13 +8,31 @@ AWS credentials — S3 locations are just strings.
 
 from __future__ import annotations
 
+import base64
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+# Default test prompts for end-of-run/interval sampling (shakespeare_char).
+# "\n" stands in for an unconditional sample (GPT.generate needs a non-empty idx).
+DEFAULT_SAMPLE_PROMPTS = ["ROMEO:", "JULIET:", "First Citizen:"]
 
 
 def _env_float(name: str, default: float | None) -> float | None:
     v = os.environ.get(name)
     return float(v) if v not in (None, "") else default
+
+
+def _env_prompts(name: str, default: list[str]) -> list[str]:
+    """Prompt list from the environment: a JSON array, or base64 of one (the
+    orchestrator relays base64 so shell quoting can't mangle the text)."""
+    v = os.environ.get(name)
+    if v in (None, ""):
+        return list(default)
+    try:
+        return list(json.loads(v))
+    except (json.JSONDecodeError, TypeError):
+        return list(json.loads(base64.b64decode(v).decode()))
 
 
 def _env_int(name: str, default: int) -> int:
@@ -42,6 +60,14 @@ class TrainConfig:
     learning_rate: float = 6e-4
     weight_decay: float = 1e-1
     seed: int = 1337
+    # LR schedule (nanoGPT-style linear warmup -> cosine decay -> min_lr). All a
+    # pure function of the step number, so resume needs no extra state. Defaults
+    # keep today's constant-LR behavior: lr_decay_steps == 0 disables the schedule.
+    warmup_steps: int = 0
+    lr_decay_steps: int = 0
+    min_lr: float = 0.0
+    # Gradient clipping (global norm); 0 disables (today's behavior).
+    grad_clip: float = 0.0
 
     # --- time budget (the controllable duration) -----------------------------
     # Wall-clock seconds this launch may train before it stops, evaluates, and
@@ -73,6 +99,30 @@ class TrainConfig:
     data_uri: str = ""
     eval_iters: int = 200
 
+    # --- periodic evaluation (Gap E) ------------------------------------------
+    # Every N steps, run the deterministic FULL pass over val.bin and print a
+    # parseable `eval step S: val_loss X` line. 0 = off (default).
+    eval_interval_steps: int = 0
+
+    # --- text sampling ---------------------------------------------------------
+    # Prompts sampled at the end of a graceful run (and, if sample_interval_steps
+    # is set, at mid-training snapshots). Char-level via meta.pkl stoi/itos;
+    # skipped gracefully for datasets without those maps.
+    sample_prompts: list[str] = field(default_factory=lambda: list(DEFAULT_SAMPLE_PROMPTS))
+    sample_max_new_tokens: int = 200
+    sample_temperature: float = 0.8
+    sample_top_k: int = 200
+    samples_per_prompt: int = 1
+    # Where the end-of-run consolidated samples.json goes (local path or s3://).
+    samples_uri: str = "checkpoints/samples.json"
+    # Mid-training snapshots: every N steps, generate a smaller batch of samples
+    # (first sample_interval_prompts prompts × sample_interval_tokens tokens) and
+    # write samples/step-<12d>.json under samples_prefix_uri. 0 = off (default).
+    sample_interval_steps: int = 0
+    sample_interval_prompts: int = 3
+    sample_interval_tokens: int = 150
+    samples_prefix_uri: str = "checkpoints/samples/"
+
     # --- eval / provenance ---------------------------------------------------
     run_id: str = "local"
     market: str = "local"  # "on-demand" | "spot" on the box
@@ -96,6 +146,14 @@ class TrainConfig:
         safe to call locally.
         """
         return cls(
+            max_steps=_env_int("MAX_STEPS", 100_000),
+            learning_rate=_env_float("LEARNING_RATE", 6e-4),
+            weight_decay=_env_float("WEIGHT_DECAY", 1e-1),
+            dropout=_env_float("DROPOUT", 0.0),
+            warmup_steps=_env_int("WARMUP_STEPS", 0),
+            lr_decay_steps=_env_int("LR_DECAY_STEPS", 0),
+            min_lr=_env_float("MIN_LR", 0.0),
+            grad_clip=_env_float("GRAD_CLIP", 0.0),
             max_seconds=_env_float("MAX_SECONDS", None),
             checkpoint_interval_seconds=_env_float("CHECKPOINT_INTERVAL_SECONDS", 30.0),
             smoke_test_every=_env_int("SMOKE_TEST_EVERY", 1),
@@ -106,6 +164,17 @@ class TrainConfig:
             data_local_dir=_env_str("DATA_LOCAL_DIR", "third_party/nanoGPT/data/shakespeare_char"),
             data_uri=_env_str("DATA_URI", ""),
             eval_iters=_env_int("EVAL_ITERS", 200),
+            eval_interval_steps=_env_int("EVAL_INTERVAL_STEPS", 0),
+            sample_prompts=_env_prompts("SAMPLE_PROMPTS", DEFAULT_SAMPLE_PROMPTS),
+            sample_max_new_tokens=_env_int("SAMPLE_MAX_NEW_TOKENS", 200),
+            sample_temperature=_env_float("SAMPLE_TEMPERATURE", 0.8),
+            sample_top_k=_env_int("SAMPLE_TOP_K", 200),
+            samples_per_prompt=_env_int("SAMPLES_PER_PROMPT", 1),
+            samples_uri=_env_str("SAMPLES_URI", "checkpoints/samples.json"),
+            sample_interval_steps=_env_int("SAMPLE_INTERVAL_STEPS", 0),
+            sample_interval_prompts=_env_int("SAMPLE_INTERVAL_PROMPTS", 3),
+            sample_interval_tokens=_env_int("SAMPLE_INTERVAL_TOKENS", 150),
+            samples_prefix_uri=_env_str("SAMPLES_PREFIX_URI", "checkpoints/samples/"),
             batch_size=_env_int("BATCH_SIZE", 12),
             run_id=_env_str("RUN_ID", "local"),
             market=_env_str("MARKET", "local"),

@@ -132,6 +132,31 @@ def _pull_log(cfg: OrchestratorConfig, logs_key: str, profile: RunProfile, state
     return False
 
 
+def _pull_samples(cfg: OrchestratorConfig, run_id: str, profile: RunProfile) -> None:
+    """Collect the trainer's text samples once the run is done: every mid-training
+    snapshot under runs/<run_id>/samples/ plus the final samples.json (written just
+    before metrics.json, so it's guaranteed present here). Attaches them to the
+    profile (-> profile.json + W&B table) and prints the final document's texts."""
+    docs: list[dict] = []
+    for key in aws.list_keys(cfg.bucket, cfg.run_samples_prefix(run_id)):
+        if key.endswith(".json"):
+            try:
+                docs.append(json.loads(aws.get_text(cfg.bucket, key)))
+            except ValueError:
+                print(f"[samples] unreadable snapshot {key} — skipping", file=sys.stderr)
+    final_key = cfg.run_samples_key(run_id)
+    final_doc = None
+    if aws.object_exists(cfg.bucket, final_key):
+        final_doc = json.loads(aws.get_text(cfg.bucket, final_key))
+        docs.append(final_doc)
+    for doc in docs:
+        profile.from_samples(doc)
+    if final_doc:
+        print(f"\n[samples] final outputs (step {final_doc.get('step')}):")
+        for s in final_doc.get("samples", []):
+            print(f"\n--- prompt {s['prompt']!r} ---\n{s['prompt']}{s['completion']}")
+
+
 def _stream_until_metrics(
     cfg: OrchestratorConfig,
     run_id: str,
@@ -157,6 +182,7 @@ def _stream_until_metrics(
             marked_first = True
         if aws.object_exists(cfg.bucket, metrics_key):
             _pull_log(cfg, logs_key, profile, state)
+            _pull_samples(cfg, run_id, profile)
             return json.loads(aws.get_text(cfg.bucket, metrics_key))
         now = time.monotonic()
         if now > deadline:
@@ -354,16 +380,20 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
     identically) — worst case equals the old behavior.
 
     Static rendezvous pins rank 0 (and the worker store) to node 0, so node 0's
-    log always carries the losses and the victim (last node) is never the master.
-    Lost work per kill is bounded by the densified checkpoint interval."""
+    log always carries the losses. The victim per round comes from
+    PREEMPT_VICTIMS (default: always the last node). Killing node 0 is allowed:
+    its replacement republishes rdzv.json on the same generation code path —
+    orchestrator-side, the only extra work is switching the streamed log to the
+    replacement's file. Lost work per kill is bounded by the densified
+    checkpoint interval."""
     if cfg.node_count < 2:
         raise SystemExit("multinode-preempt needs NODES >= 2")
+    victims = cfg.preempt_victim_schedule()  # validate before spending anything
     ami, sg_id = _prepare(cfg)
     run_id = _run_id("multinode-preempt")
     total = cfg.train_total_seconds
     market = cfg.spot_market
     interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
-    victim = cfg.node_count - 1
     node_vcpus = cfg.instance_vcpu_count()
     ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
     metrics_key = cfg.run_metrics_key(run_id)
@@ -377,7 +407,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
     print(
         f"[multinode-preempt] run_id={run_id} nodes={cfg.node_count} total_train={total}s "
         f"preemptions={cfg.preempt_count} interval={interval}s market={market} — hard-kill "
-        f"node {victim}, survivors pause while one replacement joins "
+        f"victims={victims}, survivors pause while one replacement joins "
         f"(whole-group restart only as fallback)",
         file=sys.stderr,
     )
@@ -420,8 +450,14 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
         if mark:
             profile.mark(mark)
 
-    def _launch_replacement(budget: int) -> None:
-        """One fresh box for the victim's node index; survivors are untouched."""
+    def _launch_replacement(budget: int, victim: int) -> None:
+        """One fresh box for the victim's node index; survivors are untouched.
+        A node-0 replacement also becomes the new log stream: fresh file (the
+        attempt key seq points at), re-parsed from byte 0, and the resumed rank 0
+        re-covers a few pre-kill steps — bump the dedup segment and reset the
+        printed offset (mirrors _launch_group). Victim != 0 leaves the stream
+        alone: node 0's log is continuous."""
+        nonlocal node0_log, state
         live[victim] = _launch_node(
             cfg,
             ami,
@@ -433,6 +469,10 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             logs_key=cfg.run_logs_key(run_id, node=victim, attempt=seq),
         )
         aws.wait_running(live[victim])
+        if victim == 0:
+            profile.segment += 1
+            node0_log = cfg.run_logs_key(run_id, node=0, attempt=seq)
+            state = {"printed": 0}
         profile.mark("relaunch")
 
     def _write_budget(remaining: int) -> None:
@@ -449,14 +489,15 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
 
         if aws.is_dry_run():
             # Walk the real control flow, minus the waiting: per planned kill,
-            # terminate the victim, free its quota slot, launch one replacement.
-            for _ in range(cfg.preempt_count):
+            # terminate that round's victim, free its quota slot, launch one
+            # replacement.
+            for victim in victims:
                 aws.terminate(live[victim])
                 _write_budget(max(1, math.ceil(total)))
                 aws.wait_quota_released(live[victim])
                 seq += 1
                 aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
-                _launch_replacement(max(1, math.ceil(total)))
+                _launch_replacement(max(1, math.ceil(total)), victim)
             print("[multinode-preempt] dry-run: skipping stream/kill timing", file=sys.stderr)
             return None
 
@@ -466,6 +507,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
         t0 = time.monotonic()
 
         while kills < cfg.preempt_count:
+            victim = victims[kills]
             # Train one hidden interval, then deliver the "Spot reclaim".
             while time.monotonic() - t0 < interval:
                 _pull_log(cfg, node0_log, profile, state)
@@ -479,8 +521,8 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             kills += 1
             print(
                 f"[multinode-preempt] kill {kills}/{cfg.preempt_count}: hard-terminating "
-                f"node {victim} after ~{trained:.0f}s training (no warning); survivors "
-                f"pause in place",
+                f"node {victim}{' (the master)' if victim == 0 else ''} after ~{trained:.0f}s "
+                f"training (no warning); survivors pause in place",
                 file=sys.stderr,
             )
             pre_kill_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
@@ -496,7 +538,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             aws.wait_quota_released(live[victim])
             seq += 1
             aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
-            _launch_replacement(remaining_budget)
+            _launch_replacement(remaining_budget, victim)
             # Recovery watchdog: a NEW checkpoint (or metrics.json) proves the
             # group re-formed at the next generation and resumed from S3.
             try:
