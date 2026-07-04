@@ -21,6 +21,21 @@ def _env_int(name: str, default: int) -> int:
     return int(v) if v not in (None, "") else default
 
 
+# vCPUs per instance type, for the quota-headroom gate. Only the types this
+# project plausibly launches; anything else needs INSTANCE_VCPUS set explicitly.
+_INSTANCE_VCPUS = {
+    "g4dn.xlarge": 4,
+    "g4dn.2xlarge": 8,
+    "g4dn.4xlarge": 16,
+    "g4dn.12xlarge": 48,
+    "g5.xlarge": 4,
+    "g5.2xlarge": 8,
+    "g5.12xlarge": 48,
+    "g6.xlarge": 4,
+    "g6.12xlarge": 48,
+}
+
+
 @dataclass
 class OrchestratorConfig:
     # --- AWS placement -------------------------------------------------------
@@ -115,6 +130,20 @@ class OrchestratorConfig:
     # Collective timeout exported to multi-node boxes so survivors' collectives
     # abort fast when a peer node dies (torch's default is 10 minutes).
     nccl_timeout_seconds: int = field(default_factory=lambda: _env_int("NCCL_TIMEOUT", 60))
+    # After a kill + replacement launch, how long the orchestrator waits for the
+    # group to produce a NEW checkpoint (proof the rejoin worked) before falling
+    # back to a whole-group restart.
+    recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 600))
+
+    # --- vCPU quota gate ------------------------------------------------------
+    # The account's "Running On-Demand G and VT instances" vCPU quota. Launches
+    # wait until running+pending G/VT usage leaves headroom under this before
+    # calling RunInstances (no Service Quotas API — update this if AWS raises
+    # your quota).
+    vcpu_quota: int = field(default_factory=lambda: _env_int("VCPU_QUOTA", 8))
+    # vCPUs of `instance_type`. 0 (default) = look up the builtin table; set
+    # explicitly for instance types the table doesn't know.
+    instance_vcpus: int = field(default_factory=lambda: _env_int("INSTANCE_VCPUS", 0))
 
     # --- polling -------------------------------------------------------------
     metrics_poll_seconds: int = 15
@@ -144,20 +173,37 @@ class OrchestratorConfig:
     # The box's boot/training log, synced here every few seconds so the orchestrator
     # can stream it back without SSH. Preemption uses a per-segment key (seg-N.log)
     # so a fresh instance doesn't overwrite the previous segment's log; multi-node
-    # adds a per-node suffix so the boxes don't clobber each other.
-    def run_logs_key(self, run_id: str, segment: int | None = None, node: int | None = None) -> str:
+    # adds a per-node suffix so the boxes don't clobber each other, and replacement
+    # launches an attempt suffix (-rK) so they don't clobber the dead node's log.
+    def run_logs_key(
+        self,
+        run_id: str,
+        segment: int | None = None,
+        node: int | None = None,
+        attempt: int = 0,
+    ) -> str:
         name = "boot" if segment is None else f"seg-{segment}"
         if node is not None:
             name += f"-node{node}"
+        if attempt:
+            name += f"-r{attempt}"
         return f"{self.run_prefix}/{run_id}/logs/{name}.log"
 
     def run_logs_uri(self, run_id: str, segment: int | None = None) -> str:
         return f"s3://{self.bucket}/{self.run_logs_key(run_id, segment)}"
 
-    # Multi-node rendezvous bootstrap: node 0 writes its private IP here at boot;
-    # the other nodes poll it, then all run torchrun against node 0's TCPStore.
+    # Multi-node rendezvous bootstrap: node 0 publishes {addr, port, generation}
+    # here once per group generation; the other nodes poll it, then all run
+    # torchrun against node 0's TCPStore for that generation.
     def run_rdzv_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/rdzv.json"
+
+    # Per-generation ready markers (ready/gen<G>-node<I>): non-master nodes write
+    # one before waiting for the generation to be published; node 0 publishes only
+    # once all N-1 markers for the generation exist, so its store comes up exactly
+    # when the workers start dialing.
+    def run_ready_prefix(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/ready/"
 
     # The tool-agnostic run profile (timeline + loss + merged metrics) the
     # orchestrator writes at end of run. W&B is just a mirror of this.
@@ -173,6 +219,18 @@ class OrchestratorConfig:
         if os.environ.get("WANDB_DISABLED", "") in ("1", "true", "True"):
             return False
         return bool(os.environ.get("WANDB_API_KEY"))
+
+    def instance_vcpu_count(self) -> int:
+        """vCPUs one `instance_type` box consumes against the G/VT quota."""
+        if self.instance_vcpus > 0:
+            return self.instance_vcpus
+        try:
+            return _INSTANCE_VCPUS[self.instance_type]
+        except KeyError:
+            raise SystemExit(
+                f"Unknown vCPU count for instance type {self.instance_type!r} — "
+                "set INSTANCE_VCPUS=<n> in your .env so the quota gate can count it."
+            ) from None
 
     def require_bucket(self) -> None:
         if not self.bucket:

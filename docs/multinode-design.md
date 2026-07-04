@@ -66,10 +66,11 @@ g4dn.xlarge has no EFA; NCCL runs over TCP sockets (up to 25 Gbps). Fine at
 NanoGPT scale — and the eventual bandwidth ceiling is a 1c/1d measurement, not
 a blocker.
 
-### 3. Failure model: one node dies → whole-group restart → same resume path
+### 3. Failure model: one node dies → survivors PAUSE → replace only the victim
 
-The standard production model (OPT/BLOOM-style): a lost node kills the job;
-recovery is a fresh gang restarting from the last checkpoint.
+A lost node still kills the *job* (synchronous DDP can't step without a full
+group), but not the *boxes*: healthy instances are never rebooted. Recovery
+replaces exactly the dead node; the group re-forms and resumes from S3.
 
 1. Orchestrator HARD-terminates one **non-master** node — no SIGTERM. (A
    graceful SIGTERM triggers the trainer's coordinated stop, which cleanly
@@ -78,19 +79,53 @@ recovery is a fresh gang restarting from the last checkpoint.
 2. Survivors' collectives abort quickly — `init_process_group(timeout=60s)`
    via `NCCL_TIMEOUT` (torch default is 10 min, uselessly slow) and NCCL async
    error handling crash the worker rather than hang it.
-3. `--max-restarts=0`: the agents exit on the worker crash. The orchestrator
-   tears down the remaining boxes, waits for the vCPU quota to release, and
-   launches a **fresh full segment** — every node reruns `train()`, which is
-   the existing one-resume-path: load latest S3 checkpoint, continue. Loss
+3. `--max-restarts=0`: the agents exit on the worker crash — but the boot
+   script's **generation loop** keeps the box alive, pausing in a cheap S3
+   poll. The orchestrator waits for the victim's vCPU quota slot, launches
+   **one replacement** with the same `NODE_INDEX`, and the group re-forms at
+   the next rendezvous generation (below). Every restarted `train()` is the
+   existing one-resume-path: load latest S3 checkpoint, continue. Loss
    continues; the trainer needed zero changes.
 4. Lost work per kill ≤ the densified checkpoint interval (5s default here).
+5. **Watchdog fallback:** if no new checkpoint appears within
+   `RECOVERY_TIMEOUT` (600s) of the replacement launch, the orchestrator
+   reverts to the previously-proven whole-group restart (terminate all, wait
+   quota, relaunch fresh) — worst case equals the old behavior.
 
-In-place elastic rejoin (survivors idle-wait, replacement slots in) is
-deferred to 1c: it needs the rendezvous/worker store off-node (the t3.micro)
-so no victim can take the coordination state down with it.
+**Generation protocol** (the livelock killer — no node ever restarts the group
+on its own, and nobody busy-retries against a box that is still booting):
 
-Quota note: `wait_quota_released` (instance left `running`) gates each
-segment's launches — at an 8-vCPU quota, two segments' boxes can't coexist.
+- `rdzv.json` carries `{addr, port, generation, node_count}`; the master port
+  is `RDZV_PORT + generation`, so TIME_WAIT from node 0's previous torchrun
+  can't collide when it rebinds on the same box.
+- Per generation G (= currently published generation + 1 — survivors and
+  fresh replacements compute this independently and agree): each non-master
+  node writes a ready marker `ready/gen<G>-node<I>` to S3, then polls
+  `rdzv.json` and dials only what node 0 actually publishes. Node 0 publishes
+  gen G **only after all N−1 ready markers for G exist**, then immediately
+  starts torchrun — its TCPStore comes up seconds before the workers dial,
+  well inside the store's client connect window.
+- If the *master* dies (real preemption; the experiment always kills the last
+  node), its replacement reads the stale `rdzv.json`, waits for the
+  survivors' gen+1 ready markers, and publishes its own new IP — same code
+  path, no special case.
+- `metrics.json` appearing in S3 is the group-wide done signal; each box's
+  budget shrinks only by seconds actually spent inside torchrun, so paused
+  time is free (`all_reduce_stop` MAX keeps mismatched budgets coordinated —
+  the first expiring rank stops the group).
+- Every wait is bounded (~20 min); on exhaustion a box exits nonzero and is
+  left up for debugging, and the orchestrator's watchdog handles recovery.
+
+The off-node rendezvous store (t3.micro) is still the Phase 1c upgrade — it
+would let survivors' *processes* idle inside torchrun instead of exiting —
+but pause-and-replace already removes the wasted reboots of healthy boxes.
+
+Quota note: every launch is gated by `wait_vcpu_headroom` — the orchestrator
+polls `DescribeInstances` (every 15s, one call per poll) until running+pending
+G/VT vCPU usage leaves room under `VCPU_QUOTA` (default 8), instead of firing
+`RunInstances` into a quota wall. After a kill, only the victim's slot is
+waited on (`wait_quota_released`); survivors keep theirs. The separate *spot
+instance count* quota is not covered by this gate.
 
 ### 4. Static group for the MVP (`--nnodes=N`, not `min:max`)
 
@@ -114,10 +149,10 @@ elastic-shrink is a 1c experiment.
 
 | Piece | Change |
 |---|---|
-| `config.py` | `node_count` (`NODES`, default 1), `rdzv_port` (`RDZV_PORT`, 29400), `nccl_timeout_seconds` (`NCCL_TIMEOUT`, 60) |
-| `aws.py` | self-referencing SG ingress rule in `ensure_security_group` |
-| `bootstrap.py` | multi-node branch: export `NODE_INDEX`/`NODE_COUNT`; node 0 publishes `rdzv.json`, others poll; torchrun rendezvous flags replace `--standalone` when `NODE_COUNT > 1` |
-| `experiments.py` | `run_multinode` (launch N, stream node 0, wait metrics, reap all) and `run_multinode_preempt` (train `PREEMPT_AFTER`, kill non-master node, terminate→relaunch replacement, verify group recovers and loss continues) |
+| `config.py` | `node_count` (`NODES`, default 1), `rdzv_port` (`RDZV_PORT`, 29400), `nccl_timeout_seconds` (`NCCL_TIMEOUT`, 60), `recovery_timeout_seconds` (`RECOVERY_TIMEOUT`, 600), `vcpu_quota` (`VCPU_QUOTA`, 8), `instance_vcpus` (`INSTANCE_VCPUS`, builtin table) |
+| `aws.py` | self-referencing SG ingress rule in `ensure_security_group`; `vcpus_in_use` + `wait_vcpu_headroom` (quota gate) |
+| `bootstrap.py` | multi-node branch: generation loop (`_multinode_loop`) — ready markers + `rdzv.json` publish/poll + torchrun + pause-and-rejoin; replaces `--standalone` when `NODE_COUNT > 1` |
+| `experiments.py` | `run_multinode` (launch N, stream node 0, wait metrics, reap all) and `run_multinode_preempt` (train `PREEMPT_AFTER`, kill non-master node, replace ONLY the victim while survivors pause; whole-group restart as watchdog fallback) |
 | `__main__.py` | `multinode` / `multinode-preempt` commands |
 | `distributed.py` | pass `timeout=timedelta(seconds=$NCCL_TIMEOUT)` to `init_process_group` (trainer reads it from env via `TrainConfig`) |
 
@@ -137,10 +172,13 @@ NODES=2 MARKET=on-demand TRAIN_TOTAL_SECONDS=120 PREEMPT_AFTER=20 EVAL_ITERS=20 
 
 - A: node 0 log shows `[ddp] world_size=2` **and the loss lines** (rank 0 is
   pinned to node 0 by static rendezvous); `metrics.json` lands.
-- B: segment 1 trains, the kill lands, the group is torn down; segment 2's
-  node 0 log shows `[resume] restored from step N` and `world_size=2`; loss
+- B: the group trains, the kill lands, and **node 0 is never terminated** —
+  its (continuous) log shows the torchrun crash, the `[rdzv]` pause, the gen-2
+  publish, then `[resume] restored from step N` with `world_size=2`; loss
   continues from the checkpoint (not reset); `metrics.json` reports
-  `resumed=true`.
+  `resumed=true`. Only 3 boxes are ever launched (2 + 1 replacement), and no
+  launch errors on the instance quota (a `[aws] wait for vCPU headroom` line
+  appears instead).
 
 **Cost:** 2 × $0.526/hr on-demand; a ~12-min end-to-end run ≈ **$0.21**
 (milestone B adds a third short-lived box: ≈ **$0.30**).

@@ -42,6 +42,29 @@ def _poll_metrics(cfg: OrchestratorConfig, run_id: str) -> dict:
     raise TimeoutError(f"metrics.json for {run_id} did not appear within timeout")
 
 
+def _launch_gated(cfg: OrchestratorConfig, do_launch):
+    """Launch behind the vCPU-quota gate: wait until one box's vCPUs fit under
+    VCPU_QUOTA, then RunInstances. If AWS still rejects on quota (external
+    launches can grab the slack between check and call), re-wait and retry a
+    bounded number of times instead of spamming the API."""
+    needed = cfg.instance_vcpu_count()
+    last: Exception | None = None
+    for attempt in range(1, 4):
+        aws.wait_vcpu_headroom(needed, cfg.vcpu_quota)
+        try:
+            return do_launch()
+        except Exception as e:  # noqa: BLE001 — boto ClientError; match on the code
+            if "VcpuLimitExceeded" not in str(e) and "MaxSpotInstanceCountExceeded" not in str(e):
+                raise
+            last = e
+            print(f"[quota] RunInstances rejected on quota (attempt {attempt}/3)", file=sys.stderr)
+            time.sleep(15)
+    raise SystemExit(
+        f"RunInstances rejected on quota 3 times — VCPU_QUOTA={cfg.vcpu_quota} probably "
+        f"overstates the real account quota. Last error: {last}"
+    )
+
+
 def _launch(
     cfg: OrchestratorConfig,
     ami: str,
@@ -65,15 +88,18 @@ def _launch(
         ddp=ddp,
         nproc_per_node=nproc_per_node,
     )
-    iid = aws.launch(
-        ami_id=ami,
-        instance_type=cfg.instance_type,
-        profile_name=cfg.instance_profile,
-        security_group_id=sg_id,
-        user_data=ud,
-        market=market,
-        run_id=run_id,
-        key_name=cfg.key_name,
+    iid = _launch_gated(
+        cfg,
+        lambda: aws.launch(
+            ami_id=ami,
+            instance_type=cfg.instance_type,
+            profile_name=cfg.instance_profile,
+            security_group_id=sg_id,
+            user_data=ud,
+            market=market,
+            run_id=run_id,
+            key_name=cfg.key_name,
+        ),
     )
     aws.wait_running(iid)
     print(
@@ -219,8 +245,9 @@ def _launch_node(
     node_index: int,
     logs_key: str,
 ) -> str:
-    """Launch one member of an N-node DDP group (see bootstrap._rdzv_block for
-    how the nodes find each other). Does not wait for 'running'."""
+    """Launch one member of an N-node DDP group (see bootstrap._multinode_loop
+    for how the nodes find each other and rejoin after a peer dies). Does not
+    wait for 'running'."""
     ud = bootstrap.build_user_data(
         cfg,
         run_id=run_id,
@@ -232,20 +259,23 @@ def _launch_node(
         nodes=cfg.node_count,
         node_index=node_index,
     )
-    return aws.launch(
-        ami_id=ami,
-        instance_type=cfg.instance_type,
-        profile_name=cfg.instance_profile,
-        security_group_id=sg_id,
-        user_data=ud,
-        market=market,
-        run_id=run_id,
-        key_name=cfg.key_name,
+    return _launch_gated(
+        cfg,
+        lambda: aws.launch(
+            ami_id=ami,
+            instance_type=cfg.instance_type,
+            profile_name=cfg.instance_profile,
+            security_group_id=sg_id,
+            user_data=ud,
+            market=market,
+            run_id=run_id,
+            key_name=cfg.key_name,
+        ),
     )
 
 
 def run_multinode(cfg: OrchestratorConfig) -> dict | None:
-    """N nodes × one-rank-per-GPU DDP via torchrun c10d rendezvous, run to the
+    """N nodes × one-rank-per-GPU DDP via torchrun static rendezvous, run to the
     wall-clock budget. Node 0 hosts the rendezvous store and its rank 0 does all
     checkpointing/metrics; the orchestrator streams node 0's log."""
     ami, sg_id = _prepare(cfg)
@@ -260,6 +290,10 @@ def run_multinode(cfg: OrchestratorConfig) -> dict | None:
     profile.wandb_start(cfg)
     iids: list[str] = []
     try:
+        # One up-front gate for the whole group (the per-launch gate inside
+        # _launch_node then passes instantly) so we never fire N RunInstances
+        # into a quota wall.
+        aws.wait_vcpu_headroom(cfg.node_count * cfg.instance_vcpu_count(), cfg.vcpu_quota)
         for i in range(cfg.node_count):
             iids.append(
                 _launch_node(
@@ -295,19 +329,27 @@ def run_multinode(cfg: OrchestratorConfig) -> dict | None:
 
 
 def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
-    """Multi-node preemption with WHOLE-GROUP restart. Per non-final segment:
-    launch all N nodes, let them train a hidden interval, then HARD-terminate one
-    node (no SIGTERM — a graceful stop would coordinate a clean group shutdown,
-    which is not the failure we want; a real Spot reclaim gives none of the peers
-    any warning either). The survivors' collectives abort after NCCL_TIMEOUT and
-    their agents exit (--max-restarts=0); the orchestrator tears the group down
-    and launches a fresh full segment that resumes from the latest S3 checkpoint —
-    the same proven semantics as run_preempt, N boxes per segment instead of 1.
+    """Multi-node preemption with PAUSE-AND-REPLACE recovery. Launch the group
+    ONCE; per preemption: HARD-terminate one node (no SIGTERM — a graceful stop
+    would coordinate a clean group shutdown, which is not the failure we want; a
+    real Spot reclaim gives none of the peers any warning either). The survivors'
+    collectives abort after NCCL_TIMEOUT and their torchrun exits — but their
+    INSTANCES stay up: the boot script's generation loop (bootstrap._multinode_loop)
+    pauses them on cheap S3 polls. The orchestrator waits for the victim's vCPU
+    quota slot, launches ONE replacement with the same node index, and the group
+    re-forms at the next rendezvous generation, every rank resuming from the
+    latest S3 checkpoint. No healthy box is ever rebooted, and no node ever
+    decides to restart on its own — the orchestrator is the only launcher, so the
+    reboot-crossing livelock of independent restarts can't occur.
+
+    If the group doesn't produce a NEW checkpoint within RECOVERY_TIMEOUT of the
+    replacement launch, fall back to the previously-proven whole-group restart
+    (terminate everything, relaunch fresh; the generation protocol absorbs this
+    identically) — worst case equals the old behavior.
 
     Static rendezvous pins rank 0 (and the worker store) to node 0, so node 0's
     log always carries the losses and the victim (last node) is never the master.
-    In-place elastic rejoin is deferred to Phase 1c (needs the rendezvous store
-    off-node). Lost work per kill is bounded by the densified checkpoint interval."""
+    Lost work per kill is bounded by the densified checkpoint interval."""
     if cfg.node_count < 2:
         raise SystemExit("multinode-preempt needs NODES >= 2")
     ami, sg_id = _prepare(cfg)
@@ -316,6 +358,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
     market = cfg.spot_market
     interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
     victim = cfg.node_count - 1
+    node_vcpus = cfg.instance_vcpu_count()
     ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
     metrics_key = cfg.run_metrics_key(run_id)
     # Dense checkpoints: a hard kill gives no warning, so lost work is bounded by
@@ -327,97 +370,151 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
     print(
         f"[multinode-preempt] run_id={run_id} nodes={cfg.node_count} total_train={total}s "
         f"preemptions={cfg.preempt_count} interval={interval}s market={market} — hard-kill "
-        f"node {victim}, then relaunch the whole group (resumes from S3)",
+        f"node {victim}, survivors pause while one replacement joins "
+        f"(whole-group restart only as fallback)",
         file=sys.stderr,
     )
     profile = RunProfile(run_id, kind="multinode-preempt", market=market)
     profile.wandb_start(cfg)
 
-    accumulated = 0.0
-    seg = 1
     metrics: dict | None = None
     live: dict[int, str] = {}
+    seq = 0  # counts launch events; suffixes log keys so relaunches never clobber
+    node0_log = cfg.run_logs_key(run_id, node=0)
+    state = {"printed": 0}
+
+    def _launch_group(budget: int, mark: str | None) -> None:
+        """Launch all N nodes (one up-front headroom gate for the whole group;
+        the per-launch gate inside _launch_node then passes instantly)."""
+        nonlocal node0_log, state
+        aws.wait_vcpu_headroom(cfg.node_count * node_vcpus, cfg.vcpu_quota)
+        for i in range(cfg.node_count):
+            live[i] = _launch_node(
+                cfg,
+                ami,
+                sg_id,
+                run_id,
+                market,
+                budget,
+                node_index=i,
+                logs_key=cfg.run_logs_key(run_id, node=i, attempt=seq),
+            )
+        for iid in live.values():
+            aws.wait_running(iid)
+        # A fresh node 0 means a fresh log file — restart the stream from byte 0.
+        node0_log = cfg.run_logs_key(run_id, node=0, attempt=seq)
+        state = {"printed": 0}
+        if mark:
+            profile.mark(mark)
+
+    def _launch_replacement(budget: int) -> None:
+        """One fresh box for the victim's node index; survivors are untouched."""
+        live[victim] = _launch_node(
+            cfg,
+            ami,
+            sg_id,
+            run_id,
+            market,
+            budget,
+            node_index=victim,
+            logs_key=cfg.run_logs_key(run_id, node=victim, attempt=seq),
+        )
+        aws.wait_running(live[victim])
+        profile.mark("relaunch")
+
+    kills = 0
+    accumulated = 0.0
     try:
-        while True:
-            remaining = total - accumulated
-            budget = max(1, math.ceil(remaining))
-            final = seg > cfg.preempt_count or remaining <= interval
-            node0_log = cfg.run_logs_key(run_id, segment=seg, node=0)
-            profile.segment = seg
+        _launch_group(max(1, math.ceil(total)), mark="launch")
+
+        if aws.is_dry_run():
+            # Walk the real control flow, minus the waiting: per planned kill,
+            # terminate the victim, free its quota slot, launch one replacement.
+            for _ in range(cfg.preempt_count):
+                aws.terminate(live[victim])
+                aws.wait_quota_released(live[victim])
+                seq += 1
+                aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
+                _launch_replacement(max(1, math.ceil(total)))
+            print("[multinode-preempt] dry-run: skipping stream/kill timing", file=sys.stderr)
+            return None
+
+        base_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
+        _wait_train_start(cfg, ckpt_prefix, base_step, node0_log, profile, state, metrics_key)
+        profile.mark("train_start")
+        t0 = time.monotonic()
+
+        while kills < cfg.preempt_count:
+            # Train one hidden interval, then deliver the "Spot reclaim".
+            while time.monotonic() - t0 < interval:
+                _pull_log(cfg, node0_log, profile, state)
+                if aws.object_exists(cfg.bucket, metrics_key):
+                    break  # the budget beat us to it — nothing left to kill
+                time.sleep(cfg.log_stream_seconds)
+            if aws.object_exists(cfg.bucket, metrics_key):
+                break
+            trained = time.monotonic() - t0
+            accumulated += trained
+            kills += 1
             print(
-                f"[multinode-preempt] segment {seg}: launch {cfg.node_count} nodes "
-                f"({'final' if final else 'will preempt'}), MAX_SECONDS={budget}, "
-                f"~{accumulated:.0f}/{total}s trained so far",
+                f"[multinode-preempt] kill {kills}/{cfg.preempt_count}: hard-terminating "
+                f"node {victim} after ~{trained:.0f}s training (no warning); survivors "
+                f"pause in place",
                 file=sys.stderr,
             )
-            for i in range(cfg.node_count):
-                live[i] = _launch_node(
+            pre_kill_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
+            aws.terminate(live[victim])
+            profile.mark("kill")
+            profile.segment = kills + 1
+            # Only the victim's quota slot frees — the survivors keep theirs
+            # (that's the point) — so the replacement needs exactly one node's
+            # worth of headroom.
+            aws.wait_quota_released(live[victim])
+            seq += 1
+            aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
+            remaining_budget = max(1, math.ceil(total - accumulated))
+            _launch_replacement(remaining_budget)
+            # Recovery watchdog: a NEW checkpoint (or metrics.json) proves the
+            # group re-formed at the next generation and resumed from S3.
+            try:
+                _wait_train_start(
                     cfg,
-                    ami,
-                    sg_id,
-                    run_id,
-                    market,
-                    budget,
-                    node_index=i,
-                    logs_key=cfg.run_logs_key(run_id, segment=seg, node=i),
+                    ckpt_prefix,
+                    pre_kill_step,
+                    node0_log,
+                    profile,
+                    state,
+                    metrics_key,
+                    timeout=cfg.recovery_timeout_seconds,
                 )
-            for iid in live.values():
-                aws.wait_running(iid)
-            profile.mark("launch" if seg == 1 else "relaunch")
-
-            if aws.is_dry_run():
-                print("[multinode-preempt] dry-run: not waiting/killing", file=sys.stderr)
+                print("[multinode-preempt] group re-formed; training resumed", file=sys.stderr)
+            except TimeoutError:
+                print(
+                    f"[multinode-preempt] no recovery within {cfg.recovery_timeout_seconds}s "
+                    "— falling back to whole-group restart",
+                    file=sys.stderr,
+                )
                 for iid in live.values():
                     aws.terminate(iid)
+                for iid in live.values():
+                    aws.wait_quota_released(iid)
                 live.clear()
-                if final:
-                    return None
-                accumulated += interval
-                seg += 1
-                continue
-
-            base_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
-            state = {"printed": 0}
-            _wait_train_start(cfg, ckpt_prefix, base_step, node0_log, profile, state, metrics_key)
+                seq += 1
+                fallback_base = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
+                _launch_group(max(1, math.ceil(total - accumulated)), mark=None)
+                _wait_train_start(
+                    cfg, ckpt_prefix, fallback_base, node0_log, profile, state, metrics_key
+                )
             profile.mark("train_start")
             t0 = time.monotonic()
 
-            if final:
-                metrics = _stream_until_metrics(
-                    cfg, run_id, profile, logs_key=node0_log, state=state
-                )
-                profile.mark("metrics" if metrics is not None else "timeout")
-                profile.from_metrics(metrics)
-                for iid in live.values():
-                    aws.terminate(iid)
-                live.clear()
-                break
-
-            # Non-final: train one hidden interval, then the "Spot reclaim".
-            while time.monotonic() - t0 < interval:
-                _pull_log(cfg, node0_log, profile, state)
-                time.sleep(cfg.log_stream_seconds)
-            trained = time.monotonic() - t0
-            print(
-                f"[multinode-preempt] segment {seg}: hard-terminating node {victim} after "
-                f"~{trained:.0f}s training (no warning); survivors abort on NCCL timeout",
-                file=sys.stderr,
-            )
-            aws.terminate(live[victim])
-            profile.mark("kill")
-            # Tear down the rest of the group — with --max-restarts=0 the survivors
-            # are exiting anyway; the next segment is a fresh full group.
-            for i, iid in live.items():
-                if i != victim:
-                    aws.terminate(iid)
-            # Free the vCPU quota before relaunching — at an 8-vCPU G quota the
-            # next segment's boxes can't coexist with this one's. Quota releases
-            # when instances leave 'running' (seconds), not at 'terminated'.
-            for iid in live.values():
-                aws.wait_quota_released(iid)
-            live.clear()
-            accumulated += trained
-            seg += 1
+        # Final stretch: run out the remaining budget, collect metrics.
+        metrics = _stream_until_metrics(cfg, run_id, profile, logs_key=node0_log, state=state)
+        profile.mark("metrics" if metrics is not None else "timeout")
+        profile.from_metrics(metrics)
+        for iid in live.values():
+            aws.terminate(iid)
+        live.clear()
 
         profile.finalize(cfg)
         print(f"[multinode-preempt] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
@@ -437,11 +534,13 @@ def _wait_train_start(
     profile: RunProfile,
     state: dict,
     metrics_key: str,
+    timeout: int | None = None,
 ) -> None:
     """Block (while streaming the log) until a NEW checkpoint appears past
     ``base_step`` — training is underway on this instance — or metrics.json shows up
-    (a very short final segment)."""
-    deadline = time.monotonic() + cfg.metrics_timeout_seconds
+    (a very short final segment). ``timeout`` overrides the metrics timeout (the
+    multinode recovery watchdog waits ``recovery_timeout_seconds`` instead)."""
+    deadline = time.monotonic() + (timeout or cfg.metrics_timeout_seconds)
     while True:
         _pull_log(cfg, logs_key, profile, state)
         if aws.max_checkpoint_step(cfg.bucket, ckpt_prefix) > base_step:

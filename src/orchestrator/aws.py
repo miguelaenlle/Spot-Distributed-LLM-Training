@@ -425,6 +425,58 @@ def wait_quota_released(instance_id: str) -> None:
     raise TimeoutError(f"{instance_id} still running 300s after TerminateInstances")
 
 
+def vcpus_in_use() -> int:
+    """vCPUs currently counting against the "Running On-Demand G and VT
+    instances" quota: every pending/running G- or VT-family instance in the
+    region, whoever launched it (external instances eat the same quota, so
+    counting only our own would overshoot)."""
+    if _DRY_RUN:
+        return 0
+    total = 0
+    paginator = _client("ec2").get_paginator("describe_instances")
+    pages = paginator.paginate(
+        Filters=[{"Name": "instance-state-name", "Values": ["pending", "running"]}]
+    )
+    for page in pages:
+        for res in page.get("Reservations", []):
+            for inst in res.get("Instances", []):
+                family = inst.get("InstanceType", "").split(".")[0]
+                if family.startswith("g") or family.startswith("vt"):
+                    cpu = inst.get("CpuOptions", {})
+                    total += cpu.get("CoreCount", 0) * cpu.get("ThreadsPerCore", 1)
+    return total
+
+
+def wait_vcpu_headroom(needed: int, quota: int, timeout: int = 900) -> None:
+    """Block until `needed` vCPUs fit under `quota` alongside current usage, so
+    RunInstances isn't fired into a quota wall. Polls DescribeInstances every
+    15s (one API call per poll — no spam); logs once when it has to wait."""
+    if needed > quota:
+        raise SystemExit(
+            f"Launch needs {needed} vCPUs but VCPU_QUOTA={quota} — it can never fit. "
+            "Raise the quota (Service Quotas console) and update VCPU_QUOTA."
+        )
+    _log(f"wait for vCPU headroom: need {needed} of {quota} quota")
+    if _DRY_RUN:
+        return
+    waiting_logged = False
+    deadline = time.monotonic() + timeout
+    while True:
+        used = vcpus_in_use()
+        if used + needed <= quota:
+            if waiting_logged:
+                _log(f"vCPU headroom available ({used} used + {needed} needed <= {quota})")
+            return
+        if not waiting_logged:
+            _log(f"quota full ({used} used + {needed} needed > {quota}); polling every 15s")
+            waiting_logged = True
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"no vCPU headroom after {timeout}s ({used} used + {needed} needed > {quota})"
+            )
+        time.sleep(15)
+
+
 def _ignore_exists(fn) -> None:
     """Run an idempotent IAM create, swallowing 'already exists' errors."""
     try:

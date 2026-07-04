@@ -124,43 +124,169 @@ echo "[provision] user-data exited rc=$? — box left UP for SSH (no training, n
 """
 
 
-def _rdzv_block(cfg: OrchestratorConfig, *, run_id: str, nodes: int, node_index: int) -> str:
-    """Bash for the multi-node rendezvous bootstrap. Node 0 publishes its private
-    IP to S3; the others poll it (bounded — a node that never sees the key exits
-    nonzero and is left up for debugging, like any failed boot). Sets RDZV_ADDR."""
+def _multinode_loop(
+    cfg: OrchestratorConfig, *, run_id: str, nodes: int, node_index: int, nproc: str
+) -> str:
+    """Bash for the multi-node GENERATION loop: rendezvous, torchrun, and rejoin
+    after a peer dies. The surviving instance never reboots — only its process
+    restarts; between generations it pauses in a cheap S3 poll (GPU idle).
+
+    Each *generation* is one attempt of the full group, coordinated through S3:
+    non-master nodes write a per-generation ready marker and dial only what node 0
+    has actually published; node 0 publishes rdzv.json (fresh port = base+gen, so
+    TIME_WAIT on its own relaunch can't bite) only once every worker's marker for
+    that generation exists — so its TCPStore comes up seconds before the workers
+    dial, and nobody busy-retries against a box that is still booting (the
+    timeout-retry livelock this design exists to prevent). A crash sends every
+    node back to the top of the loop, where all of them — survivors reading their
+    own last generation, replacements reading the dead group's stale rdzv.json —
+    independently converge on generation+1. metrics.json appearing in S3 is the
+    group-wide done signal; the budget shrinks only by seconds actually spent
+    inside torchrun, so paused time is free. Every wait is bounded (~20 min): on
+    exhaustion the loop exits nonzero and the box is left up for debugging, and
+    the orchestrator's recovery watchdog falls back to a whole-group restart."""
     bucket = cfg.bucket
     rdzv_key = cfg.run_rdzv_key(run_id)
+    metrics_key = cfg.run_metrics_key(run_id)
+    ready_prefix = cfg.run_ready_prefix(run_id)
+    polls = 400  # x3s = ~20 min bound on any single wait
     if node_index == 0:
-        return f"""
-# --- multi-node rendezvous: node 0 hosts the store, publish our IP ----------
-RDZV_ADDR=$(hostname -I | awk '{{print $1}}')
-"$VENV_PY" - <<PY
-import boto3, json
+        rendezvous = f"""  # Master: wait for every worker's gen-ready marker (exit 2 = the run
+  # finished while we waited; 1 = bound exhausted), then publish and host.
+  "$VENV_PY" - <<PY
+import sys, time
+import boto3
+s3 = boto3.client("s3")
+for _ in range({polls}):
+    try:
+        s3.head_object(Bucket="{bucket}", Key="{metrics_key}")
+        sys.exit(2)
+    except Exception:
+        pass
+    got = 0
+    for i in range(1, {nodes}):
+        try:
+            s3.head_object(Bucket="{bucket}", Key="{ready_prefix}gen$GEN-node%d" % i)
+            got += 1
+        except Exception:
+            pass
+    if got >= {nodes} - 1:
+        sys.exit(0)
+    time.sleep(3)
+sys.exit(1)
+PY
+  WRC=$?
+  if [ "$WRC" -eq 2 ]; then continue; fi
+  if [ "$WRC" -ne 0 ]; then
+    echo "[rdzv] node 0: gave up waiting for gen $GEN ready markers"
+    break
+  fi
+  RDZV_ADDR=$(hostname -I | awk '{{print $1}}')
+  "$VENV_PY" - <<PY
+import json
+import boto3
 boto3.client("s3").put_object(
     Bucket="{bucket}", Key="{rdzv_key}",
-    Body=json.dumps({{"addr": "$RDZV_ADDR", "node_count": {nodes}}}).encode(),
+    Body=json.dumps(
+        {{"addr": "$RDZV_ADDR", "port": $PORT, "generation": $GEN, "node_count": {nodes}}}
+    ).encode(),
 )
 PY
-echo "[rdzv] node 0/{nodes}: published $RDZV_ADDR:{cfg.rdzv_port}"
+  echo "[rdzv] node 0/{nodes}: published gen $GEN at $RDZV_ADDR:$PORT"
 """
-    return f"""
-# --- multi-node rendezvous: poll S3 for node 0's address --------------------
-"$VENV_PY" - <<'PY' > /tmp/rdzv_addr
+    else:
+        rendezvous = f"""  # Worker: announce readiness for this generation, then dial whatever
+  # node 0 actually publishes (its addr/port/gen — never assumptions).
+  "$VENV_PY" - <<PY
+import boto3
+boto3.client("s3").put_object(
+    Bucket="{bucket}", Key="{ready_prefix}gen$GEN-node{node_index}", Body=b"1"
+)
+PY
+  echo "[rdzv] node {node_index}/{nodes}: ready for gen $GEN, waiting for publication"
+  "$VENV_PY" - <<PY > /tmp/rdzv_join
 import json, sys, time
 import boto3
 s3 = boto3.client("s3")
-for _ in range(300):  # ~15 min; node 0 publishes within seconds of booting
+for _ in range({polls}):
     try:
-        body = s3.get_object(Bucket="{bucket}", Key="{rdzv_key}")["Body"].read()
-        print(json.loads(body)["addr"])
-        sys.exit(0)
+        s3.head_object(Bucket="{bucket}", Key="{metrics_key}")
+        sys.exit(2)
     except Exception:
-        time.sleep(3)
+        pass
+    try:
+        doc = json.loads(s3.get_object(Bucket="{bucket}", Key="{rdzv_key}")["Body"].read())
+        if int(doc.get("generation", 0)) >= $GEN:
+            print(doc["addr"], doc["port"], doc["generation"])
+            sys.exit(0)
+    except Exception:
+        pass
+    time.sleep(3)
 sys.exit(1)
 PY
-RDZV_ADDR=$(cat /tmp/rdzv_addr)
-[ -n "$RDZV_ADDR" ] || {{ echo "[rdzv] node {node_index}: never saw {rdzv_key}"; exit 1; }}
-echo "[rdzv] node {node_index}/{nodes}: joining $RDZV_ADDR:{cfg.rdzv_port}"
+  WRC=$?
+  if [ "$WRC" -eq 2 ]; then continue; fi
+  if [ "$WRC" -ne 0 ]; then echo "[rdzv] node {node_index}: never saw gen $GEN published"; break; fi
+  read RDZV_ADDR PORT GEN < /tmp/rdzv_join
+  echo "[rdzv] node {node_index}/{nodes}: joining gen $GEN at $RDZV_ADDR:$PORT"
+"""
+    return f"""
+# --- multi-node: generation rendezvous + rejoin loop -------------------------
+# A dead peer crashes torchrun on every survivor (NCCL_TIMEOUT); this loop then
+# PAUSES the box until the orchestrator's replacement node is ready and rejoins
+# at the next generation. metrics.json is the done signal; MN_RC=0 only then or
+# on a clean local exit.
+ORIG_BUDGET=$MAX_SECONDS
+CONSUMED=0
+MN_RC=1
+while :; do
+  "$VENV_PY" - <<'PY'
+import sys
+import boto3
+try:
+    boto3.client("s3").head_object(Bucket="{bucket}", Key="{metrics_key}")
+except Exception:
+    sys.exit(1)
+PY
+  if [ $? -eq 0 ]; then
+    echo "[rdzv] metrics.json present — run complete"
+    MN_RC=0
+    break
+  fi
+  REMAINING=$((ORIG_BUDGET - CONSUMED))
+  if [ "$REMAINING" -le 0 ]; then
+    echo "[rdzv] training budget exhausted without metrics.json"
+    break
+  fi
+  # Next generation = one past whatever is currently published (0 if nothing) —
+  # survivors and fresh replacements independently agree on this number.
+  G_PUB=$("$VENV_PY" - <<'PY'
+import json
+import boto3
+try:
+    body = boto3.client("s3").get_object(Bucket="{bucket}", Key="{rdzv_key}")["Body"].read()
+    print(int(json.loads(body).get("generation", 0)))
+except Exception:
+    print(0)
+PY
+)
+  GEN=$((G_PUB + 1))
+  PORT=$(({cfg.rdzv_port} + GEN))
+{rendezvous}  export MAX_SECONDS=$REMAINING
+  T0=$(date +%s)
+  OMP_NUM_THREADS=1 "$VENV_PY" -m torch.distributed.run \\
+    --nnodes={nodes} --nproc_per_node={nproc} --node_rank={node_index} \\
+    --master_addr="$RDZV_ADDR" --master_port="$PORT" \\
+    --max-restarts=0 -m spot_train.train
+  TRC=$?
+  CONSUMED=$((CONSUMED + $(date +%s) - T0))
+  if [ "$TRC" -eq 0 ]; then
+    MN_RC=0
+    break
+  fi
+  echo "[rdzv] torchrun exited $TRC at gen $GEN ($CONSUMED/$ORIG_BUDGET budget-s) — regrouping"
+done
+(exit "$MN_RC")
 """
 
 
@@ -189,14 +315,16 @@ def build_user_data(
     (baseline/preempt) — byte-identical to before.
 
     ``nodes > 1`` (implies ddp) joins an N-node group via torchrun's STATIC
-    rendezvous: node 0 publishes its private IP to S3 (rdzv.json), the others
+    rendezvous inside the generation loop built by ``_multinode_loop``: node 0
+    publishes its private IP + a generation number to S3 (rdzv.json), the others
     poll it, and every node runs with ``--node_rank`` + ``--master_addr`` so
     global rank 0 and the worker-group store are always on node 0 (c10d elastic
     assigned both arbitrarily — killing the wrong node stranded survivors dialing
     a dead store). ``--max-restarts=0``: a peer death crashes the survivors'
-    collectives after NCCL_TIMEOUT and the agents exit; recovery is a fresh
-    whole-group segment that resumes from the S3 checkpoint (the one proven
-    resume path), orchestrated by run_multinode_preempt."""
+    collectives after NCCL_TIMEOUT and the agents exit — but the loop keeps the
+    surviving BOX alive, pausing until the orchestrator's replacement node is up
+    and rejoining at the next generation; every restart of train() resumes from
+    the S3 checkpoint (the one proven resume path)."""
     env = _trainer_env(cfg, run_id=run_id, market=market, max_seconds=max_seconds)
     if nodes > 1:
         # Short collective timeout so survivors of a node kill abort fast (see
@@ -209,12 +337,8 @@ def build_user_data(
     rdzv_block = ""
     if nodes > 1:
         nproc = "gpu" if nproc_per_node <= 0 else str(nproc_per_node)
-        rdzv_block = _rdzv_block(cfg, run_id=run_id, nodes=nodes, node_index=node_index)
-        run_cmd = (
-            f'OMP_NUM_THREADS=1 "$VENV_PY" -m torch.distributed.run '
-            f"--nnodes={nodes} --nproc_per_node={nproc} --node_rank={node_index} "
-            f'--master_addr="$RDZV_ADDR" --master_port={cfg.rdzv_port} '
-            f"--max-restarts=0 -m spot_train.train"
+        run_cmd = _multinode_loop(
+            cfg, run_id=run_id, nodes=nodes, node_index=node_index, nproc=nproc
         )
     elif ddp:
         nproc = "gpu" if nproc_per_node <= 0 else str(nproc_per_node)
