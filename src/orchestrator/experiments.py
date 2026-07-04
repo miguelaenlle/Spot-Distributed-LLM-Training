@@ -45,11 +45,14 @@ def _poll_metrics(cfg: OrchestratorConfig, run_id: str) -> dict:
 def _launch_gated(cfg: OrchestratorConfig, do_launch):
     """Launch behind the vCPU-quota gate: wait until one box's vCPUs fit under
     VCPU_QUOTA, then RunInstances. If AWS still rejects on quota (external
-    launches can grab the slack between check and call), re-wait and retry a
-    bounded number of times instead of spamming the API."""
+    launches can grab the slack between check and call, or VCPU_QUOTA overstates
+    the real quota), keep waiting and retrying — each retry sits in the 15s
+    headroom poll, not a hot loop, so patience costs no API spam. The attempt
+    cap is a runaway backstop, not an expected exit."""
     needed = cfg.instance_vcpu_count()
     last: Exception | None = None
-    for attempt in range(1, 4):
+    attempts = 1000
+    for attempt in range(1, attempts + 1):
         aws.wait_vcpu_headroom(needed, cfg.vcpu_quota)
         try:
             return do_launch()
@@ -57,11 +60,14 @@ def _launch_gated(cfg: OrchestratorConfig, do_launch):
             if "VcpuLimitExceeded" not in str(e) and "MaxSpotInstanceCountExceeded" not in str(e):
                 raise
             last = e
-            print(f"[quota] RunInstances rejected on quota (attempt {attempt}/3)", file=sys.stderr)
+            print(
+                f"[quota] RunInstances rejected on quota (attempt {attempt}/{attempts})",
+                file=sys.stderr,
+            )
             time.sleep(15)
     raise SystemExit(
-        f"RunInstances rejected on quota 3 times — VCPU_QUOTA={cfg.vcpu_quota} probably "
-        f"overstates the real account quota. Last error: {last}"
+        f"RunInstances rejected on quota {attempts} times — VCPU_QUOTA={cfg.vcpu_quota} "
+        f"probably overstates the real account quota. Last error: {last}"
     )
 
 
