@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import pickle
 import shutil
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,7 +57,14 @@ class PositionedLoader:
 
     # -- data provisioning -------------------------------------------------- #
     def _ensure_data(self) -> None:
-        """Make sure train/val/meta exist locally, pulling from S3 if configured."""
+        """Make sure train/val/meta exist locally, pulling from S3 if configured.
+
+        Multi-rank safe: torchrun starts every rank on the box at once and each
+        constructs a loader, so on a multi-GPU node N ranks would race to
+        download and overwrite the same files. Only LOCAL_RANK 0 downloads —
+        each file lands via a same-directory temp + atomic os.replace, so a
+        file's *existence* implies it is complete — while the other local ranks
+        just wait for the files to appear."""
         os.makedirs(self.data_local_dir, exist_ok=True)
         missing = [f for f in _FILES if not os.path.exists(os.path.join(self.data_local_dir, f))]
         if not missing:
@@ -67,10 +75,28 @@ class PositionedLoader:
                 f"data_uri set. Run nanoGPT's prepare.py (locally) or `spot-orchestrate "
                 f"stage-data` (to S3) first."
             )
+        if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+            self._wait_for_files(missing)
+            return
         for name in missing:
             ref = s3_store._join(self.data_uri.rstrip("/"), name)  # s3://.../<name>
             local = s3_store.download(ref)
-            shutil.move(local, os.path.join(self.data_local_dir, name))
+            dest = os.path.join(self.data_local_dir, name)
+            tmp = f"{dest}.tmp-{os.getpid()}"
+            shutil.move(local, tmp)  # may be a cross-fs copy — but into dest's dir
+            os.replace(tmp, dest)  # atomic: waiters can trust existence
+
+    def _wait_for_files(self, names: list[str], timeout: float = 600.0) -> None:
+        """Non-downloading local ranks block here until rank 0's files land."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if all(os.path.exists(os.path.join(self.data_local_dir, n)) for n in names):
+                return
+            time.sleep(1.0)
+        raise TimeoutError(
+            f"waited {timeout:.0f}s for {names} in {self.data_local_dir!r} "
+            "(is the downloading rank 0 on this box stalled?)"
+        )
 
     def _read_vocab_size(self) -> int | None:
         meta = os.path.join(self.data_local_dir, "meta.pkl")

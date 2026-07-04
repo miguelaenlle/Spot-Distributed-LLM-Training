@@ -205,6 +205,14 @@ class OrchestratorConfig:
     def run_ready_prefix(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/ready/"
 
+    # Orchestrator-authoritative remaining training budget (seconds). Written at
+    # launch and recomputed after every kill from OBSERVED training time (first
+    # checkpoint -> kill), so boot, the NCCL stall, and crash teardown are never
+    # billed. Multinode boxes read it before each rendezvous generation instead
+    # of doing local wall-clock arithmetic.
+    def run_budget_key(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/budget.json"
+
     # The tool-agnostic run profile (timeline + loss + merged metrics) the
     # orchestrator writes at end of run. W&B is just a mirror of this.
     def run_profile_uri(self, run_id: str) -> str:

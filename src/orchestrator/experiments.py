@@ -367,6 +367,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
     node_vcpus = cfg.instance_vcpu_count()
     ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
     metrics_key = cfg.run_metrics_key(run_id)
+    budget_key = cfg.run_budget_key(run_id)
     # Dense checkpoints: a hard kill gives no warning, so lost work is bounded by
     # this interval (same knobs as run_preempt).
     cfg.checkpoint_interval_seconds = min(
@@ -393,6 +394,12 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
         """Launch all N nodes (one up-front headroom gate for the whole group;
         the per-launch gate inside _launch_node then passes instantly)."""
         nonlocal node0_log, state
+        if mark != "launch":
+            # A fresh node 0 = a fresh log file whose step lines get re-parsed
+            # from byte 0 — bump the profile's dedup segment so only THIS file's
+            # samples are new. (Victim-only replacements don't bump: node 0's
+            # log is continuous and re-parsing it must stay idempotent.)
+            profile.segment += 1
         aws.wait_vcpu_headroom(cfg.node_count * node_vcpus, cfg.vcpu_quota)
         for i in range(cfg.node_count):
             live[i] = _launch_node(
@@ -428,9 +435,16 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
         aws.wait_running(live[victim])
         profile.mark("relaunch")
 
+    def _write_budget(remaining: int) -> None:
+        """Publish the authoritative remaining budget; boxes read it before every
+        rendezvous generation (crash overhead is never billed — `remaining` comes
+        from observed training time only)."""
+        aws.put_text(cfg.bucket, budget_key, json.dumps({"remaining_seconds": remaining}))
+
     kills = 0
     accumulated = 0.0
     try:
+        _write_budget(max(1, math.ceil(total)))
         _launch_group(max(1, math.ceil(total)), mark="launch")
 
         if aws.is_dry_run():
@@ -438,6 +452,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             # terminate the victim, free its quota slot, launch one replacement.
             for _ in range(cfg.preempt_count):
                 aws.terminate(live[victim])
+                _write_budget(max(1, math.ceil(total)))
                 aws.wait_quota_released(live[victim])
                 seq += 1
                 aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
@@ -471,14 +486,16 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             pre_kill_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
             aws.terminate(live[victim])
             profile.mark("kill")
-            profile.segment = kills + 1
+            # Publish the new remaining budget IMMEDIATELY: the survivors' crash
+            # (~NCCL_TIMEOUT away) must read the post-kill value, not the stale one.
+            remaining_budget = max(1, math.ceil(total - accumulated))
+            _write_budget(remaining_budget)
             # Only the victim's quota slot frees — the survivors keep theirs
             # (that's the point) — so the replacement needs exactly one node's
             # worth of headroom.
             aws.wait_quota_released(live[victim])
             seq += 1
             aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
-            remaining_budget = max(1, math.ceil(total - accumulated))
             _launch_replacement(remaining_budget)
             # Recovery watchdog: a NEW checkpoint (or metrics.json) proves the
             # group re-formed at the next generation and resumed from S3.

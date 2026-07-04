@@ -141,14 +141,23 @@ def _multinode_loop(
     node back to the top of the loop, where all of them — survivors reading their
     own last generation, replacements reading the dead group's stale rdzv.json —
     independently converge on generation+1. metrics.json appearing in S3 is the
-    group-wide done signal; the budget shrinks only by seconds actually spent
-    inside torchrun, so paused time is free. Every wait is bounded (~20 min): on
-    exhaustion the loop exits nonzero and the box is left up for debugging, and
-    the orchestrator's recovery watchdog falls back to a whole-group restart."""
+    group-wide done signal.
+
+    The training budget is ORCHESTRATOR-authoritative: before each generation the
+    box reads runs/<run_id>/budget.json (recomputed by the orchestrator after
+    every kill from observed training time) and exports it as MAX_SECONDS —
+    boot, the NCCL stall, and crash teardown are never billed, and there is no
+    local wall-clock arithmetic to drift. The value is clamped to >= 1 and the
+    loop NEVER exits for lack of budget: rank 0 must always be able to re-form
+    the group so the coordinated stop -> eval -> metrics.json can land. Every
+    wait is bounded (~20 min): on exhaustion the loop exits nonzero and the box
+    is left up for debugging, and the orchestrator's recovery watchdog falls
+    back to a whole-group restart."""
     bucket = cfg.bucket
     rdzv_key = cfg.run_rdzv_key(run_id)
     metrics_key = cfg.run_metrics_key(run_id)
     ready_prefix = cfg.run_ready_prefix(run_id)
+    budget_key = cfg.run_budget_key(run_id)
     polls = 400  # x3s = ~20 min bound on any single wait
     if node_index == 0:
         rendezvous = f"""  # Master: wait for every worker's gen-ready marker (exit 2 = the run
@@ -236,8 +245,6 @@ PY
 # PAUSES the box until the orchestrator's replacement node is ready and rejoins
 # at the next generation. metrics.json is the done signal; MN_RC=0 only then or
 # on a clean local exit.
-ORIG_BUDGET=$MAX_SECONDS
-CONSUMED=0
 MN_RC=1
 while :; do
   "$VENV_PY" - <<'PY'
@@ -253,11 +260,23 @@ PY
     MN_RC=0
     break
   fi
-  REMAINING=$((ORIG_BUDGET - CONSUMED))
-  if [ "$REMAINING" -le 0 ]; then
-    echo "[rdzv] training budget exhausted without metrics.json"
-    break
-  fi
+  # Budget: read the orchestrator's authoritative remaining seconds. 0/unreadable
+  # falls back to the last known MAX_SECONDS; clamp >= 1 — NEVER exit for lack of
+  # budget, or rank 0 could no longer re-form the group to eval + write metrics.
+  REMAINING=$("$VENV_PY" - <<'PY'
+import json
+import boto3
+try:
+    body = boto3.client("s3").get_object(Bucket="{bucket}", Key="{budget_key}")["Body"].read()
+    print(int(json.loads(body)["remaining_seconds"]))
+except Exception:
+    print(0)
+PY
+)
+  [ "$REMAINING" -ge 1 ] || REMAINING=$MAX_SECONDS
+  [ "$REMAINING" -ge 1 ] || REMAINING=1
+  export MAX_SECONDS=$REMAINING
+  echo "[rdzv] budget: $MAX_SECONDS seconds remain"
   # Next generation = one past whatever is currently published (0 if nothing) —
   # survivors and fresh replacements independently agree on this number.
   G_PUB=$("$VENV_PY" - <<'PY'
@@ -272,19 +291,16 @@ PY
 )
   GEN=$((G_PUB + 1))
   PORT=$(({cfg.rdzv_port} + GEN))
-{rendezvous}  export MAX_SECONDS=$REMAINING
-  T0=$(date +%s)
-  OMP_NUM_THREADS=1 "$VENV_PY" -m torch.distributed.run \\
+{rendezvous}  OMP_NUM_THREADS=1 "$VENV_PY" -m torch.distributed.run \\
     --nnodes={nodes} --nproc_per_node={nproc} --node_rank={node_index} \\
     --master_addr="$RDZV_ADDR" --master_port="$PORT" \\
     --max-restarts=0 -m spot_train.train
   TRC=$?
-  CONSUMED=$((CONSUMED + $(date +%s) - T0))
   if [ "$TRC" -eq 0 ]; then
     MN_RC=0
     break
   fi
-  echo "[rdzv] torchrun exited $TRC at gen $GEN ($CONSUMED/$ORIG_BUDGET budget-s) — regrouping"
+  echo "[rdzv] torchrun exited $TRC at gen $GEN — pausing to regroup"
 done
 (exit "$MN_RC")
 """
@@ -330,6 +346,9 @@ def build_user_data(
         # Short collective timeout so survivors of a node kill abort fast (see
         # distributed.init); single-node keeps torch's default.
         env["NCCL_TIMEOUT"] = str(cfg.nccl_timeout_seconds)
+        # Skip torch's post-timeout debug-info dump: it added ~2 minutes to every
+        # peer-death crash (observed 18:26:51 -> 18:29:10), delaying the rejoin.
+        env["TORCH_NCCL_DUMP_ON_TIMEOUT"] = "0"
     steps = _provision_steps(cfg, _export_block(env))
     bucket = cfg.bucket
     logs_key = logs_key or cfg.run_logs_key(run_id)

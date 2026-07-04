@@ -109,10 +109,17 @@ on its own, and nobody busy-retries against a box that is still booting):
   node), its replacement reads the stale `rdzv.json`, waits for the
   survivors' gen+1 ready markers, and publishes its own new IP — same code
   path, no special case.
-- `metrics.json` appearing in S3 is the group-wide done signal; each box's
-  budget shrinks only by seconds actually spent inside torchrun, so paused
-  time is free (`all_reduce_stop` MAX keeps mismatched budgets coordinated —
-  the first expiring rank stops the group).
+- `metrics.json` appearing in S3 is the group-wide done signal. The budget is
+  **orchestrator-authoritative**: `budget.json` (next to `rdzv.json`) holds
+  the remaining seconds, recomputed after every kill from *observed* training
+  time (first checkpoint → kill), so boot, the NCCL stall, and crash teardown
+  are never billed. Boxes read it before each generation, clamp it to ≥ 1,
+  and export it as `MAX_SECONDS` — the loop never exits for lack of budget,
+  because rank 0 must always be able to re-form the group for the coordinated
+  stop → eval → `metrics.json` ending (`all_reduce_stop` MAX keeps mismatched
+  budgets coordinated — the first expiring rank stops the group). Multinode
+  boxes also set `TORCH_NCCL_DUMP_ON_TIMEOUT=0`: torch's post-timeout debug
+  dump added ~2 minutes to every peer-death crash.
 - Every wait is bounded (~20 min); on exhaustion a box exits nonzero and is
   left up for debugging, and the orchestrator's watchdog handles recovery.
 

@@ -53,7 +53,16 @@ def test_bash_syntax(shape, tmp_path):
 def test_single_node_paths_have_no_multinode_artifacts():
     for kwargs in ({}, {"ddp": True}, {"ddp": True, "nproc_per_node": 2}):
         ud = _ud(**kwargs)
-        for marker in ("rdzv", "generation", "GEN", "ready/", "NCCL_TIMEOUT", "MN_RC"):
+        for marker in (
+            "rdzv",
+            "generation",
+            "GEN",
+            "ready/",
+            "NCCL_TIMEOUT",
+            "MN_RC",
+            "budget.json",
+            "TORCH_NCCL_DUMP_ON_TIMEOUT",
+        ):
             assert marker not in ud, f"{marker!r} leaked into single-node user-data"
     assert "--standalone" in _ud(ddp=True)
 
@@ -86,17 +95,24 @@ def test_multinode_worker_dials_what_is_published():
 def test_multinode_loop_budget_and_done_signal():
     for node_index in (0, 1):
         ud = _ud(ddp=True, nodes=2, node_index=node_index)
-        # Budget shrinks only by seconds actually spent inside torchrun; paused
-        # time is free. The re-export must come after sourcing spot-train.env.
-        assert "ORIG_BUDGET=$MAX_SECONDS" in ud
+        # Budget is orchestrator-authoritative: read budget.json each generation,
+        # clamp >= 1 (NEVER exit on exhausted budget — rank 0 must always be able
+        # to re-form the group for the eval + metrics.json ending), and export it.
+        assert "runs/run-1/budget.json" in ud
+        assert '[ "$REMAINING" -ge 1 ] || REMAINING=1' in ud
         assert "export MAX_SECONDS=$REMAINING" in ud
-        assert ud.index("source /home/ubuntu/spot-train.env") < ud.index("ORIG_BUDGET=$MAX_SECONDS")
+        # The old local wall-clock arithmetic (which billed the crash tail as
+        # training and made survivors give up) must be gone.
+        assert "ORIG_BUDGET" not in ud
+        assert "CONSUMED" not in ud
         # metrics.json is the group-wide done signal; a clean local exit or the
         # done signal are the only RC=0 paths.
         assert "metrics.json" in ud
         assert "MN_RC=0" in ud
-        # Survivors abort fast on a dead peer.
+        # Survivors abort fast on a dead peer — and skip torch's ~2-minute
+        # post-timeout debug dump, which delayed every rejoin.
         assert 'export NCCL_TIMEOUT="60"' in ud
+        assert 'export TORCH_NCCL_DUMP_ON_TIMEOUT="0"' in ud
 
 
 def test_log_key_attempt_suffix():

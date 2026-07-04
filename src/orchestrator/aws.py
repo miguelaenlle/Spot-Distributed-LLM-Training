@@ -206,6 +206,14 @@ def upload_file(local_path: str, bucket: str, key: str) -> None:
     _client("s3").upload_file(local_path, bucket, key, ExtraArgs={"ChecksumAlgorithm": "SHA256"})
 
 
+def put_text(bucket: str, key: str, body: str) -> None:
+    """Write a small control document (e.g. budget.json) the boxes poll."""
+    _log(f"put s3://{bucket}/{key}: {body}")
+    if _DRY_RUN:
+        return
+    _client("s3").put_object(Bucket=bucket, Key=key, Body=body.encode())
+
+
 # --------------------------------------------------------------------------- #
 # Mutating: IAM (instance profile granting the box S3 access)
 # --------------------------------------------------------------------------- #
