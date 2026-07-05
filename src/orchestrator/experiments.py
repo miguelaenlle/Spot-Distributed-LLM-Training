@@ -635,6 +635,7 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
                 file=sys.stderr,
             )
             aws.terminate(live[victim])
+            kill_t = time.monotonic()
             profile.instance_stopped(live[victim])
             profile.mark("kill")
             # Publish the new remaining budget IMMEDIATELY: the survivors' crash
@@ -645,18 +646,23 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             # (that's the point) — so the replacement needs exactly one node's
             # worth of headroom.
             aws.wait_quota_released(live[victim])
-            # Watchdog baseline: sampled AFTER the quota release (>=60s past the
-            # kill), not before it — rank 0's ASYNC checkpoint writer usually has
-            # an upload in flight when the kill lands, and a baseline taken at
-            # kill time would let that stray checkpoint satisfy "new checkpoint
-            # appeared" instantly (fake 1s recoveries; fallback never armed). By
-            # now the old group is dead (crash <= NCCL_TIMEOUT, writer dies with
-            # the process), so anything newer than this genuinely proves the
-            # re-formed group resumed.
-            pre_kill_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
             seq += 1
             aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
             _launch_replacement(remaining_budget, victim)
+            # Watchdog baseline — sampled here, bounded BELOW by the stray-upload
+            # window: when the kill spares rank 0, its async checkpoint writer can
+            # land one last upload up to ~NCCL_TIMEOUT (crash of the main thread)
+            # + one upload past the kill. A baseline sampled inside that window
+            # lets the stray checkpoint satisfy "new checkpoint appeared"
+            # instantly (fake 0s recovery bars; fallback never armed) — observed
+            # once the raised quota shrank wait_quota_released to ~12s. Sampling
+            # after the replacement launch makes the floor nearly free (boot
+            # overlaps it), and the new group's first checkpoint is still
+            # comfortably ahead (user-data has barely started at this point).
+            settle = (cfg.nccl_timeout_seconds + 15) - (time.monotonic() - kill_t)
+            if settle > 0:
+                time.sleep(settle)
+            pre_kill_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
             # Recovery watchdog: a NEW checkpoint (or metrics.json) proves the
             # group re-formed at the next generation and resumed from S3.
             try:
