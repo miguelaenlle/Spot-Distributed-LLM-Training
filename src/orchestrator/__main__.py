@@ -91,6 +91,12 @@ def main() -> None:
         default="third_party/nanoGPT/data/shakespeare_char",
         help="dir holding meta.pkl (the char codec)",
     )
+    fleet_serve = fleet_sub.add_parser(
+        "serve",
+        parents=[common],
+        help="minimal cloud serve: ONE box, no router — curl it directly",
+    )
+    fleet_serve.add_argument("--run", required=True, help="run id whose latest checkpoint to serve")
     fleet_sub.add_parser("status", parents=[common, fleet_common])
     fleet_sub.add_parser("down", parents=[common, fleet_common])
     fleet_kill = fleet_sub.add_parser("kill-worker", parents=[common, fleet_common])
@@ -125,7 +131,9 @@ def main() -> None:
         aws.set_dry_run(args.dry_run)
         cfg = OrchestratorConfig()
         aws.set_region(cfg.region)
-        if args.fleet_command == "up":
+        if args.fleet_command == "serve":
+            fleet.serve_cloud(cfg, run_id=args.run)
+        elif args.fleet_command == "up":
             fleet.up_cloud(
                 cfg,
                 workers=args.workers if args.workers is not None else cfg.fleet_worker_count,

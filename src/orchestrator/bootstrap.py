@@ -130,10 +130,13 @@ def _fleet_env(
 ) -> dict[str, str]:
     """Environment for a fleet box (inference worker or router). Workers need
     the checkpoint + codec locations; the router only needs the heartbeat
-    prefix. ADVERTISE_ADDR is exported at boot from IMDS (private IP)."""
+    prefix. ADVERTISE_ADDR is exported at boot from IMDS (private IP).
+
+    ``fleet_id=""`` = standalone serve box: no heartbeat prefix, so the worker
+    skips registration entirely (there is no router to find it)."""
     env = {
         "PYTHONPATH": "/home/ubuntu/app/src",
-        "FLEET_WORKERS_URI": cfg.fleet_workers_uri(fleet_id),
+        "FLEET_WORKERS_URI": cfg.fleet_workers_uri(fleet_id) if fleet_id else "",
         "PORT": str(port),
         "HOST": "0.0.0.0",
         "MARKET": cfg.fleet_market if role == "worker" else "on-demand",

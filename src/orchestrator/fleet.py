@@ -227,20 +227,103 @@ def _discover(cfg: OrchestratorConfig) -> tuple[list[dict], list[dict]]:
     )
 
 
-def up_cloud(cfg: OrchestratorConfig, *, workers: int, run_id: str) -> None:
-    """Launch the serving fleet: 1 on-demand router + N spot workers serving
-    ``run_id``'s latest checkpoint. Prints the router's public endpoint."""
-    from . import aws, bootstrap
+def _require_run_with_checkpoints(cfg: OrchestratorConfig, run_id: str) -> None:
+    from . import aws
 
     cfg.require_bucket()
     if not run_id:
-        raise SystemExit("fleet up (cloud) needs --run <run_id> — the checkpoint to serve")
+        raise SystemExit("--run <run_id> is required — the checkpoint to serve")
     ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
     if not aws.is_dry_run() and not aws.any_object_under(cfg.bucket, ckpt_prefix):
         raise SystemExit(
             f"run {run_id!r} has no checkpoints under s3://{cfg.bucket}/{ckpt_prefix} — "
             "serve a completed training run"
         )
+
+
+def serve_cloud(cfg: OrchestratorConfig, *, run_id: str) -> None:
+    """The minimal serve: ONE box, no router, no registry. Boots a spot worker
+    that loads ``run_id``'s latest checkpoint and answers /v1/completions on a
+    public port. `fleet status`/`fleet down` manage it like any fleet box."""
+    from . import aws, bootstrap
+
+    _require_run_with_checkpoints(cfg, run_id)
+    existing_workers, existing_routers = _discover(cfg)
+    if existing_workers or existing_routers:
+        raise SystemExit(
+            f"fleet instances already exist ({len(existing_workers)} workers, "
+            f"{len(existing_routers)} routers) — run `fleet down` first"
+        )
+    ami = aws.resolve_ami(cfg.ami_id, cfg.ami_name_filter)
+    sg = aws.ensure_security_group(cfg.security_group, cfg.region)
+    port = cfg.fleet_router_port  # one public port either way; reuse the rule
+    aws.authorize_port(sg, port, cfg.fleet_ingress_cidr, "serve box (completions API)")
+    serve_id = time.strftime("serve-%Y%m%d-%H%M%S")
+    print(
+        f"[serve] {serve_id} run={run_id} 1x{cfg.fleet_worker_instance_type} ({cfg.fleet_market})"
+    )
+    iid = aws.launch(
+        ami_id=ami,
+        instance_type=cfg.fleet_worker_instance_type,
+        profile_name=cfg.instance_profile,
+        security_group_id=sg,
+        user_data=bootstrap.build_fleet_user_data(
+            cfg,
+            fleet_id="",  # standalone: worker skips heartbeating
+            role="worker",
+            worker_id=serve_id,
+            run_id=run_id,
+            logs_key=cfg.fleet_logs_key(serve_id, "worker"),
+            port=port,
+        ),
+        market=cfg.fleet_market,
+        run_id=serve_id,
+        key_name=cfg.key_name,
+        extra_tags={FLEET_TAG: serve_id, ROLE_TAG: "worker", "worker_id": serve_id},
+    )
+    aws.wait_running(iid)
+    ip = aws.public_ip(iid)
+    endpoint = f"http://{ip}:{port}"
+    print(f"[serve] instance {iid} at {endpoint}")
+    if aws.is_dry_run():
+        return
+    _wait_healthy(endpoint)
+    print(
+        f"[serve] ready — curl -s {endpoint}/v1/completions "
+        "-H 'content-type: application/json' "
+        '-d \'{"prompt": "ROMEO:", "max_tokens": 64}\''
+    )
+    print(f"[serve] boot log: s3://{cfg.bucket}/{cfg.fleet_logs_key(serve_id, 'worker')}")
+    print("[serve] done?     PYTHONPATH=src python -m orchestrator fleet down")
+
+
+def _wait_healthy(endpoint: str, timeout: float = 900.0) -> None:
+    """Poll /healthz until the worker has loaded the model (boot = clone + pip
+    + checkpoint download; ~3-8 min on a stock AMI, less on a baked one)."""
+    import requests
+
+    print("[serve] waiting for the model to load (~3-8 min)...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = requests.get(f"{endpoint}/healthz", timeout=3)
+            if r.ok and r.json().get("ok"):
+                return
+        except requests.RequestException:
+            pass
+        time.sleep(5.0)
+    print(
+        f"[serve] WARNING: not healthy within {timeout:.0f}s — check the boot log in S3",
+        file=sys.stderr,
+    )
+
+
+def up_cloud(cfg: OrchestratorConfig, *, workers: int, run_id: str) -> None:
+    """Launch the serving fleet: 1 on-demand router + N spot workers serving
+    ``run_id``'s latest checkpoint. Prints the router's public endpoint."""
+    from . import aws, bootstrap
+
+    _require_run_with_checkpoints(cfg, run_id)
     existing_workers, existing_routers = _discover(cfg)
     if existing_workers or existing_routers:
         raise SystemExit(
