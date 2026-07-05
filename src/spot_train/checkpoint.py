@@ -22,10 +22,12 @@ Two tools answer "is this checkpoint comprehensive and valid?":
 
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 import sys
 import tempfile
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -68,6 +70,120 @@ def save(*, model, optimizer, loader, step: int, uri: str) -> str:
         # into /tmp until the disk fills.
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def _cpu_copy(obj: Any) -> Any:
+    """Deep copy a state tree with every tensor moved to CPU. The copy is the
+    point: the optimizer keeps mutating the live tensors while the background
+    writer serializes, so the snapshot must not alias them."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _cpu_copy(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cpu_copy(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_cpu_copy(v) for v in obj)
+    return copy.deepcopy(obj)
+
+
+def snapshot(*, model, optimizer, loader, step: int) -> dict[str, Any]:
+    """Point-in-time CPU copy of the full training state (same schema as
+    ``save`` writes). This is the only part of an async checkpoint that must
+    run on the training critical path — ~tens of ms for a NanoGPT-sized model.
+    RNG and loader state are captured in the same instant as the weights, the
+    invariant that keeps resume from silently diverging."""
+    return {
+        "version": CKPT_VERSION,
+        "step": step,
+        "model": _cpu_copy(model.state_dict()),
+        "optimizer": _cpu_copy(optimizer.state_dict()),
+        "rng": rng.capture(),  # capture() already returns copies
+        "loader": dict(loader.state_dict()),
+    }
+
+
+class AsyncCheckpointer:
+    """Two-phase checkpointing: the caller snapshots on its own thread
+    (:func:`snapshot`, ~tens of ms), then a daemon thread serializes, uploads
+    (same atomic temp-key -> rename), and verify/smoke-tests off the critical
+    path.
+
+    One save in flight at a time: ``submit`` returns False while the previous
+    write is still running (the caller retries on a later loop iteration), so
+    memory is bounded at one snapshot and a slow S3 day can't queue-pile.
+    Durability shifts accordingly: worst-case lost work on a hard kill is the
+    checkpoint interval PLUS one upload, not the interval alone. Preempt and
+    final checkpoints stay synchronous in the trainer — call ``flush`` first so
+    the writer never races them.
+
+    Verify/smoke run on CPU in the background thread (a GPU forward there would
+    contend with training); a failed background save is logged and counted, and
+    training continues on the previous good checkpoint."""
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        verify_every: int = 1,
+        build_model: Callable[[], Any] | None = None,
+        sample_batch: tuple | None = None,
+        log: Callable[[str], None] | None = None,
+    ):
+        self._uri = uri
+        self._verify_every = verify_every
+        self._build_model = build_model
+        self._sample_batch = sample_batch  # CPU tensors (see trainer: RNG-free eval batch)
+        self._log = log or (lambda msg: print(msg, file=sys.stderr, flush=True))
+        self._thread: threading.Thread | None = None
+        self._count = 0
+        self.failures = 0
+
+    def busy(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def submit(self, *, model, optimizer, loader, step: int) -> bool:
+        """Snapshot now and hand off to the writer. False = previous save still
+        in flight (skipped; nothing was snapshotted)."""
+        if self.busy():
+            return False
+        blob = snapshot(model=model, optimizer=optimizer, loader=loader, step=step)
+        self._count += 1
+        self._thread = threading.Thread(
+            target=self._write, args=(blob, step, self._count), name="ckpt-writer", daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def _write(self, blob: dict[str, Any], step: int, count: int) -> None:
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".pt")
+            os.close(fd)
+            try:
+                torch.save(blob, tmp_path)
+                _warn_if_low_disk(os.path.getsize(tmp_path))
+                ref = s3_store.save_atomic(tmp_path, self._uri, _ckpt_name(step))
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            if self._verify_every and count % self._verify_every == 0:
+                good = verify(ref, map_location="cpu")
+                if self._build_model is not None and self._sample_batch is not None:
+                    smoke_test(good, self._build_model, self._sample_batch, "cpu")
+                self._log(f"[verify] checkpoint at step {step} passed verify + smoke test (async)")
+        except Exception as e:  # noqa: BLE001 — background thread: log, count, keep training
+            self.failures += 1
+            self._log(
+                f"[checkpoint] ASYNC save at step {step} FAILED: {e!r} — "
+                "training continues on the previous checkpoint"
+            )
+
+    def flush(self, timeout: float = 300.0) -> None:
+        """Wait for the in-flight save (if any) to finish. Called before the
+        synchronous preempt/final checkpoints and at shutdown."""
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout)
 
 
 def _warn_if_low_disk(ckpt_bytes: int) -> None:

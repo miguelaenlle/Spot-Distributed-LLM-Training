@@ -39,6 +39,7 @@ _TRAINER_PASSTHROUGH = (
     "LR_DECAY_STEPS",
     "MIN_LR",
     "GRAD_CLIP",
+    "CHECKPOINT_ASYNC",
     "EVAL_INTERVAL_STEPS",
     "SAMPLE_INTERVAL_STEPS",
     "SAMPLE_INTERVAL_PROMPTS",
@@ -115,6 +116,17 @@ class OrchestratorConfig:
     )
     repo_branch: str = field(default_factory=lambda: _env("REPO_BRANCH", "main"))
 
+    # --- AMI baking (spot-orchestrate bake-ami) ------------------------------
+    # Instance type for the throwaway bake box. pip installs are arch-independent
+    # and the DLAMI boots fine without a GPU, so a cheap CPU box is the default —
+    # it also keeps the bake entirely off the G-vCPU quota.
+    bake_instance_type: str = field(default_factory=lambda: _env("BAKE_INSTANCE_TYPE", "t3.xlarge"))
+    # Seconds to wait for the bake box's provisioning to write its status marker.
+    bake_timeout_seconds: int = field(default_factory=lambda: _env_int("BAKE_TIMEOUT", 1200))
+    # Baked AMIs to retain (newest first); older ones are deregistered and their
+    # snapshots deleted after a successful bake. Snapshots bill monthly.
+    bake_keep_images: int = field(default_factory=lambda: _env_int("BAKE_KEEP_IMAGES", 2))
+
     # --- experiment knobs ----------------------------------------------------
     dataset: str = field(default_factory=lambda: _env("DATASET", "shakespeare_char"))
     # $/hr override for the cost ledger: pins the on-demand rate when the
@@ -186,8 +198,11 @@ class OrchestratorConfig:
     node_count: int = field(default_factory=lambda: _env_int("NODES", 2))
     rdzv_port: int = field(default_factory=lambda: _env_int("RDZV_PORT", 29400))
     # Collective timeout exported to multi-node boxes so survivors' collectives
-    # abort fast when a peer node dies (torch's default is 10 minutes).
-    nccl_timeout_seconds: int = field(default_factory=lambda: _env_int("NCCL_TIMEOUT", 60))
+    # abort fast when a peer node dies (torch's default is 10 minutes). 20s keeps
+    # >10x margin over the worst legitimate stall at this model size (an async-
+    # checkpoint snapshot or a slow TCP allreduce is well under 2s); detection of
+    # a dead peer costs ~this long, so it's most of the pre-recovery stall.
+    nccl_timeout_seconds: int = field(default_factory=lambda: _env_int("NCCL_TIMEOUT", 20))
     # After a kill + replacement launch, how long the orchestrator waits for the
     # group to produce a NEW checkpoint (proof the rejoin worked) before falling
     # back to a whole-group restart.
@@ -289,6 +304,14 @@ class OrchestratorConfig:
     # of doing local wall-clock arithmetic.
     def run_budget_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/budget.json"
+
+    # AMI-bake control keys: the bake box writes status.json (ok/rc/commit) when
+    # provisioning finishes and streams its boot log next to it.
+    def bake_status_key(self, bake_id: str) -> str:
+        return f"bake/{bake_id}/status.json"
+
+    def bake_log_key(self, bake_id: str) -> str:
+        return f"bake/{bake_id}/bake.log"
 
     def on_demand_hourly_usd(self) -> float | None:
         """$/hr for on-demand ledger rows: HOURLY_USD override, else the table.

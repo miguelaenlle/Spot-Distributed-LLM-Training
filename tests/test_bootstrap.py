@@ -111,7 +111,7 @@ def test_multinode_loop_budget_and_done_signal():
         assert "MN_RC=0" in ud
         # Survivors abort fast on a dead peer — and skip torch's ~2-minute
         # post-timeout debug dump, which delayed every rejoin.
-        assert 'export NCCL_TIMEOUT="60"' in ud
+        assert 'export NCCL_TIMEOUT="20"' in ud
         assert 'export TORCH_NCCL_DUMP_ON_TIMEOUT="0"' in ud
 
 

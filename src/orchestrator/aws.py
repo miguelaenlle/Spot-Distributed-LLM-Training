@@ -451,6 +451,96 @@ def wait_running(instance_id: str) -> None:
     _client("ec2").get_waiter("instance_running").wait(InstanceIds=[instance_id])
 
 
+def stop_instance(instance_id: str) -> None:
+    """Stop (not terminate) an instance — used before CreateImage so the AMI
+    snapshots a quiesced filesystem."""
+    _log(f"StopInstances {instance_id}")
+    if _DRY_RUN:
+        return
+    _client("ec2").stop_instances(InstanceIds=[instance_id])
+
+
+def wait_stopped(instance_id: str) -> None:
+    _log(f"wait until stopped: {instance_id}")
+    if _DRY_RUN:
+        return
+    _client("ec2").get_waiter("instance_stopped").wait(InstanceIds=[instance_id])
+
+
+def create_image(instance_id: str, name: str, tags: dict[str, str]) -> str:
+    """Register an AMI from the instance's root volume. The instance should be
+    stopped (see ``stop_instance``); returns the new image id."""
+    _log(f"CreateImage {instance_id} -> {name!r}")
+    if _DRY_RUN:
+        return "ami-DRYRUN"
+    r = _client("ec2").create_image(
+        InstanceId=instance_id,
+        Name=name,
+        TagSpecifications=[
+            {
+                "ResourceType": "image",
+                "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
+            }
+        ],
+    )
+    return r["ImageId"]
+
+
+def wait_image_available(image_id: str, timeout: int = 1800) -> None:
+    """Poll until the AMI's snapshot finishes (state=available). The stock boto3
+    waiter gives up after 10 minutes; a DLAMI-sized root volume can take longer,
+    hence the hand-rolled loop."""
+    _log(f"wait until AMI available: {image_id}")
+    if _DRY_RUN:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        r = _client("ec2").describe_images(ImageIds=[image_id])
+        state = r["Images"][0]["State"] if r.get("Images") else "pending"
+        if state == "available":
+            return
+        if state in ("failed", "error"):
+            raise SystemExit(f"AMI {image_id} entered state {state!r} — bake failed")
+        time.sleep(15)
+    raise TimeoutError(f"AMI {image_id} not available after {timeout}s")
+
+
+def list_baked_images(name_prefix: str) -> list[dict[str, Any]]:
+    """Our own AMIs whose name starts with ``name_prefix``, oldest first. Each:
+    {id, name, created, snapshot_ids} — snapshot ids so pruning can delete the
+    backing storage too (DeregisterImage alone leaves the snapshot billing)."""
+    if _DRY_RUN:
+        _log(f"DescribeImages self name~={name_prefix}*")
+        return []
+    r = _client("ec2").describe_images(
+        Owners=["self"], Filters=[{"Name": "name", "Values": [f"{name_prefix}*"]}]
+    )
+    images = sorted(r.get("Images", []), key=lambda i: i["CreationDate"])
+    return [
+        {
+            "id": img["ImageId"],
+            "name": img["Name"],
+            "created": img["CreationDate"],
+            "snapshot_ids": [
+                bdm["Ebs"]["SnapshotId"]
+                for bdm in img.get("BlockDeviceMappings", [])
+                if "Ebs" in bdm and "SnapshotId" in bdm["Ebs"]
+            ],
+        }
+        for img in images
+    ]
+
+
+def deregister_image(image_id: str, snapshot_ids: list[str]) -> None:
+    """Delete an old baked AMI and its backing snapshots."""
+    _log(f"DeregisterImage {image_id} + delete snapshots {snapshot_ids}")
+    if _DRY_RUN:
+        return
+    _client("ec2").deregister_image(ImageId=image_id)
+    for sid in snapshot_ids:
+        _client("ec2").delete_snapshot(SnapshotId=sid)
+
+
 def terminate(instance_id: str) -> None:
     _log(f"TerminateInstances {instance_id}")
     if _DRY_RUN:

@@ -185,6 +185,8 @@ def train(cfg: TrainConfig) -> dict:
     listener = InterruptionListener().start()
 
     def do_checkpoint(step: int, ckpt_count: int) -> None:
+        """SYNCHRONOUS save — the preempt/final path (must complete before exit),
+        and the periodic path when CHECKPOINT_ASYNC=0."""
         if not ddp.master:  # only rank 0 writes to S3
             return
         ref = checkpoint.save(
@@ -195,6 +197,22 @@ def train(cfg: TrainConfig) -> dict:
             good = checkpoint.verify(ref, map_location=cfg.device)
             checkpoint.smoke_test(good, make_model, loader.next_batch("val"), cfg.device)
             log(f"[verify] checkpoint at step {step} passed verify + smoke test")
+
+    # Periodic checkpoints go through a background writer: only the CPU snapshot
+    # (~tens of ms) pauses the loop — and since rank 0's pause stalls every rank
+    # at the next allreduce, this is what makes dense (5s) checkpointing nearly
+    # free group-wide. The smoke batch comes from the RNG-free eval iterator so
+    # background verifies never touch the training data stream.
+    async_ckpt = None
+    if ddp.master and cfg.checkpoint_async:
+        smoke_x, smoke_y = next(loader.iter_eval_batches("val"))
+        async_ckpt = checkpoint.AsyncCheckpointer(
+            cfg.checkpoint_uri,
+            verify_every=cfg.smoke_test_every,
+            build_model=make_model,
+            sample_batch=(smoke_x.cpu(), smoke_y.cpu()),
+            log=log,
+        )
 
     start_time = time.monotonic()
     # Epoch at loop start: the orchestrator's run profile uses this to split
@@ -260,9 +278,19 @@ def train(cfg: TrainConfig) -> dict:
 
         now = time.monotonic()
         if now - last_ckpt >= cfg.checkpoint_interval_seconds:
-            ckpt_count += 1
-            do_checkpoint(step, ckpt_count)  # rank-0-only body
-            last_ckpt = now
+            if async_ckpt is not None:
+                # Busy => the previous upload is still in flight: don't advance
+                # last_ckpt, so we retry within a few steps instead of waiting a
+                # whole interval. Bounded: one snapshot in memory at a time.
+                if async_ckpt.submit(
+                    model=raw_model, optimizer=optimizer, loader=loader, step=step
+                ):
+                    ckpt_count += 1
+                    last_ckpt = now
+            else:
+                ckpt_count += 1
+                do_checkpoint(step, ckpt_count)  # rank-0-only body
+                last_ckpt = now
 
         # Coordinated stop — the LAST collective every step, so all ranks break on
         # the same iteration and none is left blocking on the next backward.
@@ -290,6 +318,8 @@ def train(cfg: TrainConfig) -> dict:
     # orchestrator can treat its appearance as an unambiguous "run done". Only rank
     # 0 writes; no collective follows, so non-master ranks just shut down and exit.
     if reason == "preempt":
+        if async_ckpt is not None:
+            async_ckpt.flush()  # never race the writer with the sync save below
         ckpt_count += 1
         do_checkpoint(step, ckpt_count)
         listener.stop()
@@ -308,6 +338,8 @@ def train(cfg: TrainConfig) -> dict:
         return {"run_id": cfg.run_id, "stop_reason": reason, "steps": step, "resumed": resumed}
 
     save_t0 = time.monotonic()
+    if async_ckpt is not None:
+        async_ckpt.flush()  # never race the writer with the final sync save
     ckpt_count += 1
     do_checkpoint(step, ckpt_count)
     save_s = round(time.monotonic() - save_t0, 2)

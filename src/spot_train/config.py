@@ -82,6 +82,11 @@ class TrainConfig:
     checkpoint_interval_seconds: float = 30.0
     # Run the (heavier) restore smoke test on every Nth checkpoint. 1 => always.
     smoke_test_every: int = 1
+    # Periodic checkpoints from a background thread: only the point-in-time CPU
+    # snapshot (~tens of ms) stays on the training critical path; serialize +
+    # upload + verify run off it. Preempt and final checkpoints are always
+    # synchronous. CHECKPOINT_ASYNC=0 restores the fully-synchronous behavior.
+    checkpoint_async: bool = True
     # Print a per-step loss/throughput line every N steps (0 => silent). Tail the
     # box log over SSM to watch these live.
     log_interval_steps: int = 10
@@ -157,6 +162,7 @@ class TrainConfig:
             max_seconds=_env_float("MAX_SECONDS", None),
             checkpoint_interval_seconds=_env_float("CHECKPOINT_INTERVAL_SECONDS", 30.0),
             smoke_test_every=_env_int("SMOKE_TEST_EVERY", 1),
+            checkpoint_async=_env_str("CHECKPOINT_ASYNC", "1").lower() not in ("0", "false"),
             log_interval_steps=_env_int("LOG_INTERVAL_STEPS", 10),
             checkpoint_uri=_env_str("CHECKPOINT_URI", "checkpoints/"),
             metrics_uri=_env_str("METRICS_URI", "checkpoints/metrics.json"),

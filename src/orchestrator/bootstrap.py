@@ -11,7 +11,7 @@ Two DLAMI realities shape these scripts:
      never try to write into a possibly root-owned framework env. (nanoGPT is
      found by the trainer relative to the package.)
 
-Two builders:
+Three builders:
 
   * ``build_provisioning_user_data`` — clone the repo + nanoGPT submodule and
     install deps, write a ``source``-able env file, then STOP and leave the box
@@ -20,6 +20,8 @@ Two builders:
   * ``build_user_data`` — the full run: provision, then ``spot_train.train``
     under a wall-clock budget, then self-terminate on success. Used once the box
     is proven. (Parked while we validate provisioning over SSH.)
+  * ``build_bake_user_data`` — provision only (no training, no env file), then
+    write a status marker to S3; ``spot-orchestrate bake-ami`` images the box.
 
 The trainer pulls the dataset and reads/writes S3 via the instance profile role
 — no credentials are passed in user-data.
@@ -90,10 +92,17 @@ cd /home/ubuntu
 VENV_PY=/opt/pytorch/bin/python
 [ -x "$VENV_PY" ] || VENV_PY="$(command -v python3)"
 
-# Code: clone the repo (idempotent) and populate the nanoGPT submodule. A plain
-# clone leaves third_party/nanoGPT EMPTY, and the trainer imports GPT from there,
-# so the submodule init is not optional.
-[ -d app ] || git clone --depth 1 -b {cfg.repo_branch} {cfg.repo_url} app
+# Code: clone the repo, or — on a pre-baked AMI where the clone already exists —
+# fast-forward it to the branch tip so baked boxes still track {cfg.repo_branch}
+# (a bare `[ -d app ] || clone` would pin baked boxes at bake-time code forever).
+# Then populate the nanoGPT submodule: a plain clone leaves third_party/nanoGPT
+# EMPTY, and the trainer imports GPT from there, so the init is not optional.
+if [ -d app/.git ]; then
+  git -C app fetch --depth 1 origin {cfg.repo_branch}
+  git -C app reset --hard FETCH_HEAD
+else
+  git clone --depth 1 -b {cfg.repo_branch} {cfg.repo_url} app
+fi
 cd app
 git submodule update --init --depth 1
 
@@ -137,6 +146,96 @@ echo "    cd /home/ubuntu/app && source /home/ubuntu/spot-train.env"
 echo "    /opt/pytorch/bin/python -m spot_train.train"
 BOOT
 echo "[provision] user-data exited rc=$? — box left UP for SSH (no training, no shutdown)"
+"""
+
+
+def build_bake_user_data(cfg: OrchestratorConfig, *, bake_id: str, base_ami: str) -> str:
+    """Provision a box for IMAGING (``spot-orchestrate bake-ami``): clone the repo
+    + nanoGPT submodule and install boto3 — the same steps every training boot
+    performs, minus anything run-specific — then write a status marker to S3 so
+    the orchestrator knows to stop the box and call CreateImage.
+
+    Deliberately bakes NO run state: no spot-train.env (each training boot writes
+    its own), no dataset (stays in S3 — EBS lazy-restore would make baked bins
+    first-touch-slow anyway), no credentials (the instance profile is IMDS-only,
+    nothing lands on disk). The clone IS baked, and stays current because
+    ``_provision_steps`` fast-forwards an existing clone at every boot."""
+    bucket = cfg.bucket
+    status_key = cfg.bake_status_key(bake_id)
+    log_key = cfg.bake_log_key(bake_id)
+    return f"""#!/bin/bash
+set -x
+exec > /var/log/spot-train-bake.log 2>&1
+chmod 644 /var/log/spot-train-bake.log   # let the ubuntu log-uploader read it
+
+sudo -u ubuntu -i bash <<'BOOT'
+set -x
+cd /home/ubuntu
+
+# Interpreter: venv python by absolute path (same DLAMI reality as training boots).
+VENV_PY=/opt/pytorch/bin/python
+[ -x "$VENV_PY" ] || VENV_PY="$(command -v python3)"
+
+# boto3 FIRST — the log uploader and the status marker need it even if the
+# provisioning below fails. (Also the one pip dep the bake exists to pre-install.)
+"$VENV_PY" -c "import boto3" 2>/dev/null || "$VENV_PY" -m pip install boto3 2>/dev/null \\
+  || "$VENV_PY" -m pip install --user boto3 2>/dev/null || true
+"$VENV_PY" - <<'PY' &
+import time, boto3
+c = boto3.client("s3")
+while True:
+    try:
+        c.upload_file("/var/log/spot-train-bake.log", "{bucket}", "{log_key}")
+    except Exception:
+        pass
+    time.sleep(10)
+PY
+UPLOADER_PID=$!
+
+# Provision in a subshell so a failure is captured as RC, not a silent exit —
+# the status marker below must ALWAYS be written.
+(
+  set -euxo pipefail
+  if [ -d app/.git ]; then
+    git -C app fetch --depth 1 origin {cfg.repo_branch}
+    git -C app reset --hard FETCH_HEAD
+  else
+    git clone --depth 1 -b {cfg.repo_branch} {cfg.repo_url} app
+  fi
+  cd app
+  git submodule update --init --depth 1
+  git rev-parse HEAD > /home/ubuntu/bake-commit
+  "$VENV_PY" - <<'PY'
+import torch, boto3, numpy  # noqa: F401
+print("bake preflight ok: torch", torch.__version__, flush=True)
+PY
+)
+RC=$?
+
+kill "$UPLOADER_PID" 2>/dev/null || true
+"$VENV_PY" - <<PY
+import json
+import boto3
+c = boto3.client("s3")
+try:
+    c.upload_file("/var/log/spot-train-bake.log", "{bucket}", "{log_key}")
+except Exception:
+    pass
+try:
+    commit = open("/home/ubuntu/bake-commit").read().strip()
+except Exception:
+    commit = ""
+c.put_object(
+    Bucket="{bucket}",
+    Key="{status_key}",
+    Body=json.dumps(
+        {{"ok": $RC == 0, "rc": $RC, "commit": commit, "base_ami": "{base_ami}"}}
+    ).encode(),
+)
+PY
+exit "$RC"
+BOOT
+echo "bake user-data exited rc=$? — box left UP for the orchestrator (stop + CreateImage on ok)"
 """
 
 

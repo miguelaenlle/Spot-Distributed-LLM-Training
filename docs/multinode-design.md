@@ -76,9 +76,11 @@ replaces exactly the dead node; the group re-forms and resumes from S3.
    graceful SIGTERM triggers the trainer's coordinated stop, which cleanly
    shuts down the *whole group* — a different, gentler experiment. A real Spot
    reclaim warns nobody.)
-2. Survivors' collectives abort quickly — `init_process_group(timeout=60s)`
+2. Survivors' collectives abort quickly — `init_process_group(timeout=20s)`
    via `NCCL_TIMEOUT` (torch default is 10 min, uselessly slow) and NCCL async
-   error handling crash the worker rather than hang it.
+   error handling crash the worker rather than hang it. 20s keeps >10x margin
+   over the worst legitimate stall at NanoGPT scale; revisit for 1d-size models
+   (rule: 3-5x the longest legitimate collective wait, not a fixed number).
 3. `--max-restarts=0`: the agents exit on the worker crash — but the boot
    script's **generation loop** keeps the box alive, pausing in a cheap S3
    poll. The orchestrator waits for the victim's vCPU quota slot, launches
@@ -163,7 +165,7 @@ elastic-shrink is a 1c experiment.
 
 | Piece | Change |
 |---|---|
-| `config.py` | `node_count` (`NODES`, default 1), `rdzv_port` (`RDZV_PORT`, 29400), `nccl_timeout_seconds` (`NCCL_TIMEOUT`, 60), `recovery_timeout_seconds` (`RECOVERY_TIMEOUT`, 600), `vcpu_quota` (`VCPU_QUOTA`, 8), `instance_vcpus` (`INSTANCE_VCPUS`, builtin table) |
+| `config.py` | `node_count` (`NODES`, default 1), `rdzv_port` (`RDZV_PORT`, 29400), `nccl_timeout_seconds` (`NCCL_TIMEOUT`, 20), `recovery_timeout_seconds` (`RECOVERY_TIMEOUT`, 600), `vcpu_quota` (`VCPU_QUOTA`, 8), `instance_vcpus` (`INSTANCE_VCPUS`, builtin table) |
 | `aws.py` | self-referencing SG ingress rule in `ensure_security_group`; `vcpus_in_use` + `wait_vcpu_headroom` (quota gate) |
 | `bootstrap.py` | multi-node branch: generation loop (`_multinode_loop`) — ready markers + `rdzv.json` publish/poll + torchrun + pause-and-rejoin; replaces `--standalone` when `NODE_COUNT > 1` |
 | `experiments.py` | `run_multinode` (launch N, stream node 0, wait metrics, reap all) and `run_multinode_preempt` (train `PREEMPT_AFTER`, kill non-master node, replace ONLY the victim while survivors pause; whole-group restart as watchdog fallback) |
