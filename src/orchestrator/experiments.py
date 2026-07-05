@@ -634,7 +634,6 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
                 f"training (no warning); survivors pause in place",
                 file=sys.stderr,
             )
-            pre_kill_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
             aws.terminate(live[victim])
             profile.instance_stopped(live[victim])
             profile.mark("kill")
@@ -646,6 +645,15 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             # (that's the point) — so the replacement needs exactly one node's
             # worth of headroom.
             aws.wait_quota_released(live[victim])
+            # Watchdog baseline: sampled AFTER the quota release (>=60s past the
+            # kill), not before it — rank 0's ASYNC checkpoint writer usually has
+            # an upload in flight when the kill lands, and a baseline taken at
+            # kill time would let that stray checkpoint satisfy "new checkpoint
+            # appeared" instantly (fake 1s recoveries; fallback never armed). By
+            # now the old group is dead (crash <= NCCL_TIMEOUT, writer dies with
+            # the process), so anything newer than this genuinely proves the
+            # re-formed group resumed.
+            pre_kill_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
             seq += 1
             aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
             _launch_replacement(remaining_budget, victim)
