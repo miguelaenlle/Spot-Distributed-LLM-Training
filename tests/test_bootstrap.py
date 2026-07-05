@@ -50,6 +50,47 @@ def test_bash_syntax(shape, tmp_path):
     assert r.returncode == 0, f"bash -n failed for {shape}:\n{r.stderr}"
 
 
+def test_provision_updates_existing_clone():
+    # Pre-baked AMI support: a boot that finds a baked clone must fast-forward
+    # it to the branch tip, not skip the fetch (which would pin bake-time code).
+    ud = _ud()
+    assert "git -C app fetch --depth 1 origin main" in ud
+    assert "git -C app reset --hard FETCH_HEAD" in ud
+    assert "git clone --depth 1 -b main" in ud  # fresh-box path still present
+
+
+def test_bake_user_data_bash_syntax(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash not available")
+    ud = bootstrap.build_bake_user_data(_cfg(), bake_id="b1", base_ami="ami-base")
+    path = tmp_path / "bake.sh"
+    path.write_text(ud)
+    r = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert r.returncode == 0, f"bash -n failed for bake user-data:\n{r.stderr}"
+
+
+def test_bake_user_data_provisions_but_bakes_no_run_state():
+    ud = bootstrap.build_bake_user_data(_cfg(), bake_id="b1", base_ami="ami-base")
+    # It provisions (clone + submodule + boto3) and reports to the bake keys.
+    assert "git clone" in ud
+    assert "git submodule update --init" in ud
+    assert "bake/b1/status.json" in ud
+    assert "bake/b1/bake.log" in ud
+    assert '"base_ami": "ami-base"' in ud
+    # Nothing run-specific may end up in the image: no training invocation, no
+    # trainer env file, no run config — every training boot writes its own.
+    for marker in ("spot_train.train", "spot-train.env", "MAX_SECONDS", "CHECKPOINT_URI"):
+        assert marker not in ud, f"{marker!r} leaked into bake user-data"
+    # The orchestrator stops+images the box; the box must not shut itself down.
+    assert "shutdown" not in ud
+
+
+def test_bake_status_and_log_keys():
+    cfg = _cfg()
+    assert cfg.bake_status_key("b1") == "bake/b1/status.json"
+    assert cfg.bake_log_key("b1") == "bake/b1/bake.log"
+
+
 def test_single_node_paths_have_no_multinode_artifacts():
     for kwargs in ({}, {"ddp": True}, {"ddp": True, "nproc_per_node": 2}):
         ud = _ud(**kwargs)

@@ -1,5 +1,5 @@
-"""CLI: ``spot-orchestrate {setup,stage-data,baseline,spot,preempt,ddp,ddp-preempt,
-multinode,multinode-preempt} [--dry-run]``,
+"""CLI: ``spot-orchestrate {setup,stage-data,bake-ami,baseline,spot,preempt,ddp,
+ddp-preempt,multinode,multinode-preempt} [--dry-run]``,
 ``spot-orchestrate resume <run_id> [--budget N] [--market ...]``, and
 ``spot-orchestrate compare <run_id> [<run_id> ...]``.
 
@@ -43,6 +43,7 @@ def main() -> None:
     for name in (
         "setup",
         "stage-data",
+        "bake-ami",
         "baseline",
         "spot",
         "preempt",
@@ -81,6 +82,10 @@ def main() -> None:
         setup.ensure_infra(cfg)
     elif args.command == "stage-data":
         dataset.stage_data(cfg)
+    elif args.command == "bake-ami":
+        from . import bake
+
+        bake.bake_ami(cfg)
     elif args.command == "baseline":
         experiments.run_baseline(cfg)
     elif args.command == "spot":

@@ -154,6 +154,7 @@ src/orchestrator/      # local control plane (boto3) — you run this
   aws.py               # the ONLY module that calls AWS; --dry-run + logging
   setup.py             # idempotent: bucket + IAM instance profile + SG
   dataset.py           # prepare-once → upload to S3
+  bake.py              # bake-ami: pre-provisioned AMI (repo+deps) → faster boots
   bootstrap.py         # EC2 user-data script builder
   experiments.py       # run_baseline / run_spot (launch, kill, resume, poll)
   config.py            # OrchestratorConfig (env-overridable)
