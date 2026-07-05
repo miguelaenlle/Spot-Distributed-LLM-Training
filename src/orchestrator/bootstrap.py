@@ -125,6 +125,121 @@ PY
 """
 
 
+def _fleet_env(
+    cfg: OrchestratorConfig, *, fleet_id: str, role: str, worker_id: str, run_id: str, port: int
+) -> dict[str, str]:
+    """Environment for a fleet box (inference worker or router). Workers need
+    the checkpoint + codec locations; the router only needs the heartbeat
+    prefix. ADVERTISE_ADDR is exported at boot from IMDS (private IP)."""
+    env = {
+        "PYTHONPATH": "/home/ubuntu/app/src",
+        "FLEET_WORKERS_URI": cfg.fleet_workers_uri(fleet_id),
+        "PORT": str(port),
+        "HOST": "0.0.0.0",
+        "MARKET": cfg.fleet_market if role == "worker" else "on-demand",
+        "PYTHONUNBUFFERED": "1",
+    }
+    if role == "worker":
+        env.update(
+            {
+                "WORKER_ID": worker_id,
+                "CHECKPOINT_URI": cfg.run_checkpoint_uri(run_id),
+                "DATA_URI": cfg.data_uri(),
+                "DATASET": cfg.dataset,
+                "DATA_LOCAL_DIR": f"/home/ubuntu/app/third_party/nanoGPT/data/{cfg.dataset}",
+                "RUN_ID": run_id,
+                "DEVICE": "auto",
+            }
+        )
+    return env
+
+
+def build_fleet_user_data(
+    cfg: OrchestratorConfig,
+    *,
+    fleet_id: str,
+    role: str,  # "worker" | "router"
+    worker_id: str = "",
+    run_id: str = "",
+    logs_key: str,
+    port: int,
+) -> str:
+    """Boot one fleet box: provision code (same clone/fast-forward + submodule
+    steps as the trainer), pip-install the fleet deps, then run the worker or
+    router service in the foreground while streaming the boot log to S3.
+
+    Unlike training boxes there is no self-terminate: serving runs until
+    `fleet down` (or a spot reclaim) terminates the instance. A nonzero service
+    exit leaves the box up for debugging — the heartbeat TTL removes a wedged
+    worker from rotation either way."""
+    module = "inference.worker" if role == "worker" else "inference.router"
+    env = _fleet_env(
+        cfg, fleet_id=fleet_id, role=role, worker_id=worker_id, run_id=run_id, port=port
+    )
+    steps = _provision_steps(cfg, _export_block(env))
+    bucket = cfg.bucket
+    interval = cfg.log_stream_seconds
+    return f"""#!/bin/bash
+set -x
+exec > /var/log/spot-train-boot.log 2>&1
+chmod 644 /var/log/spot-train-boot.log
+
+sudo -u ubuntu -i bash <<'BOOT'
+set -x
+cd /home/ubuntu
+
+VENV_PY=/opt/pytorch/bin/python
+[ -x "$VENV_PY" ] || VENV_PY="$(command -v python3)"
+
+# S3 log uploader first, so the whole boot streams to the orchestrator.
+"$VENV_PY" -c "import boto3" 2>/dev/null || "$VENV_PY" -m pip install boto3 2>/dev/null \
+  || "$VENV_PY" -m pip install --user boto3 2>/dev/null || true
+"$VENV_PY" - <<'PY' &
+import time, boto3
+c = boto3.client("s3")
+while True:
+    try:
+        c.upload_file("/var/log/spot-train-boot.log", "{bucket}", "{logs_key}")
+    except Exception:
+        pass
+    time.sleep({interval})
+PY
+UPLOADER_PID=$!
+
+{steps}
+
+# Fleet deps (not in the DLAMI/baked image): FastAPI + uvicorn.
+"$VENV_PY" -c "import fastapi, uvicorn" 2>/dev/null \\
+  || "$VENV_PY" -m pip install fastapi uvicorn \\
+  || "$VENV_PY" -m pip install --user fastapi uvicorn
+
+set +e
+source /home/ubuntu/spot-train.env
+
+# Advertise the private IP so the router (same SG) can dial this box directly.
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \\
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \\
+  http://169.254.169.254/latest/meta-data/local-ipv4)
+export ADVERTISE_ADDR="${{PRIVATE_IP}}:{port}"
+
+"$VENV_PY" -u -m {module} --port {port}
+RC=$?
+
+kill "$UPLOADER_PID" 2>/dev/null || true
+"$VENV_PY" - <<'PY'
+import boto3
+try:
+    boto3.client("s3").upload_file("/var/log/spot-train-boot.log", "{bucket}", "{logs_key}")
+except Exception:
+    pass
+PY
+exit "$RC"
+BOOT
+echo "fleet {role} exited rc=$? — box left up; run 'fleet down' to terminate it"
+"""
+
+
 def build_provisioning_user_data(
     cfg: OrchestratorConfig, *, run_id: str, market: str, max_seconds: int
 ) -> str:

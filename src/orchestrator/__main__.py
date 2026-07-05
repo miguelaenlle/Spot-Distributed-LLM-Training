@@ -67,7 +67,79 @@ def main() -> None:
     cmp_parser = sub.add_parser("compare", parents=[common])
     cmp_parser.add_argument("run_ids", nargs="+", help="run ids to compare (2+ recommended)")
 
+    fleet_parser = sub.add_parser(
+        "fleet", parents=[common], help="inference fleet (ROADMAP Part 1)"
+    )
+    fleet_sub = fleet_parser.add_subparsers(dest="fleet_command", required=True)
+    fleet_common = argparse.ArgumentParser(add_help=False)
+    fleet_common.add_argument(
+        "--local", action="store_true", help="run the fleet as local processes (no AWS)"
+    )
+    fleet_up = fleet_sub.add_parser("up", parents=[common, fleet_common])
+    fleet_up.add_argument("--workers", type=int, default=None, help="default: 2 local, 4 cloud")
+    fleet_up.add_argument(
+        "--run", default="", help="run id whose latest checkpoint the fleet serves (cloud mode)"
+    )
+    fleet_up.add_argument("--router-port", type=int, default=8000)
+    fleet_up.add_argument(
+        "--checkpoint-uri",
+        default="checkpoints/",
+        help="checkpoint dir/prefix the workers serve (local path or s3://)",
+    )
+    fleet_up.add_argument(
+        "--data-local-dir",
+        default="third_party/nanoGPT/data/shakespeare_char",
+        help="dir holding meta.pkl (the char codec)",
+    )
+    fleet_sub.add_parser("status", parents=[common, fleet_common])
+    fleet_sub.add_parser("down", parents=[common, fleet_common])
+    fleet_kill = fleet_sub.add_parser("kill-worker", parents=[common, fleet_common])
+    fleet_kill.add_argument("--worker-id", default=None)
+
     args = parser.parse_args()
+
+    if args.command == "fleet":
+        from . import fleet
+
+        # Local mode needs no AWS credentials or config.
+        if getattr(args, "local", False):
+            if args.fleet_command == "up":
+                fleet.up_local(
+                    workers=args.workers if args.workers is not None else 2,
+                    router_port=args.router_port,
+                    checkpoint_uri=args.checkpoint_uri,
+                    data_local_dir=args.data_local_dir,
+                )
+            elif args.fleet_command == "status":
+                fleet.status_local()
+            elif args.fleet_command == "down":
+                fleet.down_local()
+            elif args.fleet_command == "kill-worker":
+                fleet.kill_worker_local(args.worker_id)
+            return
+
+        # Cloud mode: same creds-after-dotenv discipline as the experiments.
+        from . import aws
+        from .config import OrchestratorConfig
+
+        aws.set_dry_run(args.dry_run)
+        cfg = OrchestratorConfig()
+        aws.set_region(cfg.region)
+        if args.fleet_command == "up":
+            fleet.up_cloud(
+                cfg,
+                workers=args.workers if args.workers is not None else cfg.fleet_worker_count,
+                run_id=args.run,
+            )
+        elif args.fleet_command == "status":
+            fleet.status_cloud(cfg)
+        elif args.fleet_command == "down":
+            fleet.down_cloud(cfg)
+        elif args.fleet_command == "kill-worker":
+            fleet.kill_worker_cloud(cfg, args.worker_id)
+        if args.dry_run:
+            print("\n[dry-run] no AWS calls were made.", file=sys.stderr)
+        return
 
     # Imported after dotenv so config picks up the loaded environment, and so
     # `aws` (the only creds-touching module) is configured before any call.

@@ -23,6 +23,11 @@ out/
 wandb/
 *.log
 
+# Inference fleet (local-mode state + loadgen artifacts)
+.fleet/
+loadgen/loadgen
+loadgen-report.json
+
 # Terraform
 infra/terraform/.terraform/
 *.tfstate

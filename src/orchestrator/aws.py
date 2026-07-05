@@ -188,6 +188,43 @@ def public_ip(instance_id: str) -> str:
     return r["Reservations"][0]["Instances"][0].get("PublicIpAddress", "")
 
 
+def private_ip(instance_id: str) -> str:
+    """Private IPv4 of the instance (intra-SG traffic, e.g. router -> workers)."""
+    if _DRY_RUN:
+        _log(f"describe {instance_id} (private ip)")
+        return "10.0.0.10"
+    r = _client("ec2").describe_instances(InstanceIds=[instance_id])
+    return r["Reservations"][0]["Instances"][0].get("PrivateIpAddress", "")
+
+
+def instances_by_tag(key: str, value: str) -> list[dict[str, str]]:
+    """Non-terminated instances carrying tag ``key=value`` — fleet discovery.
+    Returns [{id, state, type, public_ip, private_ip, tags:{...}}, ...]."""
+    if _DRY_RUN:
+        _log(f"describe-instances tag:{key}={value}")
+        return []
+    r = _client("ec2").describe_instances(
+        Filters=[
+            {"Name": f"tag:{key}", "Values": [value]},
+            {"Name": "instance-state-name", "Values": ["pending", "running", "stopping"]},
+        ]
+    )
+    out = []
+    for res in r["Reservations"]:
+        for inst in res["Instances"]:
+            out.append(
+                {
+                    "id": inst["InstanceId"],
+                    "state": inst["State"]["Name"],
+                    "type": inst["InstanceType"],
+                    "public_ip": inst.get("PublicIpAddress", ""),
+                    "private_ip": inst.get("PrivateIpAddress", ""),
+                    "tags": {t["Key"]: t["Value"] for t in inst.get("Tags", [])},
+                }
+            )
+    return out
+
+
 def instance_az(instance_id: str) -> str:
     """Availability zone the instance landed in (spot prices are per-AZ)."""
     if _DRY_RUN:
@@ -379,6 +416,29 @@ def ensure_security_group(name: str, region: str) -> str:
     return gid
 
 
+def authorize_port(group_id: str, port: int, cidr: str, description: str) -> None:
+    """Idempotently open one TCP port on the group (e.g. the fleet router's
+    public :8000). Same duplicate-tolerant pattern as ensure_security_group."""
+    _log(f"authorize ingress tcp :{port} from {cidr} on {group_id} ({description})")
+    if _DRY_RUN:
+        return
+    try:
+        _client("ec2").authorize_security_group_ingress(
+            GroupId=group_id,
+            IpPermissions=[
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": port,
+                    "ToPort": port,
+                    "IpRanges": [{"CidrIp": cidr, "Description": description}],
+                }
+            ],
+        )
+    except Exception as e:  # noqa: BLE001 — boto ClientError; duplicate rule is fine
+        if "InvalidPermission.Duplicate" not in str(e):
+            raise
+
+
 # --------------------------------------------------------------------------- #
 # Mutating: EC2 lifecycle
 # --------------------------------------------------------------------------- #
@@ -392,8 +452,12 @@ def launch(
     market: str,
     run_id: str,
     key_name: str = "",
+    extra_tags: dict[str, str] | None = None,
 ) -> str:
-    """Launch one instance (on-demand or spot). Returns the instance id."""
+    """Launch one instance (on-demand or spot). Returns the instance id.
+
+    ``extra_tags`` are added to the standard Name/project/market tags (the fleet
+    uses them for discovery); None keeps the original tag set exactly."""
     _log(
         f"RunInstances type={instance_type} market={market} ami={ami_id} "
         f"run_id={run_id} key={key_name or '<none>'} "
@@ -427,6 +491,7 @@ def launch(
                     {"Key": "Name", "Value": f"spot-train-{run_id}"},
                     {"Key": "project", "Value": "spot-train"},
                     {"Key": "market", "Value": market},
+                    *[{"Key": k, "Value": v} for k, v in (extra_tags or {}).items()],
                 ],
             }
         ],

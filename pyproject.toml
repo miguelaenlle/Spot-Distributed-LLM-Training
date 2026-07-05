@@ -22,6 +22,12 @@ dev = [
     "pytest",
     "ruff",
     "mypy",
+    "httpx",  # fastapi TestClient transport (fleet API tests)
+]
+# Inference fleet (ROADMAP Part 1): worker + router services.
+fleet = [
+    "fastapi",
+    "uvicorn",
 ]
 # Optional visualization: the orchestrator mirrors each run's profile (timeline +
 # loss) to Weights & Biases. Not a core dep — runs write S3 profile.json without it.
@@ -33,6 +39,8 @@ viz = [
 [project.scripts]
 spot-train = "spot_train.train:main"
 spot-orchestrate = "orchestrator.__main__:main"
+spot-worker = "inference.worker:main"
+spot-router = "inference.router:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

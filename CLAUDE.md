@@ -11,9 +11,12 @@ Training SOTA LLMs on multiple GPU nodes is expensive.
 Reduce the cost using **spot instances** — accept preemption as normal and
 engineer the training loop + control plane to survive it.
 
-- **Phase 1:** Spot instances on AWS.
-- **Phase 2:** Spot instances on AWS, Lambda, and RunPod (heterogeneous,
-  spot-distributed training).
+- **Phase 1 (training foundation):** Spot instances on AWS.
+- **OptiTrain (current plan of record: [ROADMAP.md](./ROADMAP.md)):** a unified
+  platform — pretrain on spot, RL-finetune, and serve at scale — orchestrated
+  by Go/K8s with a static Firebase frontend and a minimal admin backend. This
+  supersedes the old "Phase 2" (heterogeneous AWS + Lambda + RunPod), which is
+  deferred as possible future work.
 
 ## Goals
 
@@ -23,7 +26,7 @@ engineer the training loop + control plane to survive it.
 | **1b** | Train NanoGPT on AWS spot — **1 node, 4 GPUs** — successfully handling preemption. |
 | **1c** | On-demand baseline: NanoGPT on 4 nodes × 4 GPUs/node takes time **T** and cost **C**. Train on AWS **spot** with N nodes, X GPUs/node in time **T** for **less than C**. |
 | **1d** | Same as 1c but a real **Llama-arch** model. |
-| **2**  | Train a Llama model on **heterogeneous spot** (AWS + RunPod), actively waiting for hardware availability. |
+| **OptiTrain 1–7** | Inference fleet (Python → Go/K8s, spot, stress-tested) · RL finetuning (GRPO toy → ~1B → disaggregated rollout fleet) · unified platform (cloud control plane + Firebase FE + minimal admin backend). Details: [ROADMAP.md](./ROADMAP.md). |
 
 ## Guiding principles
 
@@ -45,7 +48,19 @@ engineer the training loop + control plane to survive it.
 
 ---
 
-## Phase 1a — detailed plan (current focus)
+## Current focus
+
+**OptiTrain Part 1 — inference fleet MVP (Python) + Go load generator.** See
+[ROADMAP.md](./ROADMAP.md) for the full part-by-part plan; Parts 1–2 are at
+implementation depth there. The training track below (1a onward) is built and
+cloud-proven through multi-node spot preemption (single-node, DDP, and
+multinode kill/resume experiments all run; cost ledger + run profiles in
+place); the Go supervisor and the 1c headline comparison remain open and are
+absorbed into ROADMAP Parts 3/7.
+
+---
+
+## Phase 1a — detailed plan (done; kept for reference)
 
 **Shape:** a **local orchestrator** (`src/orchestrator/`, boto3) drives AWS and
 runs two experiments; a **remote trainer** (`src/spot_train/`) runs on the GPU
@@ -137,7 +152,8 @@ Kept **deliberately minimal** — only what Phase 1a needs. Later phases add the
 own folders when they start (see "added later").
 
 ```
-CLAUDE.md              # this file — the plan of record
+CLAUDE.md              # this file — working guidance + guiding principles
+ROADMAP.md             # OptiTrain roadmap — the plan of record for new work
 README.md              # public overview
 pyproject.toml         # src-layout; scripts: spot-train, spot-orchestrate
 .env.example           # AWS creds/bucket template → copy to git-ignored .env
@@ -166,8 +182,12 @@ tests/                 # checkpoint/resume tests
 
 # S3 layout (created at runtime): data/<dataset>/{train,val}.bin,meta.pkl
 #                                  runs/<run_id>/checkpoints/  +  metrics.json
+# current phase (ROADMAP Part 1) adds: src/inference/ (worker + router),
+#   src/orchestrator/fleet.py, loadgen/ (Go load generator, own go.mod)
 # added later (do not create until the phase begins):
-#   supervisor/  — Go control plane (observe/compare/act)      (Phase 1c)
+#   src/spot_train/rl/ + rl_train.py — GRPO finetuning        (ROADMAP Part 2)
+#   router-go/, deploy/ — Go router + K8s manifests           (ROADMAP Part 3)
+#   supervisor/  — Go control plane (observe/compare/act)     (ROADMAP Parts 3/7)
 ```
 
 The nanoGPT submodule is pinned; contributors run
@@ -179,7 +199,8 @@ The nanoGPT submodule is pinned; contributors run
   `pip install -e .`.
 - Prefer running the CPU determinism test before any cloud work:
   `pytest tests/test_kill_resume.py`.
-- Keep the Go supervisor untouched until Phase 1c; it has its own module.
+- Go code (`loadgen/` now; `router-go/`, `supervisor/` later) lives in its own
+  modules with their own `go.mod`; ruff/pyproject govern Python only.
 
 ### Linting / formatting (ruff)
 

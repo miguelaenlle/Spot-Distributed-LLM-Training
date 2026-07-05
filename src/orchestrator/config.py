@@ -208,6 +208,23 @@ class OrchestratorConfig:
     # back to a whole-group restart.
     recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 600))
 
+    # --- inference fleet (ROADMAP Part 1) ------------------------------------
+    # CPU instances by default: the 10M-param model serves fine on CPU, and
+    # C/T-family spot draws on the "standard" spot quota, not the G quota.
+    fleet_worker_count: int = field(default_factory=lambda: _env_int("FLEET_WORKERS", 4))
+    fleet_worker_instance_type: str = field(
+        default_factory=lambda: _env("FLEET_WORKER_INSTANCE_TYPE", "c7i.large")
+    )
+    fleet_router_instance_type: str = field(
+        default_factory=lambda: _env("FLEET_ROUTER_INSTANCE_TYPE", "t3.small")
+    )
+    fleet_market: str = field(default_factory=lambda: _env("FLEET_MARKET", "spot"))
+    fleet_router_port: int = field(default_factory=lambda: _env_int("FLEET_ROUTER_PORT", 8000))
+    fleet_worker_port: int = field(default_factory=lambda: _env_int("FLEET_WORKER_PORT", 8001))
+    # Who may reach the router's public port. Default is open (toy model, short
+    # experiments); set FLEET_INGRESS_CIDR=<your-ip>/32 to tighten.
+    fleet_ingress_cidr: str = field(default_factory=lambda: _env("FLEET_INGRESS_CIDR", "0.0.0.0/0"))
+
     # --- vCPU quota gate ------------------------------------------------------
     # The account's "Running On-Demand G and VT instances" vCPU quota. Launches
     # wait until running+pending G/VT usage leaves headroom under this before
@@ -304,6 +321,17 @@ class OrchestratorConfig:
     # of doing local wall-clock arithmetic.
     def run_budget_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/budget.json"
+
+    # Inference-fleet keys: heartbeat docs the router polls, per-box boot logs,
+    # and a state doc recording which instances belong to the fleet.
+    def fleet_workers_uri(self, fleet_id: str) -> str:
+        return f"s3://{self.bucket}/fleet/{fleet_id}/workers/"
+
+    def fleet_logs_key(self, fleet_id: str, name: str) -> str:
+        return f"fleet/{fleet_id}/logs/{name}.log"
+
+    def fleet_state_key(self, fleet_id: str) -> str:
+        return f"fleet/{fleet_id}/fleet.json"
 
     # AMI-bake control keys: the bake box writes status.json (ok/rc/commit) when
     # provisioning finishes and streams its boot log next to it.
