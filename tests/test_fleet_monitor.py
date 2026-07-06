@@ -86,6 +86,20 @@ def test_flatten_metrics_shapes_wandb_keys():
     assert flat["workers/w1/ok"] == 0.0
     assert "workers/w1/queued" not in flat  # down worker reports no gauges
     assert flat["router/live_workers"] == 2
+    assert "workers/w0/gpu_util" not in flat  # CPU worker: no GPU keys
+
+
+def test_flatten_and_render_include_gpu_when_present():
+    from orchestrator.monitor import render_frame
+
+    gpu_worker = {**_worker("w0", queued=1), "gpu_util": 87, "gpu_mem_used_mb": 1234}
+    cur = _sample(100.0, [gpu_worker])
+    flat = flatten_metrics(cur, {"w0": {"rps": 1.0, "tok_s": 32.0, "util": 0.4}})
+    assert flat["workers/w0/gpu_util"] == 87
+    assert flat["workers/w0/gpu_mem_mb"] == 1234
+    frame = render_frame("http://x:8000", cur, {"w0": {}}, 2.0)
+    assert "87%" in frame
+    assert "1234MB" in frame
 
 
 def test_router_scrape_marks_dead_workers():

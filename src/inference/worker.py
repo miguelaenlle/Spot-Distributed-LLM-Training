@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from spot_train.config import TrainConfig
 
 from . import registry
-from .service import ModelService, PromptError
+from .service import ModelService, PromptError, gpu_stats
 
 
 @dataclass
@@ -119,6 +119,7 @@ def create_app(service: ModelService, settings: WorkerSettings | None = None) ->
             "model": service.model_name,
             "device": service.device,
             **service.stats.snapshot(),
+            **gpu_stats(),
         }
 
     @app.post("/v1/completions")

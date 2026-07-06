@@ -64,6 +64,10 @@ def flatten_metrics(cur: dict, rates: dict[str, dict]) -> dict[str, float]:
             out[f"workers/{wid}/rps"] = round(rate.get("rps", 0.0), 3)
             out[f"workers/{wid}/tok_s"] = round(rate.get("tok_s", 0.0), 1)
             out[f"workers/{wid}/util"] = round(rate.get("util", 0.0), 3)
+            if "gpu_util" in w:
+                out[f"workers/{wid}/gpu_util"] = w["gpu_util"]
+            if "gpu_mem_used_mb" in w:
+                out[f"workers/{wid}/gpu_mem_mb"] = w["gpu_mem_used_mb"]
     return out
 
 
@@ -77,18 +81,23 @@ def render_frame(url: str, cur: dict, rates: dict[str, dict], interval: float) -
         ),
         "",
         f"{'worker':<28} {'state':<6} {'queued':>6} {'inflt':>5} "
-        f"{'req/s':>6} {'tok/s':>7} {'util':>5}",
+        f"{'req/s':>6} {'tok/s':>7} {'util':>5} {'gpu':>5} {'vram':>8}",
     ]
     for w in cur["workers"]:
         wid = w["worker_id"]
         if not w.get("ok"):
-            lines.append(f"{wid:<28} {'DOWN':<6} {'-':>6} {'-':>5} {'-':>6} {'-':>7} {'-':>5}")
+            lines.append(
+                f"{wid:<28} {'DOWN':<6} {'-':>6} {'-':>5} {'-':>6} {'-':>7} "
+                f"{'-':>5} {'-':>5} {'-':>8}"
+            )
             continue
         rate = rates.get(wid, {})
+        gpu = f"{w['gpu_util']:>4.0f}%" if "gpu_util" in w else f"{'-':>5}"
+        vram = f"{w['gpu_mem_used_mb']:>6}MB" if "gpu_mem_used_mb" in w else f"{'-':>8}"
         lines.append(
             f"{wid:<28} {'ok':<6} {w.get('queued', 0):>6} {w.get('in_flight', 0):>5} "
             f"{rate.get('rps', 0.0):>6.1f} {rate.get('tok_s', 0.0):>7.1f} "
-            f"{rate.get('util', 0.0) * 100:>4.0f}%"
+            f"{rate.get('util', 0.0) * 100:>4.0f}% {gpu} {vram}"
         )
     if not cur["workers"]:
         lines.append("(no worker stats yet — first scrape lands within a few seconds)")

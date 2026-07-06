@@ -10,6 +10,7 @@ with vLLM in ROADMAP Part 4).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pickle
 import shutil
@@ -55,6 +56,22 @@ def resolve_device(device: str) -> str:
     if device == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     return device
+
+
+def gpu_stats() -> dict:
+    """Best-effort GPU telemetry for /stats. Empty dict on CPU boxes; memory
+    works everywhere CUDA does; utilization needs pynvml (present on the
+    DLAMI) and is skipped silently if unavailable."""
+    if not torch.cuda.is_available():
+        return {}
+    out: dict = {}
+    with contextlib.suppress(Exception):
+        free, total = torch.cuda.mem_get_info()
+        out["gpu_mem_used_mb"] = round((total - free) / 1e6)
+        out["gpu_mem_total_mb"] = round(total / 1e6)
+    with contextlib.suppress(Exception):
+        out["gpu_util"] = torch.cuda.utilization()  # % over the last sample window
+    return out
 
 
 @dataclass
