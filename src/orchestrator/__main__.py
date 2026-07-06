@@ -67,7 +67,148 @@ def main() -> None:
     cmp_parser = sub.add_parser("compare", parents=[common])
     cmp_parser.add_argument("run_ids", nargs="+", help="run ids to compare (2+ recommended)")
 
+    fleet_parser = sub.add_parser(
+        "fleet", parents=[common], help="inference fleet (ROADMAP Part 1)"
+    )
+    fleet_sub = fleet_parser.add_subparsers(dest="fleet_command", required=True)
+    fleet_common = argparse.ArgumentParser(add_help=False)
+    fleet_common.add_argument(
+        "--local", action="store_true", help="run the fleet as local processes (no AWS)"
+    )
+    fleet_up = fleet_sub.add_parser("up", parents=[common, fleet_common])
+    fleet_up.add_argument("--workers", type=int, default=None, help="default: 2 local, 4 cloud")
+    fleet_up.add_argument(
+        "--run", default="", help="run id whose latest checkpoint the fleet serves (cloud mode)"
+    )
+    fleet_up.add_argument("--router-port", type=int, default=8000)
+    fleet_up.add_argument(
+        "--checkpoint-uri",
+        default="checkpoints/",
+        help="checkpoint dir/prefix the workers serve (local path or s3://)",
+    )
+    fleet_up.add_argument(
+        "--data-local-dir",
+        default="third_party/nanoGPT/data/shakespeare_char",
+        help="dir holding meta.pkl (the char codec)",
+    )
+    fleet_serve = fleet_sub.add_parser(
+        "serve",
+        parents=[common],
+        help="minimal cloud serve: ONE box, no router — curl it directly",
+    )
+    fleet_serve.add_argument("--run", required=True, help="run id whose latest checkpoint to serve")
+    fleet_sub.add_parser("status", parents=[common, fleet_common])
+    fleet_sub.add_parser("down", parents=[common, fleet_common])
+    fleet_kill = fleet_sub.add_parser("kill-worker", parents=[common, fleet_common])
+    fleet_kill.add_argument("--worker-id", default=None)
+    fleet_mon = fleet_sub.add_parser(
+        "monitor",
+        parents=[common, fleet_common],
+        help="live per-worker queue/load table; --wandb mirrors it",
+    )
+    fleet_mon.add_argument("--url", default="", help="router base URL (default: discover)")
+    fleet_mon.add_argument("--interval", type=float, default=2.0)
+    fleet_mon.add_argument("--wandb", action="store_true", help="mirror ticks to Weights & Biases")
+    fleet_pre = fleet_sub.add_parser(
+        "preempt",
+        parents=[common, fleet_common],
+        help="preemption experiment: calibrated load, kill one worker, latency verdict",
+    )
+    fleet_pre.add_argument("--run", default="", help="run id to serve if the fleet must be booted")
+    fleet_pre.add_argument("--workers", type=int, default=None, help="only used when booting")
+    fleet_pre.add_argument("--duration", type=int, default=150, help="loadgen seconds")
+    fleet_pre.add_argument("--kill-after", type=int, default=60, help="kill timing (seconds)")
+    fleet_pre.add_argument("--rps", type=float, default=0.0, help="0 = auto-calibrate to 70%%")
+    fleet_pre.add_argument(
+        "--keep", action="store_true", help="don't tear down a fleet this experiment booted"
+    )
+
     args = parser.parse_args()
+
+    if args.command == "fleet":
+        from . import fleet
+
+        if args.fleet_command == "preempt":
+            from . import aws, fleet_preempt
+            from .config import OrchestratorConfig
+
+            aws.set_dry_run(args.dry_run)
+            cfg = OrchestratorConfig()
+            aws.set_region(cfg.region)
+            fleet_preempt.run_fleet_preempt(
+                cfg,
+                local=args.local,
+                run_id=args.run,
+                workers=args.workers,
+                duration=args.duration,
+                kill_after=args.kill_after,
+                rps=args.rps,
+                keep=args.keep,
+            )
+            if args.dry_run:
+                print("\n[dry-run] no AWS calls were made.", file=sys.stderr)
+            return
+
+        if args.fleet_command == "monitor":
+            from . import monitor
+            from .config import OrchestratorConfig
+
+            cfg = OrchestratorConfig()
+            url = args.url
+            if not url and getattr(args, "local", False):
+                url = fleet.router_url_local()
+            elif not url:
+                from . import aws
+
+                aws.set_dry_run(args.dry_run)
+                aws.set_region(cfg.region)
+                url = fleet.router_url_cloud(cfg)
+            if not url:
+                sys.exit("fleet monitor: no running router found — pass --url or start a fleet")
+            monitor.run_monitor(cfg, url, interval=args.interval, use_wandb=args.wandb)
+            return
+
+        # Local mode needs no AWS credentials or config.
+        if getattr(args, "local", False):
+            if args.fleet_command == "up":
+                fleet.up_local(
+                    workers=args.workers if args.workers is not None else 2,
+                    router_port=args.router_port,
+                    checkpoint_uri=args.checkpoint_uri,
+                    data_local_dir=args.data_local_dir,
+                )
+            elif args.fleet_command == "status":
+                fleet.status_local()
+            elif args.fleet_command == "down":
+                fleet.down_local()
+            elif args.fleet_command == "kill-worker":
+                fleet.kill_worker_local(args.worker_id)
+            return
+
+        # Cloud mode: same creds-after-dotenv discipline as the experiments.
+        from . import aws
+        from .config import OrchestratorConfig
+
+        aws.set_dry_run(args.dry_run)
+        cfg = OrchestratorConfig()
+        aws.set_region(cfg.region)
+        if args.fleet_command == "serve":
+            fleet.serve_cloud(cfg, run_id=args.run)
+        elif args.fleet_command == "up":
+            fleet.up_cloud(
+                cfg,
+                workers=args.workers if args.workers is not None else cfg.fleet_worker_count,
+                run_id=args.run,
+            )
+        elif args.fleet_command == "status":
+            fleet.status_cloud(cfg)
+        elif args.fleet_command == "down":
+            fleet.down_cloud(cfg)
+        elif args.fleet_command == "kill-worker":
+            fleet.kill_worker_cloud(cfg, args.worker_id)
+        if args.dry_run:
+            print("\n[dry-run] no AWS calls were made.", file=sys.stderr)
+        return
 
     # Imported after dotenv so config picks up the loaded environment, and so
     # `aws` (the only creds-touching module) is configured before any call.
