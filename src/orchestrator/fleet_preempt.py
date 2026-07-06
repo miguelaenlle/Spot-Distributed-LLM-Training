@@ -155,17 +155,25 @@ def _calibrate(url: str, live_workers: int) -> float:
             timeout=60,
         ).raise_for_status()
 
-    one()  # warmup (first request pays model/threadpool init)
-    n = 2 * max(live_workers, 1)
+    # Warm EVERY worker before timing: round-robin spreads sequential requests
+    # across the fleet, and each worker's first generate pays one-time init
+    # (CUDA context, kernel autotune). 2x live makes it robust to a retry
+    # skewing the rotation. Without this, cold workers deflate the measured
+    # capacity and the "moderate-heavy" load ends up light (observed: a T4
+    # fleet calibrated at ~2 rps vs ~12 rps actual).
+    live = max(live_workers, 1)
+    for _ in range(2 * live):
+        one()
+    n = 4 * live
     t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=max(live_workers, 1)) as pool:
+    with ThreadPoolExecutor(max_workers=live) as pool:
         for f in [pool.submit(one) for _ in range(n)]:
             f.result()
     elapsed = max(time.monotonic() - t0, 1e-3)
     capacity = n / elapsed
     rps = max(round(0.7 * capacity, 1), 0.5)
     print(
-        f"[preempt] calibration: {n} concurrent reqs in {elapsed:.1f}s "
+        f"[preempt] calibration: {n} concurrent reqs in {elapsed:.1f}s (after {2 * live} warmup) "
         f"=> capacity ~{capacity:.1f} rps => offering {rps} rps (70%)"
     )
     return rps
