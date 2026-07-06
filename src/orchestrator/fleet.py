@@ -435,6 +435,21 @@ def _wait_cloud_ready(endpoint: str, expect_workers: int, timeout: float = 900.0
     )
 
 
+def router_url_local() -> str | None:
+    state = _read_state()
+    if state is None:
+        return None
+    return f"http://127.0.0.1:{state['router']['port']}"
+
+
+def router_url_cloud(cfg: OrchestratorConfig) -> str | None:
+    _, routers = _discover(cfg)
+    for r in routers:
+        if r["state"] == "running" and r["public_ip"]:
+            return f"http://{r['public_ip']}:{cfg.fleet_router_port}"
+    return None
+
+
 def status_cloud(cfg: OrchestratorConfig) -> None:
     workers, routers = _discover(cfg)
     if not workers and not routers:

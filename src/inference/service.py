@@ -63,7 +63,18 @@ class ServiceStats:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     generate_seconds: float = 0.0
+    # Gauge: requests inside complete() right now. Generation is serialized
+    # behind a lock, so at most one is generating — the rest are the queue.
+    in_flight: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def enter(self) -> None:
+        with self._lock:
+            self.in_flight += 1
+
+    def leave(self) -> None:
+        with self._lock:
+            self.in_flight -= 1
 
     def record(self, prompt_tokens: int, completion_tokens: int, seconds: float) -> None:
         with self._lock:
@@ -81,6 +92,8 @@ class ServiceStats:
                 "completion_tokens": self.completion_tokens,
                 "generate_seconds": round(self.generate_seconds, 3),
                 "tokens_per_second": round(tok_s, 1),
+                "in_flight": self.in_flight,
+                "queued": max(self.in_flight - 1, 0),
             }
 
 
@@ -151,14 +164,19 @@ class ModelService:
         idx = torch.tensor(ids, dtype=torch.long, device=self.device)[None, ...]
         temperature = max(float(temperature), 1e-5)
 
-        start = time.monotonic()
-        with self._gen_lock:
-            if seed is not None:
-                torch.manual_seed(seed)
-            out = self.model.generate(
-                idx, max_new_tokens, temperature=temperature, top_k=top_k or None
-            )
-        elapsed = time.monotonic() - start
+        # Gauge covers the wait on the lock too: in_flight - 1 = queue depth.
+        self.stats.enter()
+        try:
+            start = time.monotonic()
+            with self._gen_lock:
+                if seed is not None:
+                    torch.manual_seed(seed)
+                out = self.model.generate(
+                    idx, max_new_tokens, temperature=temperature, top_k=top_k or None
+                )
+            elapsed = time.monotonic() - start
+        finally:
+            self.stats.leave()
 
         completion_ids = out[0, len(ids) :].tolist()
         completion = self.decode(completion_ids)

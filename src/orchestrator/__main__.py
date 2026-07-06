@@ -101,11 +101,38 @@ def main() -> None:
     fleet_sub.add_parser("down", parents=[common, fleet_common])
     fleet_kill = fleet_sub.add_parser("kill-worker", parents=[common, fleet_common])
     fleet_kill.add_argument("--worker-id", default=None)
+    fleet_mon = fleet_sub.add_parser(
+        "monitor",
+        parents=[common, fleet_common],
+        help="live per-worker queue/load table; --wandb mirrors it",
+    )
+    fleet_mon.add_argument("--url", default="", help="router base URL (default: discover)")
+    fleet_mon.add_argument("--interval", type=float, default=2.0)
+    fleet_mon.add_argument("--wandb", action="store_true", help="mirror ticks to Weights & Biases")
 
     args = parser.parse_args()
 
     if args.command == "fleet":
         from . import fleet
+
+        if args.fleet_command == "monitor":
+            from . import monitor
+            from .config import OrchestratorConfig
+
+            cfg = OrchestratorConfig()
+            url = args.url
+            if not url and getattr(args, "local", False):
+                url = fleet.router_url_local()
+            elif not url:
+                from . import aws
+
+                aws.set_dry_run(args.dry_run)
+                aws.set_region(cfg.region)
+                url = fleet.router_url_cloud(cfg)
+            if not url:
+                sys.exit("fleet monitor: no running router found — pass --url or start a fleet")
+            monitor.run_monitor(cfg, url, interval=args.interval, use_wandb=args.wandb)
+            return
 
         # Local mode needs no AWS credentials or config.
         if getattr(args, "local", False):

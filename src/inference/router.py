@@ -37,6 +37,7 @@ class RouterSettings:
     ttl_seconds: float = registry.DEFAULT_TTL_SECONDS
     request_timeout_seconds: float = 60.0
     max_attempts: int = 3
+    stats_poll_seconds: float = 2.0  # per-worker /stats scrape cadence (live monitor)
 
     @classmethod
     def from_env(cls, port: int | None = None) -> RouterSettings:
@@ -48,6 +49,7 @@ class RouterSettings:
             ttl_seconds=float(os.environ.get("WORKER_TTL_SECONDS", "15")),
             request_timeout_seconds=float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "60")),
             max_attempts=int(os.environ.get("ROUTER_MAX_ATTEMPTS", "3")),
+            stats_poll_seconds=float(os.environ.get("ROUTER_STATS_POLL_SECONDS", "2")),
         )
 
 
@@ -119,13 +121,29 @@ class RouterState:
     requests: int = 0
     rerouted: int = 0
     failed: int = 0
+    in_flight: int = 0  # gauge: requests currently being proxied
     last_poll: float = 0.0
+    worker_stats: list[dict] = field(default_factory=list)  # last /stats scrape per worker
+    stats_ts: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set_workers(self, docs: list[dict]) -> None:
         with self._lock:
             self.workers = docs
             self.last_poll = time.time()
+
+    def set_worker_stats(self, stats: list[dict]) -> None:
+        with self._lock:
+            self.worker_stats = stats
+            self.stats_ts = time.time()
+
+    def enter(self) -> None:
+        with self._lock:
+            self.in_flight += 1
+
+    def leave(self) -> None:
+        with self._lock:
+            self.in_flight -= 1
 
     def next_start(self, n: int) -> int:
         with self._lock:
@@ -151,6 +169,31 @@ def _poll_loop(state: RouterState, settings: RouterSettings, stop: threading.Eve
         stop.wait(settings.poll_seconds)
 
 
+def scrape_worker_stats(workers: list[dict], get: Callable[[str], dict]) -> list[dict]:
+    """One monitoring sweep: ``get`` fetches http://<addr>/stats (injected for
+    tests). A worker that errors still appears, with ok=False — the monitor
+    shows it dying rather than silently dropping it."""
+    out = []
+    for w in workers:
+        doc = {"worker_id": w.get("worker_id", ""), "addr": w.get("addr", ""), "ok": True}
+        try:
+            doc.update(get(w["addr"]))
+        except Exception as e:
+            doc["ok"] = False
+            doc["error"] = str(e)[:120]
+        out.append(doc)
+    return out
+
+
+def _stats_loop(state: RouterState, settings: RouterSettings, stop: threading.Event):
+    def get(addr: str) -> dict:
+        return requests.get(f"http://{addr}/stats", timeout=1.5).json()
+
+    while not stop.is_set():
+        state.set_worker_stats(scrape_worker_stats(list(state.workers), get))
+        stop.wait(settings.stats_poll_seconds)
+
+
 def create_app(settings: RouterSettings | None = None, state: RouterState | None = None) -> FastAPI:
     settings = settings or RouterSettings.from_env()
     state = state or RouterState()
@@ -161,6 +204,7 @@ def create_app(settings: RouterSettings | None = None, state: RouterState | None
         if not settings.workers_uri:
             print("[router] WARNING: FLEET_WORKERS_URI unset — no workers will be found")
         threading.Thread(target=_poll_loop, args=(state, settings, stop), daemon=True).start()
+        threading.Thread(target=_stats_loop, args=(state, settings, stop), daemon=True).start()
         yield
         stop.set()
 
@@ -196,13 +240,34 @@ def create_app(settings: RouterSettings | None = None, state: RouterState | None
             "last_poll": state.last_poll,
         }
 
+    @app.get("/fleet/metrics")
+    def fleet_metrics():
+        """Live aggregate for the fleet monitor: router counters + the latest
+        per-worker /stats scrape (queue depth, tokens, in-flight)."""
+        return {
+            "ts": time.time(),
+            "router": {
+                "live_workers": len(state.workers),
+                "in_flight": state.in_flight,
+                "requests": state.requests,
+                "rerouted": state.rerouted,
+                "failed": state.failed,
+            },
+            "workers": state.worker_stats,
+            "stats_ts": state.stats_ts,
+        }
+
     @app.post("/v1/completions")
     def completions(body: dict):
         workers = list(state.workers)
         start = state.next_start(len(workers)) if workers else 0
-        result = route_completion(
-            body, workers, _post, start_index=start, max_attempts=settings.max_attempts
-        )
+        state.enter()
+        try:
+            result = route_completion(
+                body, workers, _post, start_index=start, max_attempts=settings.max_attempts
+            )
+        finally:
+            state.leave()
         state.record(result)
         if result.status_code == 503:
             raise HTTPException(status_code=503, detail=result.detail)
