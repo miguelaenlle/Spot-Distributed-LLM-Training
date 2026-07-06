@@ -36,6 +36,11 @@ class RouterSettings:
     poll_seconds: float = 3.0
     ttl_seconds: float = registry.DEFAULT_TTL_SECONDS
     request_timeout_seconds: float = 60.0
+    # Separate connect timeout: a terminating EC2 box black-holes packets (no
+    # RST), and a flat 60s timeout would hold rerouted requests hostage. 3s
+    # connect keeps reroute latency bounded while long generations still get
+    # the full read window.
+    connect_timeout_seconds: float = 3.0
     max_attempts: int = 3
     stats_poll_seconds: float = 2.0  # per-worker /stats scrape cadence (live monitor)
 
@@ -48,6 +53,7 @@ class RouterSettings:
             poll_seconds=float(os.environ.get("ROUTER_POLL_SECONDS", "3")),
             ttl_seconds=float(os.environ.get("WORKER_TTL_SECONDS", "15")),
             request_timeout_seconds=float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "60")),
+            connect_timeout_seconds=float(os.environ.get("ROUTER_CONNECT_TIMEOUT_SECONDS", "3")),
             max_attempts=int(os.environ.get("ROUTER_MAX_ATTEMPTS", "3")),
             stats_poll_seconds=float(os.environ.get("ROUTER_STATS_POLL_SECONDS", "2")),
         )
@@ -215,7 +221,7 @@ def create_app(settings: RouterSettings | None = None, state: RouterState | None
             r = requests.post(
                 f"http://{addr}/v1/completions",
                 json=body,
-                timeout=settings.request_timeout_seconds,
+                timeout=(settings.connect_timeout_seconds, settings.request_timeout_seconds),
             )
         except requests.RequestException as e:
             raise UpstreamError(str(e)) from e

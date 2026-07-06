@@ -109,11 +109,45 @@ def main() -> None:
     fleet_mon.add_argument("--url", default="", help="router base URL (default: discover)")
     fleet_mon.add_argument("--interval", type=float, default=2.0)
     fleet_mon.add_argument("--wandb", action="store_true", help="mirror ticks to Weights & Biases")
+    fleet_pre = fleet_sub.add_parser(
+        "preempt",
+        parents=[common, fleet_common],
+        help="preemption experiment: calibrated load, kill one worker, latency verdict",
+    )
+    fleet_pre.add_argument("--run", default="", help="run id to serve if the fleet must be booted")
+    fleet_pre.add_argument("--workers", type=int, default=None, help="only used when booting")
+    fleet_pre.add_argument("--duration", type=int, default=150, help="loadgen seconds")
+    fleet_pre.add_argument("--kill-after", type=int, default=60, help="kill timing (seconds)")
+    fleet_pre.add_argument("--rps", type=float, default=0.0, help="0 = auto-calibrate to 70%%")
+    fleet_pre.add_argument(
+        "--keep", action="store_true", help="don't tear down a fleet this experiment booted"
+    )
 
     args = parser.parse_args()
 
     if args.command == "fleet":
         from . import fleet
+
+        if args.fleet_command == "preempt":
+            from . import aws, fleet_preempt
+            from .config import OrchestratorConfig
+
+            aws.set_dry_run(args.dry_run)
+            cfg = OrchestratorConfig()
+            aws.set_region(cfg.region)
+            fleet_preempt.run_fleet_preempt(
+                cfg,
+                local=args.local,
+                run_id=args.run,
+                workers=args.workers,
+                duration=args.duration,
+                kill_after=args.kill_after,
+                rps=args.rps,
+                keep=args.keep,
+            )
+            if args.dry_run:
+                print("\n[dry-run] no AWS calls were made.", file=sys.stderr)
+            return
 
         if args.fleet_command == "monitor":
             from . import monitor

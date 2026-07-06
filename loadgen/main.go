@@ -69,6 +69,7 @@ type secondBucket struct {
 
 type report struct {
 	URL          string         `json:"url"`
+	StartUnix    float64        `json:"start_unix"` // aligns per-second buckets with external events
 	RPS          float64        `json:"rps"`
 	Concurrency  int            `json:"concurrency"`
 	DurationSec  float64        `json:"duration_s"`
@@ -133,6 +134,7 @@ func main() {
 	rep := <-collectorDone
 
 	rep.URL = cfg.url
+	rep.StartUnix = float64(start.UnixMilli()) / 1000.0
 	rep.RPS = cfg.rps
 	rep.Concurrency = cfg.concurrency
 	rep.Dropped = dropped
