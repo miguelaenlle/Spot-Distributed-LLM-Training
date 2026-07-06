@@ -1,4 +1,4 @@
-# Spot-Distributed LLM Training → OptiTrain
+# OptiTrain
 
 Training SOTA LLMs on multiple GPU nodes is expensive. This project cuts the
 cost by running on **spot instances** and engineering the training stack to
