@@ -116,6 +116,13 @@ def latest(uri: str) -> str | None:
     return _s3_latest(uri) if is_s3(uri) else _local_latest(uri)
 
 
+def ref_for(uri: str, name: str) -> str:
+    """The ref of object ``name`` under prefix/dir ``uri`` (existence not checked)."""
+    if is_s3(uri):
+        return uri.rstrip("/") + "/" + name
+    return os.path.join(uri, name)
+
+
 def download(ref: str, verify: bool = True) -> str:
     """Return a local path for ``ref``. For S3, download to a temp file (and let
     S3/boto3 validate the SHA-256 when ``verify``). For local, ``ref`` already is

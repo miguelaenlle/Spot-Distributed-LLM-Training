@@ -117,13 +117,24 @@ MVP (invariant: loss continues from the checkpoint).
 - **1b — 1 node, 4 GPUs:** add `torchrun` + DDP; adopt the elastic agent so
   survivors re-rendezvous when one process dies. Rendezvous is local, so no
   coordinator box yet. Same resume test, now across a DDP restart.
-- **1c — multi-node spot + Go supervisor:** 4 nodes × 4 GPUs over the network;
-  rendezvous store on a dedicated on-demand `t3.micro`. Build the Go control
-  plane (**observe / compare / act**: watch health, launch replacement spot
-  nodes, re-rendezvous). Add async two-tier checkpointing. **Headline
-  experiment:** on-demand baseline vs. spot to the same target loss for under
-  **C** within **(1+ε)·T**; report goodput, recovery time, lost work,
-  idle-wait.
+- **1c — multi-node ELASTIC spot (current):** N ≤ 8 nodes via torchrun elastic
+  (`--nnodes=N-1:N`, c10d store on node 0, endpoint published once via S3
+  rdzv.json). **Survivors keep training at world N−1 while a dead node is
+  replaced** — ~40–60s downtime per membership change instead of the full
+  replacement boot. Constant global batch via gradient accumulation
+  (`GLOBAL_BATCH_SIZE`; K recomputed per world size); two-tier checkpoints
+  (step-aligned node-local disk for instant survivor restores + rank-0 async
+  S3 for replacements; group-MIN agreement picks the resume step); the run
+  budget rides in the checkpoint (`TRAIN_BUDGET_SECONDS` − `trained_seconds`,
+  so downtime is never billed). The orchestrator watchdog is two-phase per
+  kill (shrink_resume ≤ 180s → full_world ≤ 600s), whole-group restart as
+  fallback (also the node-0-death path — the store dies with it). W&B mirrors
+  the world-size staircase next to the loss curve, plus goodput. Details:
+  docs/multinode-design.md. Still open in 1c: dedicated `t3.micro` rendezvous
+  store (makes node 0 killable), the Go control plane (**observe / compare /
+  act**). **Headline experiment:** on-demand baseline vs. spot to the same
+  target loss for under **C** within **(1+ε)·T**; report goodput, recovery
+  time, lost work, idle-wait.
 - **1d — real Llama-arch model:** same 1c system, bigger model. Shows the
   controller is model-agnostic and that η improves with model size, giving a
   cleaner savings story. Validation-at-scale, not new infra — watch memory

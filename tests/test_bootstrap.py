@@ -4,9 +4,9 @@ Pins the boot-script shapes the experiments depend on:
 
   - single-process and single-node-DDP scripts stay free of multi-node
     artifacts (the multinode work must not leak into the proven 1a/1b paths);
-  - the multi-node generation loop has the pieces the pause-and-replace
-    failure model needs (ready markers, publish-after-ready ordering,
-    per-generation port, budget re-export, done-signal check);
+  - the multi-node ELASTIC loop has the pieces degraded-mode training needs
+    (min:max nnodes, c10d rendezvous on node 0, publish-once rdzv.json,
+    max-restarts, checkpoint-carried budget, done-signal check);
   - every generated script parses (`bash -n`).
 """
 
@@ -96,64 +96,89 @@ def test_single_node_paths_have_no_multinode_artifacts():
         ud = _ud(**kwargs)
         for marker in (
             "rdzv",
-            "generation",
-            "GEN",
-            "ready/",
             "NCCL_TIMEOUT",
             "MN_RC",
-            "budget.json",
             "TORCH_NCCL_DUMP_ON_TIMEOUT",
+            "TRAIN_BUDGET_SECONDS",
+            "LOCAL_CHECKPOINT_DIR",
+            "--nnodes",
+            "max-restarts",
         ):
             assert marker not in ud, f"{marker!r} leaked into single-node user-data"
     assert "--standalone" in _ud(ddp=True)
 
 
-def test_multinode_master_publishes_only_after_ready_markers():
+def test_multinode_master_hosts_elastic_rendezvous():
     ud = _ud(ddp=True, nodes=2, node_index=0)
-    # The livelock guard: node 0 waits for the workers' ready markers BEFORE
-    # publishing rdzv.json (and only then starts torchrun).
-    ready_wait = ud.index("ready/gen$GEN-node")
-    publish = ud.index('"generation": $GEN')
+    # Node 0 publishes its addr/port ONCE per attempt, BEFORE torchrun, so its
+    # agent hosts the c10d store and workers/replacements know where to dial.
+    publish = ud.index('"addr": "$RDZV_ADDR"')
     torchrun = ud.index("torch.distributed.run")
-    assert ready_wait < publish < torchrun
-    # Fresh port per generation dodges TIME_WAIT on the master's own relaunch.
-    assert "PORT=$((29400 + GEN))" in ud
-    assert '--master_port="$PORT"' in ud
-    assert "--max-restarts=0" in ud
+    assert publish < torchrun
+    # Fresh port per outer attempt dodges TIME_WAIT if node 0's agent relaunches.
+    assert "PORT=$((29400 + ATTEMPT - 1))" in ud
+    # No generation machinery anywhere.
+    for marker in ("GEN", "generation", "ready/", "budget.json"):
+        assert marker not in ud, f"{marker!r} survived the elastic rewrite"
 
 
 def test_multinode_worker_dials_what_is_published():
     ud = _ud(ddp=True, nodes=2, node_index=1)
-    # Worker announces readiness for its target generation...
-    assert "ready/gen$GEN-node1" in ud
-    # ...then joins whatever node 0 actually published (addr/port/gen read back
-    # from rdzv.json, not assumed).
-    assert "read RDZV_ADDR PORT GEN < /tmp/rdzv_join" in ud
+    # Worker joins whatever node 0 actually published (addr/port read back from
+    # rdzv.json, not assumed) — the same path a mid-run replacement takes.
+    assert "read RDZV_ADDR PORT < /tmp/rdzv_join" in ud
     # A worker never publishes.
-    assert '"generation": $GEN' not in ud
+    assert '"addr": "$RDZV_ADDR"' not in ud
 
 
-def test_multinode_loop_budget_and_done_signal():
+def test_multinode_elastic_torchrun_flags():
+    # min nodes defaults to N-1 (>=1): survivors keep training with one down.
+    for nodes, node_index, nnodes in ((2, 0, "1:2"), (2, 1, "1:2"), (3, 2, "2:3"), (4, 0, "3:4")):
+        ud = _ud(ddp=True, nodes=nodes, node_index=node_index)
+        assert f"--nnodes={nnodes}" in ud
+        assert "--rdzv_backend=c10d" in ud
+        assert '--rdzv_endpoint="$RDZV_ADDR:$PORT"' in ud
+        assert "--rdzv_id=run-1" in ud
+        assert "--max-restarts=100" in ud
+        assert '--rdzv_conf="last_call_timeout=15"' in ud
+        # Elastic assigns ranks — the static-rendezvous flags must be gone.
+        assert "--node_rank" not in ud
+        assert "--master_addr" not in ud
+        assert "--master_port" not in ud
+
+
+def test_multinode_budget_and_done_signal():
     for node_index in (0, 1):
         ud = _ud(ddp=True, nodes=2, node_index=node_index)
-        # Budget is orchestrator-authoritative: read budget.json each generation,
-        # clamp >= 1 (NEVER exit on exhausted budget — rank 0 must always be able
-        # to re-form the group for the eval + metrics.json ending), and export it.
-        assert "runs/run-1/budget.json" in ud
-        assert '[ "$REMAINING" -ge 1 ] || REMAINING=1' in ud
-        assert "export MAX_SECONDS=$REMAINING" in ud
-        # The old local wall-clock arithmetic (which billed the crash tail as
-        # training and made survivors give up) must be gone.
-        assert "ORIG_BUDGET" not in ud
-        assert "CONSUMED" not in ud
+        # Run-level budget rides in the checkpoint: the box exports the total
+        # once; every elastic restart derives its own remaining time. The old
+        # per-generation budget.json protocol must be gone.
+        assert 'export TRAIN_BUDGET_SECONDS="120"' in ud
+        assert 'export LOCAL_CHECKPOINT_DIR="/tmp/spot-ckpt"' in ud
+        assert "budget.json" not in ud
+        assert "remaining_seconds" not in ud
         # metrics.json is the group-wide done signal; a clean local exit or the
         # done signal are the only RC=0 paths.
         assert "metrics.json" in ud
         assert "MN_RC=0" in ud
+        # Bounded outer retries — exhaustion leaves the box up for the watchdog.
+        assert 'if [ "$ATTEMPT" -gt 20 ]' in ud
         # Survivors abort fast on a dead peer — and skip torch's ~2-minute
         # post-timeout debug dump, which delayed every rejoin.
         assert 'export NCCL_TIMEOUT="20"' in ud
         assert 'export TORCH_NCCL_DUMP_ON_TIMEOUT="0"' in ud
+
+
+def test_nodes_min_count():
+    cfg = _cfg()
+    cfg.node_count = 4
+    assert cfg.nodes_min_count() == 3  # default: tolerate one node down
+    cfg.node_count = 2
+    assert cfg.nodes_min_count() == 1
+    cfg.nodes_min = 2
+    assert cfg.nodes_min_count() == 2  # NODES_MIN=NODES pins all-or-nothing
+    cfg.nodes_min = 9  # clamped to the group size
+    assert cfg.nodes_min_count() == 2
 
 
 def test_log_key_attempt_suffix():

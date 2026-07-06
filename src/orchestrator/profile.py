@@ -20,8 +20,12 @@ import time
 from dataclasses import dataclass, field
 
 # Matches the trainer's per-step line (spot_train/train.py):
-#   "step 20: loss 2.9876, 80ms/step, 15300 tok/s"
-_STEP_RE = re.compile(r"step\s+(\d+):\s+loss\s+([0-9.]+),\s+(\d+)ms/step,\s+(\d+)\s+tok/s")
+#   "step 20: loss 2.9876, 80ms/step, 15300 tok/s, ws 4"
+# The trailing world size is optional so pre-elastic logs still parse; it is
+# what renders the N -> N-1 -> N staircase next to the loss curve.
+_STEP_RE = re.compile(
+    r"step\s+(\d+):\s+loss\s+([0-9.]+),\s+(\d+)ms/step,\s+(\d+)\s+tok/s(?:,\s+ws\s+(\d+))?"
+)
 
 # Matches the trainer's periodic exact-eval line (Gap E):
 #   "eval step 250: val_loss 2.1034"
@@ -44,7 +48,20 @@ _SEGMENT_LABEL: dict[tuple[str, str], str] = {
 
 # Preemption timeline is built from control-plane MARKS (not per-step lines): each
 # consecutive (from_mark, to_mark) pair maps to a phase. Repeats for each segment.
-_PREEMPT_MARKS = {"launch", "relaunch", "train_start", "kill", "metrics", "timeout"}
+# Elastic runs add shrink_resume (survivors checkpointing again at N-1) and
+# full_world (world size back to N): kill -> shrink_resume is the true downtime,
+# shrink_resume -> full_world is DEGRADED training (fewer GPUs, still learning).
+# relaunch (the replacement's launch) can land on either side of shrink_resume.
+_PREEMPT_MARKS = {
+    "launch",
+    "relaunch",
+    "train_start",
+    "kill",
+    "shrink_resume",
+    "full_world",
+    "metrics",
+    "timeout",
+}
 _MARK_PHASE: dict[tuple[str, str], str] = {
     ("launch", "train_start"): "provisioning",
     ("relaunch", "train_start"): "preemption_recovery",
@@ -52,12 +69,25 @@ _MARK_PHASE: dict[tuple[str, str], str] = {
     ("kill", "relaunch"): "downtime",
     ("train_start", "metrics"): "training",  # final segment (split via stamps below)
     ("train_start", "timeout"): "training",
+    # elastic (degraded-mode) sequences
+    ("kill", "shrink_resume"): "downtime",
+    ("relaunch", "shrink_resume"): "downtime",
+    ("shrink_resume", "relaunch"): "degraded",
+    ("shrink_resume", "full_world"): "degraded",
+    ("relaunch", "full_world"): "degraded",
+    ("shrink_resume", "kill"): "degraded",
+    ("shrink_resume", "metrics"): "degraded",
+    ("shrink_resume", "timeout"): "degraded",
+    ("full_world", "kill"): "training",
+    ("full_world", "metrics"): "training",
+    ("full_world", "timeout"): "training",
 }
 
 # Stable colors per phase (used by the stacked timeline bar).
 _PHASE_COLORS: dict[str, str] = {
     "provisioning": "#4C78A8",
     "training": "#54A24B",
+    "degraded": "#EECA3B",  # training at reduced world size (one node down)
     "downtime": "#9E9E9E",
     "preemption_recovery": "#F58518",
     "evaluation": "#72B7B2",
@@ -85,6 +115,9 @@ class Sample:
     # (log-poll granularity, ~3s). Lets loss curves overlay on a wall-clock axis
     # where preemption gaps are visible.
     t_rel: float = 0.0
+    # Live world size from the trainer's `ws N` suffix (None on pre-elastic
+    # logs) — the per-step record of the N -> N-1 -> N staircase.
+    world_size: int | None = None
 
 
 @dataclass
@@ -164,6 +197,7 @@ class RunProfile:
                 int(m.group(3)),
                 int(m.group(4)),
                 t_rel=self._t_rel_now(now),
+                world_size=int(m.group(5)) if m.group(5) else None,
             )
             self.samples.append(s)
             if self._first_sample_wall is None:
@@ -428,6 +462,10 @@ class RunProfile:
             "t_rel": s.t_rel,
             "train_step": s.step,
         }
+        if s.world_size is not None:
+            # Charted against the same axes as loss: the world-size staircase
+            # (N -> N-1 while a replacement boots -> N) under the loss curve.
+            payload["world_size"] = s.world_size
         if self.instances:
             payload["cost/cumulative_usd"] = round(self.cost_now(), 6)
             rate = self.hourly_rate_now()
@@ -646,9 +684,25 @@ class RunProfile:
         if cost is not None:
             self._wb.summary["total_usd"] = cost["total_usd"]
         if self.metrics:
-            for k in ("train_loss", "val_loss", "steps", "stop_reason", "resumed"):
+            for k in (
+                "train_loss",
+                "val_loss",
+                "steps",
+                "stop_reason",
+                "resumed",
+                "world_size",
+                "restart_count",
+                "effective_global_batch",
+                "trained_seconds_total",
+            ):
                 if k in self.metrics:
                     self._wb.summary[k] = self.metrics[k]
+            # Goodput: fraction of the run's wall-clock spent actually training
+            # (trained_seconds is checkpoint-carried, so downtime never counts).
+            trained = self.metrics.get("trained_seconds_total")
+            total = self.durations().get("total_s")
+            if trained and total:
+                self._wb.summary["goodput"] = round(trained / total, 4)
 
         # The timeline as (1) a per-event table and (2) a stacked segment bar image,
         # both built programmatically — they render as panels with no UI setup.

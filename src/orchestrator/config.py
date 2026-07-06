@@ -32,6 +32,7 @@ def _env_float(name: str, default: float) -> float:
 # TrainConfig.from_env parses them on the box.
 _TRAINER_PASSTHROUGH = (
     "MAX_STEPS",
+    "GLOBAL_BATCH_SIZE",
     "LEARNING_RATE",
     "WEIGHT_DECAY",
     "DROPOUT",
@@ -196,6 +197,20 @@ class OrchestratorConfig:
     # Node 0 hosts the c10d rendezvous store and publishes its private IP to S3
     # (runs/<run_id>/rdzv.json); the other nodes poll that key before starting.
     node_count: int = field(default_factory=lambda: _env_int("NODES", 2))
+    # Minimum nodes the elastic rendezvous will train with (torchrun
+    # --nnodes=MIN:N). 0 (default) = node_count - 1: survivors keep training
+    # while ONE dead node is being replaced; the replacement joining scales the
+    # group back up. Set NODES_MIN=NODES to pin the old all-or-nothing behavior.
+    nodes_min: int = field(default_factory=lambda: _env_int("NODES_MIN", 0))
+    # torchrun --max-restarts: worker-group restarts one agent tolerates before
+    # giving up (each membership change — a kill OR a rejoin — consumes one).
+    # The boot script's outer retry loop catches exhaustion, so this is a
+    # per-torchrun bound, not a run bound.
+    max_restarts: int = field(default_factory=lambda: _env_int("MAX_RESTARTS", 100))
+    # c10d rendezvous last-call: how long a completable rendezvous (>= MIN nodes
+    # present) holds the door open for stragglers. Bounds the shrink downtime:
+    # survivors wait this long for the dead node before proceeding at N-1.
+    rdzv_last_call_seconds: int = field(default_factory=lambda: _env_int("RDZV_LAST_CALL", 15))
     rdzv_port: int = field(default_factory=lambda: _env_int("RDZV_PORT", 29400))
     # Collective timeout exported to multi-node boxes so survivors' collectives
     # abort fast when a peer node dies (torch's default is 10 minutes). 20s keeps
@@ -207,6 +222,13 @@ class OrchestratorConfig:
     # group to produce a NEW checkpoint (proof the rejoin worked) before falling
     # back to a whole-group restart.
     recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 600))
+    # Elastic phase-(a) watchdog: how long after a kill the SURVIVORS get to
+    # produce a new checkpoint at world N-1 (NCCL abort ~20s + re-rendezvous
+    # ~15s last-call + local restore + one checkpoint interval, with margin)
+    # before the orchestrator falls back to a whole-group restart.
+    degraded_recovery_timeout_seconds: int = field(
+        default_factory=lambda: _env_int("DEGRADED_RECOVERY_TIMEOUT", 180)
+    )
 
     # --- vCPU quota gate ------------------------------------------------------
     # The account's "Running On-Demand G and VT instances" vCPU quota. Launches
@@ -284,26 +306,21 @@ class OrchestratorConfig:
     def run_logs_uri(self, run_id: str, segment: int | None = None) -> str:
         return f"s3://{self.bucket}/{self.run_logs_key(run_id, segment)}"
 
-    # Multi-node rendezvous bootstrap: node 0 publishes {addr, port, generation}
-    # here once per group generation; the other nodes poll it, then all run
-    # torchrun against node 0's TCPStore for that generation.
+    # Multi-node rendezvous bootstrap: node 0 publishes {addr, port} here ONCE
+    # at boot (republished with a bumped port only on the rare outer retry); the
+    # other nodes — including replacements joining a live group — poll it, then
+    # run torchrun's elastic c10d rendezvous against node 0's store. The
+    # orchestrator deletes the key before a whole-group restart so a fresh group
+    # can't dial a dead node 0's address.
     def run_rdzv_key(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/rdzv.json"
 
-    # Per-generation ready markers (ready/gen<G>-node<I>): non-master nodes write
-    # one before waiting for the generation to be published; node 0 publishes only
-    # once all N-1 markers for the generation exist, so its store comes up exactly
-    # when the workers start dialing.
-    def run_ready_prefix(self, run_id: str) -> str:
-        return f"{self.run_prefix}/{run_id}/ready/"
-
-    # Orchestrator-authoritative remaining training budget (seconds). Written at
-    # launch and recomputed after every kill from OBSERVED training time (first
-    # checkpoint -> kill), so boot, the NCCL stall, and crash teardown are never
-    # billed. Multinode boxes read it before each rendezvous generation instead
-    # of doing local wall-clock arithmetic.
-    def run_budget_key(self, run_id: str) -> str:
-        return f"{self.run_prefix}/{run_id}/budget.json"
+    def nodes_min_count(self, nodes: int | None = None) -> int:
+        """MIN of torchrun --nnodes=MIN:N — tolerate one node down by default."""
+        n = nodes or self.node_count
+        if self.nodes_min > 0:
+            return min(self.nodes_min, n)
+        return max(1, n - 1)
 
     # AMI-bake control keys: the bake box writes status.json (ok/rc/commit) when
     # provisioning finishes and streams its boot log next to it.

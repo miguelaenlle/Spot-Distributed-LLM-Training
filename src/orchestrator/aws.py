@@ -248,11 +248,20 @@ def upload_file(local_path: str, bucket: str, key: str) -> None:
 
 
 def put_text(bucket: str, key: str, body: str) -> None:
-    """Write a small control document (e.g. budget.json) the boxes poll."""
+    """Write a small control document the boxes poll."""
     _log(f"put s3://{bucket}/{key}: {body}")
     if _DRY_RUN:
         return
     _client("s3").put_object(Bucket=bucket, Key=key, Body=body.encode())
+
+
+def delete_object(bucket: str, key: str) -> None:
+    """Delete a control document (e.g. a stale rdzv.json before a whole-group
+    restart, so fresh boxes can't dial a dead node 0's address)."""
+    _log(f"delete s3://{bucket}/{key}")
+    if _DRY_RUN:
+        return
+    _client("s3").delete_object(Bucket=bucket, Key=key)
 
 
 # --------------------------------------------------------------------------- #

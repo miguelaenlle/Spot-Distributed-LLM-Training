@@ -14,8 +14,10 @@ Invariants:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
+import os
 import sys
 import time
 
@@ -91,6 +93,18 @@ def estimate_loss(model, loader: PositionedLoader, eval_iters: int) -> dict[str,
     return out
 
 
+def grad_accum_steps(global_batch_size: int, world_size: int, batch_size: int) -> int:
+    """Micro-batches each rank runs per optimizer step so the group processes
+    ~``global_batch_size`` sequences per step regardless of how many nodes are
+    alive — an elastic world-size change then alters wall-clock per step, not
+    the gradient statistics (so the LR schedule stays valid). ``ceil`` keeps the
+    effective batch >= the target when the world size doesn't divide it; the
+    caller logs the actual effective batch."""
+    if global_batch_size <= 0:
+        return 1
+    return max(1, math.ceil(global_batch_size / (world_size * batch_size)))
+
+
 def get_lr(cfg: TrainConfig, step: int) -> float:
     """nanoGPT-style schedule: linear warmup -> cosine decay -> min_lr. A pure
     function of the step number, so a resumed run computes the same LR the dead
@@ -161,16 +175,29 @@ def train(cfg: TrainConfig) -> dict:
     )
 
     # --- the one resume code path --------------------------------------- #
-    blob = checkpoint.load_latest(cfg.checkpoint_uri, map_location=cfg.device)
+    # Group-agreed across the node-local tier (instant, survivors) and S3
+    # (durable, replacements); degrades to plain latest-from-uri single-node.
+    blob = checkpoint.load_group_latest(
+        cfg.checkpoint_uri, cfg.local_checkpoint_dir, ddp, map_location=cfg.device
+    )
     resumed = blob is not None
     if resumed:
         start_step = checkpoint.restore_into(
             blob, model=raw_model, optimizer=optimizer, loader=loader
         )
-        log(f"[resume] restored from step {start_step}")
+        trained_before = float(blob.get("trained_seconds", 0.0))
+        log(f"[resume] restored from step {start_step} ({trained_before:.0f}s already trained)")
     else:
         start_step = 0
+        trained_before = 0.0
         log("[fresh] no checkpoint found, starting from step 0")
+
+    # Run-level budget: this launch gets whatever the run hasn't consumed yet —
+    # boot, NCCL stalls, and crash teardown are never billed because only
+    # in-loop time lands in the checkpoint's trained_seconds.
+    if cfg.train_budget_seconds is not None:
+        cfg.max_seconds = max(1.0, cfg.train_budget_seconds - trained_before)
+        log(f"[budget] {cfg.max_seconds:.0f}s of {cfg.train_budget_seconds:.0f}s remain")
 
     # Wrap DDP strictly AFTER resume/configure (device_ids=None on CPU/gloo). A fresh
     # run's DDP construction broadcasts rank-0 weights so all ranks start identical.
@@ -180,17 +207,40 @@ def train(cfg: TrainConfig) -> dict:
 
         model = DDP(raw_model, device_ids=[ddp.local_rank] if device_type == "cuda" else None)
         if cfg.data_mode == "shard":  # per-rank data stream (overwrites restored RNG)
-            torch.manual_seed(cfg.seed + ddp.rank)
+            # Seeded by (rank, resume step) so a restart never replays the window
+            # stream it already consumed, and after an elastic world-size change
+            # rank r draws a fresh stream for its new slice of the group.
+            torch.manual_seed(cfg.seed + ddp.rank * 1_000_003 + start_step)
+
+    # Constant-global-batch gradient accumulation (K=1 when GLOBAL_BATCH_SIZE=0).
+    accum = grad_accum_steps(cfg.global_batch_size, ddp.world_size, cfg.batch_size)
+    effective_batch = accum * ddp.world_size * cfg.batch_size
+    if cfg.global_batch_size:
+        log(
+            f"[batch] global_batch_size={cfg.global_batch_size} -> {accum} "
+            f"micro-batches/rank x {ddp.world_size} ranks x {cfg.batch_size}/batch "
+            f"= effective {effective_batch}"
+        )
+        if effective_batch != cfg.global_batch_size:
+            log(
+                f"[batch] WARNING: effective batch {effective_batch} != target "
+                f"{cfg.global_batch_size} (world size {ddp.world_size} doesn't divide it)"
+            )
 
     listener = InterruptionListener().start()
 
-    def do_checkpoint(step: int, ckpt_count: int) -> None:
+    def do_checkpoint(step: int, ckpt_count: int, trained_seconds: float = 0.0) -> None:
         """SYNCHRONOUS save — the preempt/final path (must complete before exit),
         and the periodic path when CHECKPOINT_ASYNC=0."""
         if not ddp.master:  # only rank 0 writes to S3
             return
         ref = checkpoint.save(
-            model=raw_model, optimizer=optimizer, loader=loader, step=step, uri=cfg.checkpoint_uri
+            model=raw_model,
+            optimizer=optimizer,
+            loader=loader,
+            step=step,
+            uri=cfg.checkpoint_uri,
+            trained_seconds=trained_seconds,
         )
         # Every Nth checkpoint, prove the written artifact reconstructs a model.
         if cfg.smoke_test_every and ckpt_count % cfg.smoke_test_every == 0:
@@ -229,26 +279,38 @@ def train(cfg: TrainConfig) -> dict:
         lr = get_lr(cfg, step)
         for group in optimizer.param_groups:
             group["lr"] = lr
-        x, y = loader.next_batch("train")
-        _, loss = model(x, y)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()  # DDP averages gradients across ranks here
+        micro_loss = 0.0
+        for micro in range(accum):
+            x, y = loader.next_batch("train")
+            # Local grads accumulate across micro-batches; only the K-th backward
+            # pays DDP's gradient all-reduce (no_sync skips it on the others).
+            last_micro = micro == accum - 1
+            sync_ctx = (
+                contextlib.nullcontext() if last_micro or not ddp.enabled else model.no_sync()
+            )
+            with sync_ctx:
+                _, loss = model(x, y)
+                (loss / accum).backward()
+            micro_loss += loss.item() / accum
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
         step += 1
 
-        # per-step progress (nanoGPT-style) — tail the box log to watch this live
+        # per-step progress (nanoGPT-style) — tail the box log to watch this live.
+        # `ws` is the live world size: the orchestrator parses it into the run
+        # profile so the N -> N-1 -> N staircase shows up next to the loss curve.
         if cfg.log_interval_steps and step % cfg.log_interval_steps == 0:
-            gloss = distributed.mean_loss(ddp, loss.item())  # all ranks participate
+            gloss = distributed.mean_loss(ddp, micro_loss)  # all ranks participate
             if ddp.master:
                 t = time.monotonic()
                 per_step = (t - last_log_time) / max(1, step - last_log_step)
-                toks = ddp.world_size * cfg.batch_size * cfg.block_size
+                toks = accum * ddp.world_size * cfg.batch_size * cfg.block_size
                 tok_s = toks / per_step if per_step else 0
                 print(
                     f"step {step}: loss {gloss:.4f}, {per_step * 1000:.0f}ms/step, "
-                    f"{tok_s:.0f} tok/s",
+                    f"{tok_s:.0f} tok/s, ws {ddp.world_size}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -277,20 +339,47 @@ def train(cfg: TrainConfig) -> dict:
                 log(f"[sample] step {step}: {len(doc['samples'])} samples -> {uri}")
 
         now = time.monotonic()
-        if now - last_ckpt >= cfg.checkpoint_interval_seconds:
+        trained_now = trained_before + (now - start_time)
+        submitted = False
+        if ddp.master and now - last_ckpt >= cfg.checkpoint_interval_seconds:
             if async_ckpt is not None:
                 # Busy => the previous upload is still in flight: don't advance
                 # last_ckpt, so we retry within a few steps instead of waiting a
                 # whole interval. Bounded: one snapshot in memory at a time.
                 if async_ckpt.submit(
-                    model=raw_model, optimizer=optimizer, loader=loader, step=step
+                    model=raw_model,
+                    optimizer=optimizer,
+                    loader=loader,
+                    step=step,
+                    trained_seconds=trained_now,
                 ):
                     ckpt_count += 1
                     last_ckpt = now
+                    submitted = True
             else:
                 ckpt_count += 1
-                do_checkpoint(step, ckpt_count)  # rank-0-only body
+                do_checkpoint(step, ckpt_count, trained_now)  # rank-0-only body
                 last_ckpt = now
+                submitted = True
+        # Node-local tier, step-aligned on rank 0's decision: every node's
+        # LOCAL_RANK-0 snapshots the SAME step rank 0 shipped to S3, which is
+        # what lets a shrunken group later agree on a common local resume step.
+        # Order matters: broadcast_flag is a collective, so EVERY rank must
+        # evaluate it before the local_rank filter. (Rank 0 snapshots twice —
+        # a second ~tens-of-ms CPU copy.)
+        if cfg.local_checkpoint_dir and distributed.broadcast_flag(ddp, submitted):  # noqa: SIM102
+            if ddp.local_rank == 0:
+                checkpoint.save_local(
+                    checkpoint.snapshot(
+                        model=raw_model,
+                        optimizer=optimizer,
+                        loader=loader,
+                        step=step,
+                        trained_seconds=trained_now,
+                    ),
+                    cfg.local_checkpoint_dir,
+                    step,
+                )
 
         # Coordinated stop — the LAST collective every step, so all ranks break on
         # the same iteration and none is left blocking on the next backward.
@@ -321,7 +410,7 @@ def train(cfg: TrainConfig) -> dict:
         if async_ckpt is not None:
             async_ckpt.flush()  # never race the writer with the sync save below
         ckpt_count += 1
-        do_checkpoint(step, ckpt_count)
+        do_checkpoint(step, ckpt_count, trained_before + (time.monotonic() - start_time))
         listener.stop()
         log(f"[preempt] checkpointed at step {step}; exiting for replacement")
         distributed.shutdown(ddp)
@@ -341,7 +430,7 @@ def train(cfg: TrainConfig) -> dict:
     if async_ckpt is not None:
         async_ckpt.flush()  # never race the writer with the final sync save
     ckpt_count += 1
-    do_checkpoint(step, ckpt_count)
+    do_checkpoint(step, ckpt_count, trained_before + train_s)
     save_s = round(time.monotonic() - save_t0, 2)
 
     final_step = step
@@ -378,6 +467,12 @@ def train(cfg: TrainConfig) -> dict:
         "gpu": gpu_name,
         "dataset": cfg.dataset,
         "world_size": ddp.world_size,
+        # Elastic provenance: how many times torchrun restarted this worker
+        # group, and the batch semantics the run actually trained with.
+        "restart_count": int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")),
+        "grad_accum_steps": accum,
+        "effective_global_batch": effective_batch,
+        "trained_seconds_total": round(trained_before + train_s, 2),
     }
     _write_metrics(cfg, metrics)
     distributed.shutdown(ddp)

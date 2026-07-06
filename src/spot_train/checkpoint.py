@@ -22,6 +22,7 @@ Two tools answer "is this checkpoint comprehensive and valid?":
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import os
 import shutil
@@ -33,9 +34,12 @@ from typing import Any
 
 import torch
 
-from . import rng, s3_store
+from . import distributed, rng, s3_store
 
-CKPT_VERSION = 1
+# v2 adds trained_seconds (cumulative in-loop wall-clock, the run-level budget's
+# progress meter). v1 blobs still load — trained_seconds defaults to 0.
+CKPT_VERSION = 2
+_KNOWN_VERSIONS = (1, 2)
 _REQUIRED_KEYS = ("version", "step", "model", "optimizer", "rng", "loader")
 
 
@@ -48,11 +52,20 @@ def _ckpt_name(step: int) -> str:
     return f"{s3_store.CHECKPOINT_PREFIX}{step:012d}.pt"
 
 
-def save(*, model, optimizer, loader, step: int, uri: str) -> str:
+def _step_of(ref: str | None) -> int:
+    """Step number encoded in a checkpoint ref's basename, or -1 for None."""
+    if ref is None:
+        return -1
+    base = ref.rsplit("/", 1)[-1]
+    return int(base[len(s3_store.CHECKPOINT_PREFIX) : -len(".pt")])
+
+
+def save(*, model, optimizer, loader, step: int, uri: str, trained_seconds: float = 0.0) -> str:
     """Atomically persist full training state. Returns the final checkpoint ref."""
     blob: dict[str, Any] = {
         "version": CKPT_VERSION,
         "step": step,
+        "trained_seconds": trained_seconds,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "rng": rng.capture(),
@@ -87,7 +100,9 @@ def _cpu_copy(obj: Any) -> Any:
     return copy.deepcopy(obj)
 
 
-def snapshot(*, model, optimizer, loader, step: int) -> dict[str, Any]:
+def snapshot(
+    *, model, optimizer, loader, step: int, trained_seconds: float = 0.0
+) -> dict[str, Any]:
     """Point-in-time CPU copy of the full training state (same schema as
     ``save`` writes). This is the only part of an async checkpoint that must
     run on the training critical path — ~tens of ms for a NanoGPT-sized model.
@@ -96,11 +111,39 @@ def snapshot(*, model, optimizer, loader, step: int) -> dict[str, Any]:
     return {
         "version": CKPT_VERSION,
         "step": step,
+        "trained_seconds": trained_seconds,
         "model": _cpu_copy(model.state_dict()),
         "optimizer": _cpu_copy(optimizer.state_dict()),
         "rng": rng.capture(),  # capture() already returns copies
         "loader": dict(loader.state_dict()),
     }
+
+
+def save_local(blob: dict[str, Any], local_dir: str, step: int, keep: int = 2) -> str:
+    """Write a snapshot blob to the node-local tier (atomic same-dir rename) and
+    prune to the ``keep`` newest. Keeping two absorbs one interval of skew when
+    a crash lands mid-save somewhere in the group — the group-MIN agreement in
+    :func:`load_group_latest` can then still find a step everyone has."""
+    os.makedirs(local_dir, exist_ok=True)
+    # Temp file IN the destination dir so os.replace never crosses filesystems.
+    fd, tmp_path = tempfile.mkstemp(suffix=".pt", dir=local_dir)
+    os.close(fd)
+    try:
+        torch.save(blob, tmp_path)
+        final = os.path.join(local_dir, _ckpt_name(step))
+        os.replace(tmp_path, final)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    kept = sorted(
+        f
+        for f in os.listdir(local_dir)
+        if f.startswith(s3_store.CHECKPOINT_PREFIX) and f.endswith(".pt")
+    )
+    for old in kept[:-keep]:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(local_dir, old))
+    return final
 
 
 class AsyncCheckpointer:
@@ -142,12 +185,18 @@ class AsyncCheckpointer:
     def busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def submit(self, *, model, optimizer, loader, step: int) -> bool:
+    def submit(self, *, model, optimizer, loader, step: int, trained_seconds: float = 0.0) -> bool:
         """Snapshot now and hand off to the writer. False = previous save still
         in flight (skipped; nothing was snapshotted)."""
         if self.busy():
             return False
-        blob = snapshot(model=model, optimizer=optimizer, loader=loader, step=step)
+        blob = snapshot(
+            model=model,
+            optimizer=optimizer,
+            loader=loader,
+            step=step,
+            trained_seconds=trained_seconds,
+        )
         self._count += 1
         self._thread = threading.Thread(
             target=self._write, args=(blob, step, self._count), name="ckpt-writer", daemon=True
@@ -209,6 +258,52 @@ def load_latest(uri: str, map_location: str = "cpu") -> dict[str, Any] | None:
         return torch.load(local, map_location=map_location, weights_only=False)
 
 
+def load_group_latest(
+    uri: str,
+    local_dir: str = "",
+    dist_ctx: distributed.Dist | None = None,
+    map_location: str = "cpu",
+) -> dict[str, Any] | None:
+    """The one resume path, now across two tiers and N ranks.
+
+    Every rank offers the newest step it can reach (node-local tier if present,
+    else the durable S3 tier); the group takes the MIN so all ranks restore the
+    SAME step, then each loads it from the cheapest tier that has it. The two
+    interesting cases fall out without any membership detection:
+
+      - group shrank (survivors only): everyone holds the same step-aligned
+        local snapshot -> instant disk restore, ~zero lost work;
+      - a fresh replacement is present: its best is S3-latest, which becomes the
+        group MIN -> everyone restores S3-latest (survivors lose at most one
+        interval + one in-flight upload — the existing durability bound).
+
+    Degrades exactly to :func:`load_latest` semantics for a single process with
+    no local tier, so single-node paths are unchanged.
+    """
+    local_ref = s3_store.latest(local_dir) if local_dir else None
+    s3_ref = s3_store.latest(uri)
+    best = max(_step_of(local_ref), _step_of(s3_ref))
+    group_step = distributed.all_reduce_min(dist_ctx, best) if dist_ctx is not None else best
+    if group_step < 0:
+        return None  # no checkpoint anywhere in the group -> fresh
+    name = _ckpt_name(group_step)
+    local_path = os.path.join(local_dir, name) if local_dir else ""
+    if local_path and os.path.exists(local_path):
+        ref = local_path
+    else:
+        ref = s3_store.ref_for(uri, name)
+        if not s3_store.exists(ref):
+            # A peer holds a local step the durable tier never received (its
+            # upload failed). Crash loudly: the elastic agent restarts us, the
+            # group re-agrees, and S3 has usually caught up by then.
+            raise CheckpointError(
+                f"group agreed on step {group_step} but this rank has no tier "
+                f"holding it (local={local_path or 'off'}, s3={ref})"
+            )
+    with s3_store.fetch(ref) as local:
+        return torch.load(local, map_location=map_location, weights_only=False)
+
+
 def restore_into(blob: dict[str, Any], *, model, optimizer, loader) -> int:
     """Restore all state from ``blob``. Returns the step to resume from."""
     model.load_state_dict(blob["model"])
@@ -236,7 +331,7 @@ def _verify_blob(blob: dict[str, Any]) -> dict[str, Any]:
     missing = [k for k in _REQUIRED_KEYS if k not in blob]
     if missing:
         raise CheckpointError(f"checkpoint missing keys: {missing}")
-    if blob["version"] != CKPT_VERSION:
+    if blob["version"] not in _KNOWN_VERSIONS:
         raise CheckpointError(f"unsupported checkpoint version {blob['version']}")
     if not _all_finite(blob["model"]):
         raise CheckpointError("model weights contain NaN/inf")

@@ -204,6 +204,46 @@ def test_segments_preempt_multi_segment():
     assert secs[8:] == [1.0, 44.0]  # from stamps
 
 
+def test_ingest_parses_world_size_suffix():
+    # Elastic trainer appends `, ws N`; pre-elastic lines (no suffix) still parse.
+    p = RunProfile("mn-1", "multinode-preempt", "spot")
+    p.ingest_log(
+        "step 10: loss 3.3405, 3085ms/step, 996 tok/s, ws 4\n"
+        "step 20: loss 2.9876, 80ms/step, 15300 tok/s, ws 3\n"
+        "step 30: loss 2.5000, 80ms/step, 15300 tok/s\n"
+    )
+    assert [s.world_size for s in p.samples] == [4, 3, None]
+    # The staircase lands in profile.json's loss_samples too.
+    assert p.to_dict()["loss_samples"][0]["world_size"] == 4
+
+
+def test_segments_elastic_degraded():
+    # Elastic kill: downtime is only kill -> shrink_resume; the group then TRAINS
+    # at N-1 (degraded) until the replacement joins (full_world).
+    p = RunProfile("mn-1", "multinode-preempt", "spot")
+    p.events = [
+        Event("launch", 0.0, 1),
+        Event("train_start", 45.0, 1),
+        Event("kill", 65.0, 1),  # training 20
+        Event("relaunch", 90.0, 1),  # downtime so far 25
+        Event("shrink_resume", 110.0, 1),  # downtime 45 total
+        Event("full_world", 170.0, 1),  # degraded 60
+        Event("train_start", 170.0, 1),
+        Event("metrics", 230.0, 1),  # final training block -> split via stamps
+    ]
+    p.from_metrics({"phases": {"train_s": 58.0, "save_s": 2.0}})
+    assert [(s["phase"], s["seconds"]) for s in p.segments()] == [
+        ("provisioning", 45.0),
+        ("training", 20.0),
+        ("downtime", 25.0),
+        ("downtime", 20.0),
+        ("degraded", 60.0),
+        ("training", 58.0),
+        ("final_saves", 2.0),
+    ]
+    assert p.durations()["degraded_s"] == 60.0
+
+
 def test_wandb_disabled_is_noop():
     p = RunProfile("baseline-1", "baseline", "on-demand")
     cfg = types.SimpleNamespace(wandb_enabled=lambda: False)

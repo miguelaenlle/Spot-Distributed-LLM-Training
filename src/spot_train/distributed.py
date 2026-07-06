@@ -76,6 +76,31 @@ def all_reduce_stop(d: Dist, local_stop: bool) -> bool:
     return bool(t.item())
 
 
+def broadcast_flag(d: Dist, local_flag: bool) -> bool:
+    """Rank 0's flag, agreed group-wide (non-master inputs are ignored). Used to
+    step-align the node-local checkpoint tier: rank 0 decides "checkpoint at this
+    step" and every node's LOCAL_RANK-0 snapshots the SAME step, which is what
+    lets a shrunken group later agree on a common local resume step. Implemented
+    as a MAX all-reduce where only rank 0 contributes, so it composes with the
+    same every-rank-every-step call pattern as all_reduce_stop."""
+    if not d.enabled:
+        return local_flag
+    t = torch.tensor([1 if (local_flag and d.master) else 0], dtype=torch.int32, device=d.device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return bool(t.item())
+
+
+def all_reduce_min(d: Dist, value: int) -> int:
+    """Group-wide MIN of an integer (identity when not under torchrun). The
+    resume path uses this to agree on a checkpoint step every rank can load:
+    the minimum over each rank's best locally-available step."""
+    if not d.enabled:
+        return value
+    t = torch.tensor([value], dtype=torch.int64, device=d.device)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN)
+    return int(t.item())
+
+
 def mean_loss(d: Dist, loss_value: float) -> float:
     """Global mean loss across ranks for the reported log line (all ranks call it)."""
     if not d.enabled:

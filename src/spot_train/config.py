@@ -57,6 +57,12 @@ class TrainConfig:
     # --- optimization ---
     max_steps: int = 100_000  # effectively "until the time budget runs out"
     batch_size: int = 12
+    # Sequences per OPTIMIZER step, independent of how many GPUs are alive.
+    # 0 = off (one micro-batch per rank, effective batch = world_size*batch_size,
+    # today's behavior). >0 => each rank runs K = ceil(global/(world*batch))
+    # micro-batches per step, so an elastic world-size change alters wall-clock
+    # per step but NOT the gradient statistics or the LR schedule's validity.
+    global_batch_size: int = 0
     learning_rate: float = 6e-4
     weight_decay: float = 1e-1
     seed: int = 1337
@@ -74,12 +80,25 @@ class TrainConfig:
     # writes metrics. None => run until max_steps. The orchestrator sets this
     # per launch (e.g. 300 for the baseline, 180 for the second spot segment).
     max_seconds: float | None = None
+    # Run-level training budget across ALL launches/elastic restarts. The
+    # checkpoint carries the seconds already trained; on resume max_seconds
+    # becomes (train_budget_seconds - trained so far), clamped >= 1 so rank 0
+    # can always re-form the group to eval + write metrics.json. None => use
+    # max_seconds as-is (single-launch semantics).
+    train_budget_seconds: float | None = None
 
     # --- checkpointing -------------------------------------------------------
     # Time-based, not step-based: bounds worst-case *wall-clock* lost work to
     # this interval regardless of how fast a step is. Some spot kills give no
     # warning, so we checkpoint on a clock, not on a signal.
     checkpoint_interval_seconds: float = 30.0
+    # Node-local checkpoint tier (elastic multi-node): every node's LOCAL_RANK-0
+    # keeps the latest snapshots on its own disk (DDP state is replicated, so
+    # this needs no network), letting survivors of an elastic restart resume in
+    # milliseconds instead of re-downloading from S3. "" = tier off (single-node
+    # behavior unchanged). Rank 0 still uploads to S3 — the durable tier a fresh
+    # replacement node resumes from.
+    local_checkpoint_dir: str = ""
     # Run the (heavier) restore smoke test on every Nth checkpoint. 1 => always.
     smoke_test_every: int = 1
     # Periodic checkpoints from a background thread: only the point-in-time CPU
@@ -160,7 +179,9 @@ class TrainConfig:
             min_lr=_env_float("MIN_LR", 0.0),
             grad_clip=_env_float("GRAD_CLIP", 0.0),
             max_seconds=_env_float("MAX_SECONDS", None),
+            train_budget_seconds=_env_float("TRAIN_BUDGET_SECONDS", None),
             checkpoint_interval_seconds=_env_float("CHECKPOINT_INTERVAL_SECONDS", 30.0),
+            local_checkpoint_dir=_env_str("LOCAL_CHECKPOINT_DIR", ""),
             smoke_test_every=_env_int("SMOKE_TEST_EVERY", 1),
             checkpoint_async=_env_str("CHECKPOINT_ASYNC", "1").lower() not in ("0", "false"),
             log_interval_steps=_env_int("LOG_INTERVAL_STEPS", 10),
@@ -182,6 +203,7 @@ class TrainConfig:
             sample_interval_tokens=_env_int("SAMPLE_INTERVAL_TOKENS", 150),
             samples_prefix_uri=_env_str("SAMPLES_PREFIX_URI", "checkpoints/samples/"),
             batch_size=_env_int("BATCH_SIZE", 12),
+            global_batch_size=_env_int("GLOBAL_BATCH_SIZE", 0),
             run_id=_env_str("RUN_ID", "local"),
             market=_env_str("MARKET", "local"),
             device=_env_str("DEVICE", "auto"),
