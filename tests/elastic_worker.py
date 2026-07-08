@@ -19,7 +19,10 @@ import torch.distributed as dist
 def main() -> None:
     out = os.environ["E2E_OUT"]
     done = os.environ["E2E_DONE"]
-    dist.init_process_group(backend="gloo", timeout=timedelta(seconds=10))
+    # Short collective timeout = fast dead-peer detection (the test's NCCL_TIMEOUT
+    # analog): on macOS the survivor's all_reduce raises on THIS timeout, not on a
+    # connection reset, so it directly bounds the kill-to-recovery latency.
+    dist.init_process_group(backend="gloo", timeout=timedelta(seconds=3))
     world = dist.get_world_size()
     rank = dist.get_rank()
     restart = os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")

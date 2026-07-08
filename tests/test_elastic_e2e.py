@@ -8,7 +8,8 @@ continues at world 1 WITHOUT B — the exact survivors-keep-training behavior th
 multinode-preempt experiment relies on.
 
 Subprocess-based (no fork-after-torch), so it runs on macOS too. It exercises
-real sockets and timing, so it's the slowest test in the suite (~30-60s).
+real sockets and timing, so it's the slowest test in the suite (~10-15s: join
++ the worker's 3s gloo dead-peer timeout + one re-rendezvous).
 Set E2E_ELASTIC=0 to skip.
 """
 
@@ -42,7 +43,8 @@ def _spawn_agent(port: int, env: dict, min_nodes: int = 1, max_nodes: int = 2):
         "--rdzv_backend=c10d",
         f"--rdzv_endpoint=127.0.0.1:{port}",
         "--rdzv_id=e2e-test",
-        "--rdzv_conf=last_call_timeout=3",
+        "--rdzv_conf=last_call_timeout=1",
+        "--monitor-interval=0.5",  # torch 2.4 default is 5s — directly on the kill->detect path
         "--max-restarts=3",
         "--local-addr=127.0.0.1",
         os.path.join(here, "elastic_worker.py"),
@@ -82,7 +84,7 @@ def _wait_for(predicate, timeout: float, what: str) -> None:
     while time.monotonic() < deadline:
         if predicate():
             return
-        time.sleep(0.5)
+        time.sleep(0.2)
     raise AssertionError(f"timed out after {timeout}s waiting for {what}")
 
 
@@ -110,8 +112,10 @@ def test_survivor_continues_at_world_one(tmp_path):
     a = b = None
     try:
         # A first (it must host the c10d store — the "node 0" of this test).
+        # If A closes a solo world-1 round before B arrives, B's join just
+        # triggers one more restart to world 2 — the wait below covers both.
         a = _spawn_agent(port, env)
-        time.sleep(2)
+        time.sleep(1)
         b = _spawn_agent(port, env)
 
         # Both ranks join at world 2.
