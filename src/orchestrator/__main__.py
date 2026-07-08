@@ -1,5 +1,5 @@
 """CLI: ``spot-orchestrate {setup,stage-data,bake-ami,baseline,spot,preempt,ddp,
-ddp-preempt,multinode,multinode-preempt} [--dry-run]``,
+ddp-preempt,multinode,multinode-shrink,multinode-preempt} [--dry-run]``,
 ``spot-orchestrate resume <run_id> [--budget N] [--market ...]``, and
 ``spot-orchestrate compare <run_id> [<run_id> ...]``.
 
@@ -50,6 +50,7 @@ def main() -> None:
         "ddp",
         "ddp-preempt",
         "multinode",
+        "multinode-shrink",
         "multinode-preempt",
     ):
         sub.add_parser(name, parents=[common])
@@ -239,6 +240,8 @@ def main() -> None:
         experiments.run_preempt(cfg, ddp=True)
     elif args.command == "multinode":
         experiments.run_multinode(cfg)
+    elif args.command == "multinode-shrink":
+        experiments.run_multinode_shrink(cfg)
     elif args.command == "multinode-preempt":
         experiments.run_multinode_preempt(cfg)
     elif args.command == "resume":

@@ -723,14 +723,15 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
                 )
                 # (b) replacement joined: a post-kill step line reports the
                 # pre-kill world size at a step past the pre-kill floor.
-                _wait_full_world(
+                _wait_for_world(
                     cfg,
                     logs,
                     profile,
                     metrics_key,
-                    full_ws=full_ws,
+                    want_ws=full_ws,
                     step_floor=step_floor,
                     timeout=cfg.recovery_timeout_seconds,
+                    label="multinode-preempt",
                 )
                 profile.mark("full_world")
                 print(
@@ -765,6 +766,204 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
             aws.terminate(iid)
 
 
+def run_multinode_shrink(cfg: OrchestratorConfig) -> dict | None:
+    """The MINIMAL elastic validation: kill WITHOUT replace. Launch the group,
+    train ``PREEMPT_AFTER`` seconds (default 120), hard-terminate the LAST node
+    — and then launch nothing: if elastic works, the survivors alone must
+    re-rendezvous at world N-1, resume from the node-local tier, and run the
+    remaining budget to metrics.json. No replacement, no whole-group fallback,
+    and no quota waits on the observation path — the console streams every
+    node's log the entire time, so the recovery (or its failure) is visible
+    live. Ends with an explicit PASS/FAIL verdict.
+
+    PASS requires all of:
+      (a) a NEW checkpoint within DEGRADED_RECOVERY_TIMEOUT of the kill
+          (survivors checkpointing again);
+      (b) a post-kill step line reporting the shrunken world size
+          (pre-kill ws × (N-1)/N) at a step past the pre-kill floor;
+      (c) metrics.json arriving with that world size and resumed=true.
+
+    Boxes are terminated either way; on FAIL the S3 node logs hold the
+    evidence and a grep hint is printed. The victim is always the last node —
+    node 0 hosts the rendezvous store, and store death is a different (known,
+    fallback-only) failure mode this experiment deliberately excludes."""
+    if cfg.node_count < 2:
+        raise SystemExit("multinode-shrink needs NODES >= 2")
+    ami, sg_id = _prepare(cfg)
+    run_id = _run_id("multinode-shrink")
+    total = cfg.train_total_seconds
+    budget = max(1, math.ceil(total))
+    market = cfg.spot_market
+    kill_after = cfg.preempt_after_seconds or 120
+    victim = cfg.node_count - 1
+    ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
+    metrics_key = cfg.run_metrics_key(run_id)
+    cfg.checkpoint_interval_seconds = min(
+        cfg.checkpoint_interval_seconds, cfg.preempt_checkpoint_seconds
+    )
+    cfg.smoke_test_every = max(1, round(30 / cfg.checkpoint_interval_seconds))
+    print(
+        f"[multinode-shrink] run_id={run_id} nodes={cfg.node_count} "
+        f"(min {cfg.nodes_min_count()}) total_train={total}s kill_after={kill_after}s "
+        f"market={market} — hard-kill node {victim}, NO replacement: survivors must "
+        f"finish the run at world size N-1 on their own",
+        file=sys.stderr,
+    )
+    profile = RunProfile(run_id, kind="multinode-shrink", market=market)
+    if not aws.is_dry_run():
+        profile.wandb_start(cfg)
+
+    live: dict[int, str] = {}
+    logs: dict[int, dict] = {}
+    checks: list[tuple[str, bool, str]] = []  # (name, passed, detail)
+    try:
+        aws.wait_vcpu_headroom(cfg.node_count * cfg.instance_vcpu_count(), cfg.vcpu_quota)
+        for i in range(cfg.node_count):
+            logs[i] = {"key": cfg.run_logs_key(run_id, node=i), "state": {"printed": 0}}
+            live[i] = _launch_node(
+                cfg, ami, sg_id, run_id, market, budget, node_index=i, logs_key=logs[i]["key"]
+            )
+        for iid in live.values():
+            aws.wait_running(iid)
+        for iid in live.values():
+            _record_instance(cfg, profile, iid, market)
+        profile.mark("launch")
+
+        if aws.is_dry_run():
+            aws.terminate(live[victim])
+            print("[multinode-shrink] dry-run: skipping stream/kill timing", file=sys.stderr)
+            return None
+
+        _wait_train_start(cfg, ckpt_prefix, 0, logs, profile, metrics_key)
+        profile.mark("train_start")
+
+        # Train the pre-kill stretch with the console live the whole way.
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < kill_after:
+            _pull_logs(cfg, logs, profile)
+            if aws.object_exists(cfg.bucket, metrics_key):
+                raise SystemExit(
+                    "[multinode-shrink] run finished before the kill — raise "
+                    "TRAIN_TOTAL_SECONDS or lower PREEMPT_AFTER"
+                )
+            time.sleep(cfg.log_stream_seconds)
+
+        full_ws = next((s.world_size for s in reversed(profile.samples) if s.world_size), None)
+        step_floor = max((s.step for s in profile.samples), default=0)
+        shrunk_ws = None
+        if full_ws is not None and full_ws % cfg.node_count == 0:
+            shrunk_ws = full_ws // cfg.node_count * (cfg.node_count - 1)
+        print(
+            f"[multinode-shrink] killing node {victim} at step ~{step_floor} "
+            f"(ws {full_ws}); expecting survivors at ws {shrunk_ws} — no replacement "
+            f"will be launched",
+            file=sys.stderr,
+        )
+        aws.terminate(live[victim])
+        kill_t = time.monotonic()
+        profile.instance_stopped(live.pop(victim))
+        profile.mark("kill")
+
+        # Stray-upload floor (same reasoning as multinode-preempt), spent
+        # streaming logs instead of sleeping blind.
+        while time.monotonic() - kill_t < cfg.nccl_timeout_seconds + 15:
+            _pull_logs(cfg, logs, profile)
+            time.sleep(cfg.log_stream_seconds)
+        baseline = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
+
+        # (a) survivors checkpointing again, deadline anchored at the kill.
+        try:
+            remaining = cfg.degraded_recovery_timeout_seconds - (time.monotonic() - kill_t)
+            _wait_train_start(
+                cfg,
+                ckpt_prefix,
+                baseline,
+                logs,
+                profile,
+                metrics_key,
+                timeout=max(30, math.ceil(remaining)),
+            )
+            profile.mark("shrink_resume")
+            dt = time.monotonic() - kill_t
+            checks.append(("survivors checkpointing again", True, f"{dt:.0f}s after the kill"))
+        except TimeoutError:
+            checks.append(
+                (
+                    "survivors checkpointing again",
+                    False,
+                    f"nothing new within {cfg.degraded_recovery_timeout_seconds}s",
+                )
+            )
+            raise
+
+        # (b) step lines at the shrunken world size, past the pre-kill floor.
+        try:
+            _wait_for_world(
+                cfg,
+                logs,
+                profile,
+                metrics_key,
+                want_ws=shrunk_ws,
+                step_floor=step_floor,
+                timeout=cfg.degraded_recovery_timeout_seconds,
+                label="multinode-shrink",
+            )
+            checks.append(("step lines at shrunken world size", True, f"ws {shrunk_ws} observed"))
+        except TimeoutError:
+            checks.append(("step lines at shrunken world size", False, f"no ws {shrunk_ws} line"))
+            raise
+
+        # (c) the survivors run the remaining budget out and finalize the run.
+        metrics = _stream_until_metrics_multi(cfg, run_id, profile, logs)
+        profile.mark("metrics" if metrics is not None else "timeout")
+        profile.from_metrics(metrics)
+        if metrics is None:
+            checks.append(("metrics.json from the shrunken group", False, "timed out"))
+            raise TimeoutError("metrics.json never arrived")
+        ok = (shrunk_ws is None or metrics.get("world_size") == shrunk_ws) and metrics.get(
+            "resumed"
+        )
+        checks.append(
+            (
+                "metrics.json from the shrunken group",
+                bool(ok),
+                f"world_size={metrics.get('world_size')} resumed={metrics.get('resumed')} "
+                f"restart_count={metrics.get('restart_count')}",
+            )
+        )
+        return metrics
+    except (TimeoutError, KeyboardInterrupt):
+        return None
+    finally:
+        for iid in live.values():
+            aws.terminate(iid)
+            profile.instance_stopped(iid)
+        if not aws.is_dry_run():
+            profile.finalize(cfg)
+            _print_shrink_verdict(cfg, run_id, checks)
+
+
+def _print_shrink_verdict(
+    cfg: OrchestratorConfig, run_id: str, checks: list[tuple[str, bool, str]]
+) -> None:
+    print("\n================ ELASTIC SHRINK VERDICT ================", file=sys.stderr)
+    if not checks:
+        print("  no checks ran (killed before training started?)", file=sys.stderr)
+    for name, passed, detail in checks:
+        print(f"  {'PASS' if passed else 'FAIL'}  {name} — {detail}", file=sys.stderr)
+    verdict = bool(checks) and all(p for _, p, _ in checks)
+    summary = "PASS — survivors kept training without the dead node" if verdict else "FAIL"
+    print(f"  VERDICT: {summary}", file=sys.stderr)
+    if not verdict:
+        print(
+            "  evidence: aws s3 cp "
+            f"s3://{cfg.bucket}/{cfg.run_prefix}/{run_id}/logs/boot-node<N>.log - "
+            "| grep -nE '\\[rdzv\\]|torchrun|Rendezvous|\\[resume\\]|Traceback'",
+            file=sys.stderr,
+        )
+    print("========================================================\n", file=sys.stderr)
+
+
 def _wait_train_start(
     cfg: OrchestratorConfig,
     ckpt_prefix: str,
@@ -790,39 +989,38 @@ def _wait_train_start(
         time.sleep(cfg.log_stream_seconds)
 
 
-def _wait_full_world(
+def _wait_for_world(
     cfg: OrchestratorConfig,
     logs: dict[int, dict],
     profile: RunProfile,
     metrics_key: str,
     *,
-    full_ws: int | None,
+    want_ws: int | None,
     step_floor: int,
     timeout: int,
+    label: str,
 ) -> None:
-    """Block until a step line reports the pre-kill world size again at a step
-    PAST the pre-kill floor (both guards matter: a lag-parsed pre-kill line
-    carries the old ws at an old step, and degraded-mode lines carry a smaller
-    ws). ``full_ws`` None means the trainer never reported ws (pre-elastic log)
-    — phase (a) already proved progress, so just note it and return."""
-    if full_ws is None:
+    """Block until a step line reports world size ``want_ws`` at a step PAST
+    ``step_floor`` (both guards matter: a lag-parsed pre-kill line carries the
+    old ws at an old step, and other-regime lines carry a different ws).
+    ``want_ws`` None means the trainer never reported ws (pre-elastic log) —
+    checkpoint progress already proved training, so just note it and return."""
+    if want_ws is None:
         print(
-            "[multinode-preempt] no `ws` in step lines before the kill — skipping the "
-            "full-world check (old trainer?)",
+            f"[{label}] no `ws` in step lines before the kill — skipping the "
+            "world-size check (old trainer?)",
             file=sys.stderr,
         )
         return
     deadline = time.monotonic() + timeout
     while True:
         _pull_logs(cfg, logs, profile)
-        if any(s.world_size == full_ws and s.step > step_floor for s in profile.samples):
+        if any(s.world_size == want_ws and s.step > step_floor for s in profile.samples):
             return
         if aws.object_exists(cfg.bucket, metrics_key):
-            return  # run finished while degraded — nothing left to verify
+            return  # run finished — nothing left to verify against step lines
         if time.monotonic() > deadline:
-            raise TimeoutError(
-                f"world size never returned to {full_ws} within {timeout}s of the kill"
-            )
+            raise TimeoutError(f"world size never reached {want_ws} within {timeout}s of the kill")
         time.sleep(cfg.log_stream_seconds)
 
 
