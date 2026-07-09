@@ -439,508 +439,210 @@ def _launch_node(
     )
 
 
-def run_multinode(cfg: OrchestratorConfig) -> dict | None:
-    """N nodes × one-rank-per-GPU DDP via torchrun's elastic c10d rendezvous,
-    run to the wall-clock budget. Node 0 hosts the rendezvous store; elastic
-    assigns ranks, so the orchestrator streams EVERY node's log (rank 0's loss
-    lines can come from any of them)."""
-    ami, sg_id = _prepare(cfg)
-    run_id = _run_id("multinode")
-    budget = cfg.baseline_seconds
-    market = cfg.spot_market
-    print(
-        f"[multinode] run_id={run_id} nodes={cfg.node_count} budget={budget}s market={market}",
-        file=sys.stderr,
-    )
-    profile = RunProfile(run_id, kind="multinode", market=market)
-    if not aws.is_dry_run():  # dry-run must not create a real W&B run
-        profile.wandb_start(cfg)
-    iids: list[str] = []
-    logs: dict[int, dict] = {}
-    try:
-        # One up-front gate for the whole group (the per-launch gate inside
-        # _launch_node then passes instantly) so we never fire N RunInstances
-        # into a quota wall.
-        aws.wait_vcpu_headroom(cfg.node_count * cfg.instance_vcpu_count(), cfg.vcpu_quota)
-        for i in range(cfg.node_count):
-            logs[i] = {"key": cfg.run_logs_key(run_id, node=i), "state": {"printed": 0}}
-            iids.append(
-                _launch_node(
-                    cfg,
-                    ami,
-                    sg_id,
-                    run_id,
-                    market,
-                    budget,
-                    node_index=i,
-                    logs_key=logs[i]["key"],
-                )
-            )
-        for iid in iids:
-            aws.wait_running(iid)
-        for iid in iids:
-            _record_instance(cfg, profile, iid, market)
-        profile.mark("launch")
-        if aws.is_dry_run():
-            print("[multinode] dry-run: skipping stream/terminate", file=sys.stderr)
-            return None
-        metrics = _stream_until_metrics_multi(cfg, run_id, profile, logs)
-        profile.mark("metrics" if metrics is not None else "timeout")
-        profile.from_metrics(metrics)
-        profile.finalize(cfg)
-        print(f"[multinode] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
-        if metrics is not None:
-            print(f"\n[multinode] metrics: {json.dumps(metrics, indent=2)}")
-        return metrics
-    finally:
-        for iid in iids:
-            aws.terminate(iid)
+def _make_launch_node(cfg, ami, sg_id, run_id, market, budget, profile, logs):
+    """Return ``launch(node_index) -> instance_id`` for the supervisor: allocate
+    a fresh (attempt-suffixed) log key so a replacement never clobbers the dead
+    node's log, launch behind the vCPU gate, wait running, open a cost row."""
+    attempts: dict[int, int] = {}
 
-
-def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
-    """Multi-node preemption with ELASTIC degraded-mode recovery. Launch the
-    group ONCE; per preemption: HARD-terminate one node (no SIGTERM — a graceful
-    stop would coordinate a clean group shutdown, which is not the failure we
-    want; a real Spot reclaim gives none of the peers any warning either). The
-    survivors' collectives abort after NCCL_TIMEOUT, their elastic agents
-    re-rendezvous at world N-1, and training CONTINUES from the node-local
-    checkpoint tier — before the replacement even boots. The orchestrator
-    launches ONE replacement; it dials the live rendezvous and the group scales
-    back to N. The orchestrator is still the only launcher of boxes; torchrun
-    only ever restarts worker processes on boxes that are already up.
-
-    Two watchdog phases verify each kill:
-
-      (a) shrink_resume — the SURVIVORS produce a new checkpoint within
-          ``degraded_recovery_timeout_seconds`` of the kill (training at N-1,
-          replacement not required);
-      (b) full_world — a parsed step line reports the pre-kill world size again
-          within ``recovery_timeout_seconds`` (the replacement joined).
-
-    Either phase timing out falls back to the previously-proven whole-group
-    restart (terminate everything, delete the stale rdzv.json so fresh boxes
-    can't dial a dead store, relaunch) — worst case equals the old
-    pause-and-replace behavior.
-
-    The run-level budget rides in the checkpoint (TRAIN_BUDGET_SECONDS +
-    trained_seconds), so there is no budget.json to recompute after kills —
-    downtime is never billed by construction. The victim per round comes from
-    PREEMPT_VICTIMS (default: always the last node). Killing node 0 is allowed
-    but forfeits elastic recovery — it hosts the rendezvous store, so that kill
-    exercises the whole-group-restart fallback instead. Lost work per kill is
-    bounded by the densified checkpoint interval."""
-    if cfg.node_count < 2:
-        raise SystemExit("multinode-preempt needs NODES >= 2")
-    victims = cfg.preempt_victim_schedule()  # validate before spending anything
-    ami, sg_id = _prepare(cfg)
-    run_id = _run_id("multinode-preempt")
-    total = cfg.train_total_seconds
-    budget = max(1, math.ceil(total))  # constant: the trainer subtracts trained_seconds
-    market = cfg.spot_market
-    interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
-    node_vcpus = cfg.instance_vcpu_count()
-    ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
-    metrics_key = cfg.run_metrics_key(run_id)
-    rdzv_key = cfg.run_rdzv_key(run_id)
-    # Dense checkpoints: a hard kill gives no warning, so lost work is bounded by
-    # this interval (same knobs as run_preempt).
-    cfg.checkpoint_interval_seconds = min(
-        cfg.checkpoint_interval_seconds, cfg.preempt_checkpoint_seconds
-    )
-    cfg.smoke_test_every = max(1, round(30 / cfg.checkpoint_interval_seconds))
-    print(
-        f"[multinode-preempt] run_id={run_id} nodes={cfg.node_count} "
-        f"(min {cfg.nodes_min_count()}) total_train={total}s "
-        f"preemptions={cfg.preempt_count} interval={interval}s market={market} — hard-kill "
-        f"victims={victims}; survivors keep training at reduced world size while one "
-        f"replacement joins (whole-group restart only as fallback)",
-        file=sys.stderr,
-    )
-    profile = RunProfile(run_id, kind="multinode-preempt", market=market)
-    if not aws.is_dry_run():  # dry-run must not create a real W&B run
-        profile.wandb_start(cfg)
-
-    metrics: dict | None = None
-    live: dict[int, str] = {}
-    seq = 0  # counts launch events; suffixes log keys so relaunches never clobber
-    logs: dict[int, dict] = {}  # node -> {"key", "state"}: every live log stream
-
-    def _track_log(i: int) -> str:
-        logs[i] = {
-            "key": cfg.run_logs_key(run_id, node=i, attempt=seq),
-            "state": {"printed": 0},
-        }
-        return logs[i]["key"]
-
-    def _launch_group(mark: str | None) -> None:
-        """Launch all N nodes (one up-front headroom gate for the whole group;
-        the per-launch gate inside _launch_node then passes instantly)."""
-        if mark != "launch":
-            # Fresh log files re-parsed from byte 0, and the resumed rank 0
-            # re-covers a few pre-restart steps — bump the profile's dedup
-            # segment so only THIS group's samples read as new.
-            profile.segment += 1
-        aws.wait_vcpu_headroom(cfg.node_count * node_vcpus, cfg.vcpu_quota)
-        for i in range(cfg.node_count):
-            live[i] = _launch_node(
-                cfg,
-                ami,
-                sg_id,
-                run_id,
-                market,
-                budget,
-                node_index=i,
-                logs_key=_track_log(i),
-            )
-        for iid in live.values():
-            aws.wait_running(iid)
-        for iid in live.values():
-            _record_instance(cfg, profile, iid, market)
-        if mark:
-            profile.mark(mark)
-
-    def _launch_replacement(victim: int) -> None:
-        """One fresh box for the victim's node index; survivors — and their log
-        streams — are untouched. The replacement gets a fresh attempt-suffixed
-        log key so it never clobbers the dead node's log."""
-        live[victim] = _launch_node(
-            cfg,
-            ami,
-            sg_id,
-            run_id,
-            market,
-            budget,
-            node_index=victim,
-            logs_key=_track_log(victim),
+    def launch(node_index: int) -> str:
+        attempts[node_index] = attempts.get(node_index, 0) + 1
+        key = cfg.run_logs_key(run_id, node=node_index, attempt=attempts[node_index] - 1)
+        logs[node_index] = {"key": key, "state": {"printed": 0}}
+        iid = _launch_node(
+            cfg, ami, sg_id, run_id, market, budget, node_index=node_index, logs_key=key
         )
-        aws.wait_running(live[victim])
-        _record_instance(cfg, profile, live[victim], market)
-        profile.mark("relaunch")
+        aws.wait_running(iid)
+        _record_instance(cfg, profile, iid, market)
+        return iid
 
-    def _fallback_restart() -> None:
-        """The pre-elastic worst case: terminate everything and relaunch the
-        whole group. Deletes rdzv.json first — fresh boxes must never dial the
-        dead group's store address."""
-        nonlocal seq
-        aws.delete_object(cfg.bucket, rdzv_key)
-        for iid in live.values():
-            aws.terminate(iid)
-            profile.instance_stopped(iid)
-        for iid in live.values():
-            aws.wait_quota_released(iid)
-        live.clear()
-        seq += 1
-        fallback_base = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
-        _launch_group(mark=None)
-        _wait_train_start(cfg, ckpt_prefix, fallback_base, logs, profile, metrics_key)
-
-    kills = 0
-    try:
-        _launch_group(mark="launch")
-
-        if aws.is_dry_run():
-            # Walk the real control flow, minus the waiting: per planned kill,
-            # terminate that round's victim, free its quota slot, launch one
-            # replacement.
-            for victim in victims:
-                aws.terminate(live[victim])
-                aws.wait_quota_released(live[victim])
-                seq += 1
-                aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
-                _launch_replacement(victim)
-            print("[multinode-preempt] dry-run: skipping stream/kill timing", file=sys.stderr)
-            return None
-
-        base_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
-        _wait_train_start(cfg, ckpt_prefix, base_step, logs, profile, metrics_key)
-        profile.mark("train_start")
-        t0 = time.monotonic()
-
-        while kills < cfg.preempt_count:
-            victim = victims[kills]
-            # Train one hidden interval, then deliver the "Spot reclaim".
-            while time.monotonic() - t0 < interval:
-                _pull_logs(cfg, logs, profile)
-                if aws.object_exists(cfg.bucket, metrics_key):
-                    break  # the budget beat us to it — nothing left to kill
-                time.sleep(cfg.log_stream_seconds)
-            if aws.object_exists(cfg.bucket, metrics_key):
-                break
-            trained = time.monotonic() - t0
-            kills += 1
-            print(
-                f"[multinode-preempt] kill {kills}/{cfg.preempt_count}: hard-terminating "
-                f"node {victim}{' (the master)' if victim == 0 else ''} after ~{trained:.0f}s "
-                f"training (no warning); survivors continue at world "
-                f"{cfg.node_count - 1} of {cfg.node_count} nodes",
-                file=sys.stderr,
-            )
-            # Phase-(b) reference: the world size and step the group ran at just
-            # before the kill (from the trainer's `ws N` step-line suffix).
-            full_ws = next((s.world_size for s in reversed(profile.samples) if s.world_size), None)
-            step_floor = max((s.step for s in profile.samples), default=0)
-            aws.terminate(live[victim])
-            kill_t = time.monotonic()
-            profile.instance_stopped(live[victim])
-            profile.mark("kill")
-            # Only the victim's quota slot frees — the survivors keep theirs
-            # (that's the point) — so the replacement needs exactly one node's
-            # worth of headroom. Survivors re-rendezvous on their own meanwhile.
-            aws.wait_quota_released(live[victim])
-            seq += 1
-            aws.wait_vcpu_headroom(node_vcpus, cfg.vcpu_quota)
-            _launch_replacement(victim)
-            # Phase-(a) baseline — sampled here, bounded BELOW by the stray-upload
-            # window: when the kill spares rank 0, its async checkpoint writer can
-            # land one last upload up to ~NCCL_TIMEOUT past the kill, which would
-            # otherwise satisfy "new checkpoint appeared" instantly (fake 0s
-            # recovery). Sampling after the replacement launch makes the floor
-            # nearly free (boot overlaps it); genuine survivor progress past this
-            # point is exactly what phase (a) is meant to observe.
-            settle = (cfg.nccl_timeout_seconds + 15) - (time.monotonic() - kill_t)
-            if settle > 0:
-                time.sleep(settle)
-            pre_kill_step = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
-            try:
-                # (a) survivors checkpointing again at N-1 — the whole point of
-                # elastic: this must NOT need the replacement. Deadline anchored
-                # at the kill.
-                remaining = cfg.degraded_recovery_timeout_seconds - (time.monotonic() - kill_t)
-                _wait_train_start(
-                    cfg,
-                    ckpt_prefix,
-                    pre_kill_step,
-                    logs,
-                    profile,
-                    metrics_key,
-                    timeout=max(30, math.ceil(remaining)),
-                )
-                profile.mark("shrink_resume")
-                print(
-                    f"[multinode-preempt] survivors training at reduced world size "
-                    f"~{time.monotonic() - kill_t:.0f}s after the kill",
-                    file=sys.stderr,
-                )
-                # (b) replacement joined: a post-kill step line reports the
-                # pre-kill world size at a step past the pre-kill floor.
-                _wait_for_world(
-                    cfg,
-                    logs,
-                    profile,
-                    metrics_key,
-                    want_ws=full_ws,
-                    step_floor=step_floor,
-                    timeout=cfg.recovery_timeout_seconds,
-                    label="multinode-preempt",
-                )
-                profile.mark("full_world")
-                print(
-                    "[multinode-preempt] replacement joined; group back to full world",
-                    file=sys.stderr,
-                )
-            except TimeoutError as e:
-                print(
-                    f"[multinode-preempt] {e} — falling back to whole-group restart",
-                    file=sys.stderr,
-                )
-                _fallback_restart()
-            profile.mark("train_start")
-            t0 = time.monotonic()
-
-        # Final stretch: run out the remaining budget, collect metrics.
-        metrics = _stream_until_metrics_multi(cfg, run_id, profile, logs)
-        profile.mark("metrics" if metrics is not None else "timeout")
-        profile.from_metrics(metrics)
-        for iid in live.values():
-            aws.terminate(iid)
-            profile.instance_stopped(iid)
-        live.clear()
-
-        profile.finalize(cfg)
-        print(f"[multinode-preempt] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
-        if metrics is not None:
-            print(f"\n[multinode-preempt] metrics: {json.dumps(metrics, indent=2)}")
-        return metrics
-    finally:
-        for iid in live.values():
-            aws.terminate(iid)
+    return launch
 
 
-def run_multinode_shrink(cfg: OrchestratorConfig) -> dict | None:
-    """The MINIMAL elastic validation: kill WITHOUT replace. Launch the group,
-    train ``PREEMPT_AFTER`` seconds (default 120), hard-terminate the LAST node
-    — and then launch nothing: if elastic works, the survivors alone must
-    re-rendezvous at world N-1, resume from the node-local tier, and run the
-    remaining budget to metrics.json. No replacement, no whole-group fallback,
-    and no quota waits on the observation path — the console streams every
-    node's log the entire time, so the recovery (or its failure) is visible
-    live. Ends with an explicit PASS/FAIL verdict.
+def _run_supervised(
+    cfg: OrchestratorConfig,
+    *,
+    kind: str,
+    budget: int,
+    replace_on_loss: bool,
+    kill_schedule: list[tuple[float, int]],
+    verdict: bool = False,
+) -> dict | None:
+    """Shared driver for every multi-node experiment: launch N boxes, hand
+    membership to the epoch :class:`~orchestrator.supervisor.Supervisor`, and let
+    it drive to metrics.json. ``multinode`` passes no kills; ``multinode-shrink``
+    one kill with ``replace_on_loss=False`` (+ a PASS/FAIL verdict);
+    ``multinode-preempt`` a schedule with ``replace_on_loss=True``. All three
+    share one code path, so the W&B world-size staircase / degraded phase / cost
+    ledger behave identically across them."""
+    from .supervisor import Policy, Supervisor
 
-    PASS requires all of:
-      (a) a NEW checkpoint within DEGRADED_RECOVERY_TIMEOUT of the kill
-          (survivors checkpointing again);
-      (b) a post-kill step line reporting the shrunken world size
-          (pre-kill ws × (N-1)/N) at a step past the pre-kill floor;
-      (c) metrics.json arriving with that world size and resumed=true.
-
-    Boxes are terminated either way; on FAIL the S3 node logs hold the
-    evidence and a grep hint is printed. The victim is always the last node —
-    node 0 hosts the rendezvous store, and store death is a different (known,
-    fallback-only) failure mode this experiment deliberately excludes."""
     if cfg.node_count < 2:
-        raise SystemExit("multinode-shrink needs NODES >= 2")
+        raise SystemExit(f"{kind} needs NODES >= 2")
     ami, sg_id = _prepare(cfg)
-    run_id = _run_id("multinode-shrink")
-    total = cfg.train_total_seconds
-    budget = max(1, math.ceil(total))
+    run_id = _run_id(kind)
     market = cfg.spot_market
-    kill_after = cfg.preempt_after_seconds or 120
-    victim = cfg.node_count - 1
-    ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
-    metrics_key = cfg.run_metrics_key(run_id)
-    cfg.checkpoint_interval_seconds = min(
-        cfg.checkpoint_interval_seconds, cfg.preempt_checkpoint_seconds
-    )
-    cfg.smoke_test_every = max(1, round(30 / cfg.checkpoint_interval_seconds))
+    if kill_schedule:
+        # Dense checkpoints: a hard kill gives no warning, so lost work (and the
+        # time to observe a shrink resume) is bounded by this interval.
+        cfg.checkpoint_interval_seconds = min(
+            cfg.checkpoint_interval_seconds, cfg.preempt_checkpoint_seconds
+        )
+        cfg.smoke_test_every = max(1, round(30 / cfg.checkpoint_interval_seconds))
     print(
-        f"[multinode-shrink] run_id={run_id} nodes={cfg.node_count} "
-        f"(min {cfg.nodes_min_count()}) total_train={total}s kill_after={kill_after}s "
-        f"market={market} — hard-kill node {victim}, NO replacement: survivors must "
-        f"finish the run at world size N-1 on their own",
+        f"[{kind}] run_id={run_id} nodes={cfg.node_count} budget={budget}s market={market} "
+        f"kills={kill_schedule} replace={replace_on_loss}",
         file=sys.stderr,
     )
-    profile = RunProfile(run_id, kind="multinode-shrink", market=market)
+    profile = RunProfile(run_id, kind=kind, market=market)
     if not aws.is_dry_run():
         profile.wandb_start(cfg)
 
-    live: dict[int, str] = {}
+    node_ids: dict[int, str] = {}
     logs: dict[int, dict] = {}
-    checks: list[tuple[str, bool, str]] = []  # (name, passed, detail)
+    launch_node = _make_launch_node(cfg, ami, sg_id, run_id, market, budget, profile, logs)
+
     try:
         aws.wait_vcpu_headroom(cfg.node_count * cfg.instance_vcpu_count(), cfg.vcpu_quota)
         for i in range(cfg.node_count):
-            logs[i] = {"key": cfg.run_logs_key(run_id, node=i), "state": {"printed": 0}}
-            live[i] = _launch_node(
-                cfg, ami, sg_id, run_id, market, budget, node_index=i, logs_key=logs[i]["key"]
-            )
-        for iid in live.values():
-            aws.wait_running(iid)
-        for iid in live.values():
-            _record_instance(cfg, profile, iid, market)
+            node_ids[i] = launch_node(i)
         profile.mark("launch")
 
         if aws.is_dry_run():
-            aws.terminate(live[victim])
-            print("[multinode-shrink] dry-run: skipping stream/kill timing", file=sys.stderr)
+            # Walk the kill/replace control flow minus the waiting.
+            for _secs, victim in kill_schedule:
+                aws.terminate(node_ids[victim])
+                if replace_on_loss:
+                    aws.wait_quota_released(node_ids[victim])
+                    node_ids[victim] = launch_node(victim)
+            print(f"[{kind}] dry-run: skipping supervision", file=sys.stderr)
             return None
 
-        _wait_train_start(cfg, ckpt_prefix, 0, logs, profile, metrics_key)
-        profile.mark("train_start")
-
-        # Train the pre-kill stretch with the console live the whole way.
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < kill_after:
-            _pull_logs(cfg, logs, profile)
-            if aws.object_exists(cfg.bucket, metrics_key):
-                raise SystemExit(
-                    "[multinode-shrink] run finished before the kill — raise "
-                    "TRAIN_TOTAL_SECONDS or lower PREEMPT_AFTER"
-                )
-            time.sleep(cfg.log_stream_seconds)
-
-        full_ws = next((s.world_size for s in reversed(profile.samples) if s.world_size), None)
-        step_floor = max((s.step for s in profile.samples), default=0)
-        shrunk_ws = None
-        if full_ws is not None and full_ws % cfg.node_count == 0:
-            shrunk_ws = full_ws // cfg.node_count * (cfg.node_count - 1)
-        print(
-            f"[multinode-shrink] killing node {victim} at step ~{step_floor} "
-            f"(ws {full_ws}); expecting survivors at ws {shrunk_ws} — no replacement "
-            f"will be launched",
-            file=sys.stderr,
+        policy = Policy(
+            replace_on_loss=replace_on_loss,
+            recovery_timeout_s=cfg.recovery_timeout_seconds,
         )
-        aws.terminate(live[victim])
-        kill_t = time.monotonic()
-        profile.instance_stopped(live.pop(victim))
-        profile.mark("kill")
-
-        # Stray-upload floor (same reasoning as multinode-preempt), spent
-        # streaming logs instead of sleeping blind.
-        while time.monotonic() - kill_t < cfg.nccl_timeout_seconds + 15:
-            _pull_logs(cfg, logs, profile)
-            time.sleep(cfg.log_stream_seconds)
-        baseline = aws.max_checkpoint_step(cfg.bucket, ckpt_prefix)
-
-        # (a) survivors checkpointing again, deadline anchored at the kill.
-        try:
-            remaining = cfg.degraded_recovery_timeout_seconds - (time.monotonic() - kill_t)
-            _wait_train_start(
-                cfg,
-                ckpt_prefix,
-                baseline,
-                logs,
-                profile,
-                metrics_key,
-                timeout=max(30, math.ceil(remaining)),
-            )
-            profile.mark("shrink_resume")
-            dt = time.monotonic() - kill_t
-            checks.append(("survivors checkpointing again", True, f"{dt:.0f}s after the kill"))
-        except TimeoutError:
-            checks.append(
-                (
-                    "survivors checkpointing again",
-                    False,
-                    f"nothing new within {cfg.degraded_recovery_timeout_seconds}s",
-                )
-            )
-            raise
-
-        # (b) step lines at the shrunken world size, past the pre-kill floor.
-        try:
-            _wait_for_world(
-                cfg,
-                logs,
-                profile,
-                metrics_key,
-                want_ws=shrunk_ws,
-                step_floor=step_floor,
-                timeout=cfg.degraded_recovery_timeout_seconds,
-                label="multinode-shrink",
-            )
-            checks.append(("step lines at shrunken world size", True, f"ws {shrunk_ws} observed"))
-        except TimeoutError:
-            checks.append(("step lines at shrunken world size", False, f"no ws {shrunk_ws} line"))
-            raise
-
-        # (c) the survivors run the remaining budget out and finalize the run.
-        metrics = _stream_until_metrics_multi(cfg, run_id, profile, logs)
+        sup = Supervisor(
+            cfg,
+            profile,
+            run_id=run_id,
+            policy=policy,
+            node_ids=node_ids,
+            logs=logs,
+            launch_node=launch_node,
+            pull_logs=lambda: _pull_logs(cfg, logs, profile),
+            kill_schedule=kill_schedule,
+        )
+        metrics = sup.run(deadline_s=cfg.metrics_timeout_seconds)
         profile.mark("metrics" if metrics is not None else "timeout")
         profile.from_metrics(metrics)
-        if metrics is None:
-            checks.append(("metrics.json from the shrunken group", False, "timed out"))
-            raise TimeoutError("metrics.json never arrived")
-        ok = (shrunk_ws is None or metrics.get("world_size") == shrunk_ws) and metrics.get(
-            "resumed"
-        )
-        checks.append(
-            (
-                "metrics.json from the shrunken group",
-                bool(ok),
-                f"world_size={metrics.get('world_size')} resumed={metrics.get('resumed')} "
-                f"restart_count={metrics.get('restart_count')}",
-            )
-        )
+        if metrics is not None:
+            _pull_samples(cfg, run_id, profile)
+
+        if verdict:
+            _shrink_verdict(cfg, run_id, profile, sup, metrics)
+
+        profile.finalize(cfg)
+        print(f"[{kind}] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
+        if metrics is not None:
+            print(f"\n[{kind}] metrics: {json.dumps(metrics, indent=2)}")
         return metrics
-    except (TimeoutError, KeyboardInterrupt):
-        return None
     finally:
-        for iid in live.values():
+        for iid in node_ids.values():
             aws.terminate(iid)
-            profile.instance_stopped(iid)
-        if not aws.is_dry_run():
-            profile.finalize(cfg)
-            _print_shrink_verdict(cfg, run_id, checks)
+
+
+def run_multinode(cfg: OrchestratorConfig) -> dict | None:
+    """N nodes x one-rank-per-GPU DDP under the epoch supervisor, run to the
+    wall-clock budget with no kills. Proves a clean multi-node run end to end."""
+    return _run_supervised(
+        cfg,
+        kind="multinode",
+        budget=cfg.baseline_seconds,
+        replace_on_loss=False,
+        kill_schedule=[],
+    )
+
+
+def run_multinode_shrink(cfg: OrchestratorConfig) -> dict | None:
+    """The minimal elastic validation: ONE kill, NO replacement. The supervisor
+    publishes a shrink epoch; survivors must re-form at N-1 and finish the run on
+    their own. Ends with an explicit PASS/FAIL verdict (survivors checkpointed
+    again, step lines at the shrunken world size, metrics with that world size +
+    resumed). The victim is the last node — with no rendezvous store on any box,
+    that's no longer special, but it keeps the experiment simple."""
+    total = cfg.train_total_seconds
+    kill_after = cfg.preempt_after_seconds or 120
+    return _run_supervised(
+        cfg,
+        kind="multinode-shrink",
+        budget=max(1, math.ceil(total)),
+        replace_on_loss=False,
+        kill_schedule=[(kill_after, cfg.node_count - 1)],
+        verdict=True,
+    )
+
+
+def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
+    """Multi-node preemption under the epoch supervisor: a schedule of hard kills,
+    each followed by a replacement that rejoins at the next epoch. Same profile
+    marks as before (kill -> shrink_resume -> relaunch -> full_world), so the W&B
+    world-size staircase, degraded phase, and goodput carry over unchanged."""
+    victims = cfg.preempt_victim_schedule()
+    total = cfg.train_total_seconds
+    interval = cfg.preempt_after_seconds or math.ceil(total / (cfg.preempt_count + 1))
+    # Kill i fires `interval` seconds after the PREVIOUS one resumed; the
+    # supervisor clock is seconds-since-train-start, so space them by interval.
+    schedule = [((k + 1) * interval, victims[k]) for k in range(cfg.preempt_count)]
+    return _run_supervised(
+        cfg,
+        kind="multinode-preempt",
+        budget=max(1, math.ceil(total)),
+        replace_on_loss=True,
+        kill_schedule=schedule,
+    )
+
+
+def _shrink_verdict(cfg, run_id, profile, sup, metrics) -> None:
+    """Turn the observed run into the three PASS/FAIL checks the shrink
+    experiment exists to answer, then print the verdict."""
+    full_ws = sup.st.full_ws
+    shrunk_ws = None
+    if full_ws is not None and full_ws % cfg.node_count == 0:
+        shrunk_ws = full_ws // cfg.node_count * (cfg.node_count - 1)
+    marked = {e.event for e in profile.events}
+    checks: list[tuple[str, bool, str]] = []
+
+    resumed_mark = "shrink_resume" in marked
+    checks.append(
+        (
+            "survivors checkpointing again",
+            resumed_mark,
+            "shrink_resume mark emitted" if resumed_mark else "no new checkpoint after the kill",
+        )
+    )
+    ws_seen = shrunk_ws is not None and any(s.world_size == shrunk_ws for s in profile.samples)
+    checks.append(
+        (
+            "step lines at shrunken world size",
+            bool(ws_seen),
+            f"ws {shrunk_ws} observed" if ws_seen else f"no ws {shrunk_ws} step line",
+        )
+    )
+    m_ok = bool(
+        metrics
+        and (shrunk_ws is None or metrics.get("world_size") == shrunk_ws)
+        and metrics.get("resumed")
+    )
+    checks.append(
+        (
+            "metrics.json from the shrunken group",
+            m_ok,
+            f"world_size={metrics.get('world_size') if metrics else None} "
+            f"resumed={metrics.get('resumed') if metrics else None}",
+        )
+    )
+    _print_shrink_verdict(cfg, run_id, checks)
 
 
 def _print_shrink_verdict(
@@ -951,14 +653,14 @@ def _print_shrink_verdict(
         print("  no checks ran (killed before training started?)", file=sys.stderr)
     for name, passed, detail in checks:
         print(f"  {'PASS' if passed else 'FAIL'}  {name} — {detail}", file=sys.stderr)
-    verdict = bool(checks) and all(p for _, p, _ in checks)
-    summary = "PASS — survivors kept training without the dead node" if verdict else "FAIL"
+    ok = bool(checks) and all(p for _, p, _ in checks)
+    summary = "PASS — survivors kept training without the dead node" if ok else "FAIL"
     print(f"  VERDICT: {summary}", file=sys.stderr)
-    if not verdict:
+    if not ok:
         print(
             "  evidence: aws s3 cp "
             f"s3://{cfg.bucket}/{cfg.run_prefix}/{run_id}/logs/boot-node<N>.log - "
-            "| grep -nE '\\[rdzv\\]|torchrun|Rendezvous|\\[resume\\]|Traceback'",
+            "| grep -nE '\\[epoch\\]|torchrun|\\[resume\\]|Traceback'",
             file=sys.stderr,
         )
     print("========================================================\n", file=sys.stderr)
@@ -968,59 +670,23 @@ def _wait_train_start(
     cfg: OrchestratorConfig,
     ckpt_prefix: str,
     base_step: int,
-    logs: dict[int, dict],
+    logs_key: str,
     profile: RunProfile,
+    state: dict,
     metrics_key: str,
     timeout: int | None = None,
 ) -> None:
-    """Block (while streaming every node's log) until a NEW checkpoint appears
-    past ``base_step`` — training is underway — or metrics.json shows up (a very
-    short final segment). ``timeout`` overrides the metrics timeout (the elastic
-    watchdogs wait their own bounds instead)."""
+    """Single-box variant used by ``run_preempt``: block (streaming one box's log)
+    until a NEW checkpoint appears past ``base_step`` or metrics.json shows up."""
     deadline = time.monotonic() + (timeout or cfg.metrics_timeout_seconds)
     while True:
-        _pull_logs(cfg, logs, profile)
+        _pull_log(cfg, logs_key, profile, state)
         if aws.max_checkpoint_step(cfg.bucket, ckpt_prefix) > base_step:
             return
         if aws.object_exists(cfg.bucket, metrics_key):
             return
         if time.monotonic() > deadline:
             raise TimeoutError("training never started (no new checkpoint appeared)")
-        time.sleep(cfg.log_stream_seconds)
-
-
-def _wait_for_world(
-    cfg: OrchestratorConfig,
-    logs: dict[int, dict],
-    profile: RunProfile,
-    metrics_key: str,
-    *,
-    want_ws: int | None,
-    step_floor: int,
-    timeout: int,
-    label: str,
-) -> None:
-    """Block until a step line reports world size ``want_ws`` at a step PAST
-    ``step_floor`` (both guards matter: a lag-parsed pre-kill line carries the
-    old ws at an old step, and other-regime lines carry a different ws).
-    ``want_ws`` None means the trainer never reported ws (pre-elastic log) —
-    checkpoint progress already proved training, so just note it and return."""
-    if want_ws is None:
-        print(
-            f"[{label}] no `ws` in step lines before the kill — skipping the "
-            "world-size check (old trainer?)",
-            file=sys.stderr,
-        )
-        return
-    deadline = time.monotonic() + timeout
-    while True:
-        _pull_logs(cfg, logs, profile)
-        if any(s.world_size == want_ws and s.step > step_floor for s in profile.samples):
-            return
-        if aws.object_exists(cfg.bucket, metrics_key):
-            return  # run finished — nothing left to verify against step lines
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"world size never reached {want_ws} within {timeout}s of the kill")
         time.sleep(cfg.log_stream_seconds)
 
 

@@ -180,8 +180,8 @@ class OrchestratorConfig:
 
     # --- multinode-preempt victim schedule ------------------------------------
     # Comma-separated node index to hard-kill per preemption round, e.g. "1,0"
-    # (kill node 1 first, then node 0 — the master; its replacement republishes
-    # rdzv.json on the same generation code path). Empty = always the last node.
+    # (kill node 1 first, then node 0). Any node is killable — the epoch after a
+    # kill just names a new lowest-index master. Empty = always the last node.
     preempt_victims: str = field(default_factory=lambda: _env("PREEMPT_VICTIMS", ""))
 
     # --- DDP experiment (spot-orchestrate ddp) ------------------------------
@@ -194,41 +194,26 @@ class OrchestratorConfig:
 
     # --- multi-node experiment (spot-orchestrate multinode) ------------------
     # Nodes in the training group; each runs torchrun with one rank per GPU.
-    # Node 0 hosts the c10d rendezvous store and publishes its private IP to S3
-    # (runs/<run_id>/rdzv.json); the other nodes poll that key before starting.
+    # The orchestrator owns membership: it publishes runs/<run_id>/epoch.json
+    # (who is in the group, their ranks, the master addr/port) and every box's
+    # sidecar polls it and runs STATIC torchrun for the current epoch. Node 0 of
+    # an epoch is just the lowest live node index — no node hosts a rendezvous
+    # store, so any node is killable.
     node_count: int = field(default_factory=lambda: _env_int("NODES", 2))
-    # Minimum nodes the elastic rendezvous will train with (torchrun
-    # --nnodes=MIN:N). 0 (default) = node_count - 1: survivors keep training
-    # while ONE dead node is being replaced; the replacement joining scales the
-    # group back up. Set NODES_MIN=NODES to pin the old all-or-nothing behavior.
-    nodes_min: int = field(default_factory=lambda: _env_int("NODES_MIN", 0))
-    # torchrun --max-restarts: worker-group restarts one agent tolerates before
-    # giving up (each membership change — a kill OR a rejoin — consumes one).
-    # The boot script's outer retry loop catches exhaustion, so this is a
-    # per-torchrun bound, not a run bound.
-    max_restarts: int = field(default_factory=lambda: _env_int("MAX_RESTARTS", 100))
-    # c10d rendezvous last-call: how long a completable rendezvous (>= MIN nodes
-    # present) holds the door open for stragglers. Bounds the shrink downtime:
-    # survivors wait this long for the dead node before proceeding at N-1.
-    rdzv_last_call_seconds: int = field(default_factory=lambda: _env_int("RDZV_LAST_CALL", 15))
+    # Base for the per-epoch master port: master_port = rdzv_port + epoch, so a
+    # relaunched master never fights TIME_WAIT on its own previous socket.
     rdzv_port: int = field(default_factory=lambda: _env_int("RDZV_PORT", 29400))
-    # Collective timeout exported to multi-node boxes so survivors' collectives
-    # abort fast when a peer node dies (torch's default is 10 minutes). 20s keeps
-    # >10x margin over the worst legitimate stall at this model size (an async-
-    # checkpoint snapshot or a slow TCP allreduce is well under 2s); detection of
-    # a dead peer costs ~this long, so it's most of the pre-recovery stall.
+    # Collective timeout exported to multi-node boxes (torch's default is 10
+    # minutes). Under the epoch supervisor a survivor's torchrun is normally
+    # killed by its sidecar the moment the shrink epoch lands (~3s), so this is
+    # the IN-BAND BACKSTOP: if the supervisor is slow, the survivor's collective
+    # still aborts here rather than hanging. 20s keeps >10x margin over the worst
+    # legitimate stall at this model size (an async-checkpoint snapshot or a slow
+    # TCP allreduce is well under 2s).
     nccl_timeout_seconds: int = field(default_factory=lambda: _env_int("NCCL_TIMEOUT", 20))
-    # After a kill + replacement launch, how long the orchestrator waits for the
-    # group to produce a NEW checkpoint (proof the rejoin worked) before falling
-    # back to a whole-group restart.
+    # No checkpoint progress for this long -> the supervisor's whole-group
+    # restart floor (terminate all, relaunch, publish a fresh epoch).
     recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 600))
-    # Elastic phase-(a) watchdog: how long after a kill the SURVIVORS get to
-    # produce a new checkpoint at world N-1 (NCCL abort ~20s + re-rendezvous
-    # ~15s last-call + local restore + one checkpoint interval, with margin)
-    # before the orchestrator falls back to a whole-group restart.
-    degraded_recovery_timeout_seconds: int = field(
-        default_factory=lambda: _env_int("DEGRADED_RECOVERY_TIMEOUT", 180)
-    )
 
     # --- inference fleet (ROADMAP Part 1) ------------------------------------
     # CPU instances by default: the 10M-param model serves fine on CPU, and
@@ -323,21 +308,27 @@ class OrchestratorConfig:
     def run_logs_uri(self, run_id: str, segment: int | None = None) -> str:
         return f"s3://{self.bucket}/{self.run_logs_key(run_id, segment)}"
 
-    # Multi-node rendezvous bootstrap: node 0 publishes {addr, port} here ONCE
-    # at boot (republished with a bumped port only on the rare outer retry); the
-    # other nodes — including replacements joining a live group — poll it, then
-    # run torchrun's elastic c10d rendezvous against node 0's store. The
-    # orchestrator deletes the key before a whole-group restart so a fresh group
-    # can't dial a dead node 0's address.
-    def run_rdzv_key(self, run_id: str) -> str:
-        return f"{self.run_prefix}/{run_id}/rdzv.json"
+    # Epoch protocol (see supervisor.py / sidecar.py). The orchestrator is the
+    # ONLY writer of epoch.json — the membership document every box's sidecar
+    # polls: {epoch, members:[{node,ip,rank}], node_count, master_addr,
+    # master_port}. Each box registers node<i>.json {ip, instance_id} once at
+    # boot; that registration is both the ready-marker and the join request
+    # (admission = the orchestrator including the node in a published epoch).
+    def run_epoch_key(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/epoch.json"
 
-    def nodes_min_count(self, nodes: int | None = None) -> int:
-        """MIN of torchrun --nnodes=MIN:N — tolerate one node down by default."""
-        n = nodes or self.node_count
-        if self.nodes_min > 0:
-            return min(self.nodes_min, n)
-        return max(1, n - 1)
+    def run_epoch_uri(self, run_id: str) -> str:
+        return f"s3://{self.bucket}/{self.run_epoch_key(run_id)}"
+
+    def run_nodes_prefix(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/nodes/"
+
+    def run_node_key(self, run_id: str, node: int) -> str:
+        return f"{self.run_prefix}/{run_id}/nodes/node{node}.json"
+
+    def run_uri(self, run_id: str) -> str:
+        """s3://bucket/runs/<run_id> — the base the box sidecar is pointed at."""
+        return f"s3://{self.bucket}/{self.run_prefix}/{run_id}"
 
     # Inference-fleet keys: heartbeat docs the router polls, per-box boot logs,
     # and a state doc recording which instances belong to the fleet.

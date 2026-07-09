@@ -132,24 +132,29 @@ MVP (invariant: loss continues from the checkpoint).
 - **1b — 1 node, 4 GPUs:** add `torchrun` + DDP; adopt the elastic agent so
   survivors re-rendezvous when one process dies. Rendezvous is local, so no
   coordinator box yet. Same resume test, now across a DDP restart.
-- **1c — multi-node ELASTIC spot (current):** N ≤ 8 nodes via torchrun elastic
-  (`--nnodes=N-1:N`, c10d store on node 0, endpoint published once via S3
-  rdzv.json). **Survivors keep training at world N−1 while a dead node is
-  replaced** — ~40–60s downtime per membership change instead of the full
-  replacement boot. Constant global batch via gradient accumulation
-  (`GLOBAL_BATCH_SIZE`; K recomputed per world size); two-tier checkpoints
-  (step-aligned node-local disk for instant survivor restores + rank-0 async
-  S3 for replacements; group-MIN agreement picks the resume step); the run
-  budget rides in the checkpoint (`TRAIN_BUDGET_SECONDS` − `trained_seconds`,
-  so downtime is never billed). The orchestrator watchdog is two-phase per
-  kill (shrink_resume ≤ 180s → full_world ≤ 600s), whole-group restart as
-  fallback (also the node-0-death path — the store dies with it). W&B mirrors
-  the world-size staircase next to the loss curve, plus goodput. Details:
-  docs/multinode-design.md. Still open in 1c: dedicated `t3.micro` rendezvous
-  store (makes node 0 killable), the Go control plane (**observe / compare /
-  act**). **Headline experiment:** on-demand baseline vs. spot to the same
-  target loss for under **C** within **(1+ε)·T**; report goodput, recovery
-  time, lost work, idle-wait.
+- **1c — multi-node spot, EPOCH SUPERVISOR (current):** N ≤ 8 nodes. A single
+  orchestrator owns membership by publishing monotonic **epoch documents**
+  (`runs/<run_id>/epoch.json`); every box runs a **sidecar** that obeys them by
+  running STATIC torchrun per epoch. **Survivors keep training at world N−1
+  while a dead node is replaced** — ~15–30s per membership change. This
+  replaced a torchrun-**elastic** design (`--nnodes=N-1:N`, c10d dynamic
+  rendezvous) that passed all local tests on torch 2.4 but hung >180s on the
+  DLAMI's torch ≥2.8 — the dynamic rendezvous is a version-dependent black box,
+  so we moved to central orchestration (one writer, N readers, our code + our
+  logs). Kept from the elastic work: constant global batch via gradient
+  accumulation (`GLOBAL_BATCH_SIZE`; K recomputed per world size); two-tier
+  checkpoints (step-aligned node-local disk for instant survivor restores +
+  rank-0 async S3 for replacements; group-MIN agreement picks the resume step);
+  budget-in-checkpoint (`TRAIN_BUDGET_SECONDS` − `trained_seconds`, so downtime
+  is never billed); the W&B world-size staircase + goodput. The supervisor's
+  decision core is a PURE reducer (`decide(Observation, Policy) -> [Action]`,
+  table-tested); the whole protocol runs on localhost in `test_epoch_e2e.py`
+  (real sidecars + static torchrun). No node hosts a rendezvous store, so any
+  node is killable. Details: docs/multinode-design.md. Still open in 1c: promote
+  the supervisor onto a dedicated on-demand `t3.micro` (durable control plane),
+  the Go control plane (**observe / compare / act**). **Headline experiment:**
+  on-demand baseline vs. spot to the same target loss for under **C** within
+  **(1+ε)·T**; report goodput, recovery time, lost work, idle-wait.
 - **1d — real Llama-arch model:** same 1c system, bigger model. Shows the
   controller is model-agnostic and that η improves with model size, giving a
   cleaner savings story. Validation-at-scale, not new infra — watch memory
@@ -182,8 +187,10 @@ src/orchestrator/      # local control plane (boto3) — you run this
   setup.py             # idempotent: bucket + IAM instance profile + SG
   dataset.py           # prepare-once → upload to S3
   bake.py              # bake-ami: pre-provisioned AMI (repo+deps) → faster boots
-  bootstrap.py         # EC2 user-data script builder
-  experiments.py       # run_baseline / run_spot (launch, kill, resume, poll)
+  bootstrap.py         # EC2 user-data script builder (multinode → sidecar)
+  experiments.py       # run_baseline / run_spot / _run_supervised (multinode)
+  supervisor.py        # epoch supervisor: pure decide() reducer + Effects loop
+  sidecar.py           # per-box: obey epoch.json, run static torchrun per epoch
   config.py            # OrchestratorConfig (env-overridable)
   __main__.py          # CLI: setup | stage-data | baseline | spot [--dry-run]
 third_party/nanoGPT/   # Karpathy's nanoGPT — git submodule, read-only.

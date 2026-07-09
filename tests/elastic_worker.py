@@ -26,8 +26,9 @@ def main() -> None:
     world = dist.get_world_size()
     rank = dist.get_rank()
     restart = os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")
+    tag = os.environ.get("E2E_TAG", "?")  # which agent spawned this worker
     with open(out, "a") as f:
-        f.write(f"start world={world} rank={rank} restart={restart}\n")
+        f.write(f"start world={world} rank={rank} restart={restart} tag={tag}\n")
         f.flush()
     for _ in range(600):  # <= 60s of 0.1s heartbeats
         t = torch.zeros(1)

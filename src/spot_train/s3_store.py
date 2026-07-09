@@ -175,6 +175,24 @@ def put_bytes(data: bytes, uri: str) -> None:
             f.write(data)
 
 
+def read_bytes(uri: str) -> bytes | None:
+    """Return the bytes at ``uri`` (S3 object or local file), or None if it does
+    not exist. The read side of :func:`put_bytes` — used for the small control
+    docs the epoch protocol polls (epoch.json, node<i>.json). No checksum
+    verification: these are tiny JSON docs rewritten in place, not checkpoints."""
+    if is_s3(uri):
+        bucket, key = _split(uri)
+        try:
+            return _client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        except Exception:  # noqa: BLE001 — NoSuchKey (and any transient error) => absent
+            return None
+    try:
+        with open(uri, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
 def exists(uri: str) -> bool:
     if is_s3(uri):
         bucket, key = _split(uri)

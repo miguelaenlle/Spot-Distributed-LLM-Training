@@ -4,9 +4,10 @@ Pins the boot-script shapes the experiments depend on:
 
   - single-process and single-node-DDP scripts stay free of multi-node
     artifacts (the multinode work must not leak into the proven 1a/1b paths);
-  - the multi-node ELASTIC loop has the pieces degraded-mode training needs
-    (min:max nnodes, c10d rendezvous on node 0, publish-once rdzv.json,
-    max-restarts, checkpoint-carried budget, done-signal check);
+  - the multi-node boot script hands off to the epoch sidecar (registers +
+    runs orchestrator.sidecar) and carries the checkpoint-budget/local-tier
+    env — with NO torchrun/rendezvous flags of its own (the sidecar owns the
+    static torchrun per epoch);
   - every generated script parses (`bash -n`).
 """
 
@@ -96,89 +97,64 @@ def test_single_node_paths_have_no_multinode_artifacts():
         ud = _ud(**kwargs)
         for marker in (
             "rdzv",
+            "epoch",
+            "sidecar",
             "NCCL_TIMEOUT",
             "MN_RC",
             "TORCH_NCCL_DUMP_ON_TIMEOUT",
             "TRAIN_BUDGET_SECONDS",
             "LOCAL_CHECKPOINT_DIR",
             "--nnodes",
-            "max-restarts",
         ):
             assert marker not in ud, f"{marker!r} leaked into single-node user-data"
     assert "--standalone" in _ud(ddp=True)
 
 
-def test_multinode_master_hosts_elastic_rendezvous():
-    ud = _ud(ddp=True, nodes=2, node_index=0)
-    # Node 0 publishes its addr/port ONCE per attempt, BEFORE torchrun, so its
-    # agent hosts the c10d store and workers/replacements know where to dial.
-    publish = ud.index('"addr": "$RDZV_ADDR"')
-    torchrun = ud.index("torch.distributed.run")
-    assert publish < torchrun
-    # Fresh port per outer attempt dodges TIME_WAIT if node 0's agent relaunches.
-    assert "PORT=$((29400 + ATTEMPT - 1))" in ud
-    # No generation machinery anywhere.
-    for marker in ("GEN", "generation", "ready/", "budget.json"):
-        assert marker not in ud, f"{marker!r} survived the elastic rewrite"
+def test_multinode_hands_off_to_epoch_sidecar():
+    # The box registers + runs the sidecar; it does NOT negotiate a rendezvous.
+    for node_index in (0, 1, 2):
+        ud = _ud(ddp=True, nodes=3, node_index=node_index)
+        assert (
+            f'-m orchestrator.sidecar --run-uri "s3://test-bucket/runs/run-1" '
+            f"--node-index {node_index}" in ud
+        )
+        assert 'export NPROC_PER_NODE="gpu"' in ud
+        # No torchrun / rendezvous flags in the boot script itself — the sidecar
+        # owns the static torchrun invocation now.
+        for marker in (
+            "torch.distributed.run",
+            "--rdzv",
+            "--node_rank",
+            "--nnodes",
+            "--max-restarts",
+        ):
+            assert marker not in ud, f"{marker!r} survived the epoch rewrite"
 
 
-def test_multinode_worker_dials_what_is_published():
-    ud = _ud(ddp=True, nodes=2, node_index=1)
-    # Worker joins whatever node 0 actually published (addr/port read back from
-    # rdzv.json, not assumed) — the same path a mid-run replacement takes.
-    assert "read RDZV_ADDR PORT < /tmp/rdzv_join" in ud
-    # A worker never publishes.
-    assert '"addr": "$RDZV_ADDR"' not in ud
-
-
-def test_multinode_elastic_torchrun_flags():
-    # min nodes defaults to N-1 (>=1): survivors keep training with one down.
-    for nodes, node_index, nnodes in ((2, 0, "1:2"), (2, 1, "1:2"), (3, 2, "2:3"), (4, 0, "3:4")):
-        ud = _ud(ddp=True, nodes=nodes, node_index=node_index)
-        assert f"--nnodes={nnodes}" in ud
-        assert "--rdzv_backend=c10d" in ud
-        assert '--rdzv_endpoint="$RDZV_ADDR:$PORT"' in ud
-        assert "--rdzv_id=run-1" in ud
-        assert "--max-restarts=100" in ud
-        assert '--rdzv_conf="last_call_timeout=15"' in ud
-        # Elastic assigns ranks — the static-rendezvous flags must be gone.
-        assert "--node_rank" not in ud
-        assert "--master_addr" not in ud
-        assert "--master_port" not in ud
-
-
-def test_multinode_budget_and_done_signal():
+def test_multinode_budget_env_and_done_signal():
     for node_index in (0, 1):
         ud = _ud(ddp=True, nodes=2, node_index=node_index)
-        # Run-level budget rides in the checkpoint: the box exports the total
-        # once; every elastic restart derives its own remaining time. The old
-        # per-generation budget.json protocol must be gone.
+        # Run-level budget rides in the checkpoint; local tier for fast resume.
         assert 'export TRAIN_BUDGET_SECONDS="120"' in ud
         assert 'export LOCAL_CHECKPOINT_DIR="/tmp/spot-ckpt"' in ud
-        assert "budget.json" not in ud
-        assert "remaining_seconds" not in ud
-        # metrics.json is the group-wide done signal; a clean local exit or the
-        # done signal are the only RC=0 paths.
-        assert "metrics.json" in ud
-        assert "MN_RC=0" in ud
-        # Bounded outer retries — exhaustion leaves the box up for the watchdog.
-        assert 'if [ "$ATTEMPT" -gt 20 ]' in ud
-        # Survivors abort fast on a dead peer — and skip torch's ~2-minute
-        # post-timeout debug dump, which delayed every rejoin.
+        # NCCL crash is the in-band backstop to the supervisor's epoch bump.
         assert 'export NCCL_TIMEOUT="20"' in ud
         assert 'export TORCH_NCCL_DUMP_ON_TIMEOUT="0"' in ud
+        # The old generation/budget.json rendezvous protocol is gone.
+        for marker in ("budget.json", "remaining_seconds", "GEN", "ready/"):
+            assert marker not in ud, f"{marker!r} survived the epoch rewrite"
 
 
-def test_nodes_min_count():
+def test_nproc_per_node_forwarded_to_sidecar():
+    ud = _ud(ddp=True, nodes=2, node_index=0, nproc_per_node=2)
+    assert 'export NPROC_PER_NODE="2"' in ud
+
+
+def test_config_epoch_keys():
     cfg = _cfg()
-    cfg.node_count = 4
-    assert cfg.nodes_min_count() == 3  # default: tolerate one node down
-    cfg.node_count = 2
-    assert cfg.nodes_min_count() == 1
-    cfg.nodes_min = 2
-    assert cfg.nodes_min_count() == 2  # NODES_MIN=NODES pins all-or-nothing
-    cfg.nodes_min = 9  # clamped to the group size
-    assert cfg.nodes_min_count() == 2
+    assert cfg.run_epoch_key("run-1") == "runs/run-1/epoch.json"
+    assert cfg.run_node_key("run-1", 3) == "runs/run-1/nodes/node3.json"
+    assert cfg.run_uri("run-1") == "s3://test-bucket/runs/run-1"
 
 
 def test_log_key_attempt_suffix():

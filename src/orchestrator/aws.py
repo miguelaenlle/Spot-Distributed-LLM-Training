@@ -129,6 +129,20 @@ def max_checkpoint_step(bucket: str, prefix: str) -> int:
     return best
 
 
+def object_last_modified(bucket: str, key: str) -> float | None:
+    """POSIX timestamp of ``key``'s last write, or None if absent. The boxes
+    re-upload their boot log every few seconds, so the age of the log key is a
+    free liveness heartbeat — no box-side heartbeat machinery needed."""
+    if _DRY_RUN:
+        _log(f"head s3://{bucket}/{key} (last-modified)")
+        return None
+    try:
+        r = _client("s3").head_object(Bucket=bucket, Key=key)
+        return r["LastModified"].timestamp()
+    except Exception:  # noqa: BLE001 — absent or transient => no heartbeat yet
+        return None
+
+
 def list_keys(bucket: str, prefix: str) -> list[str]:
     """All object keys under ``prefix``, sorted. Used to collect the trainer's
     per-step sample snapshots (runs/<run_id>/samples/step-*.json)."""

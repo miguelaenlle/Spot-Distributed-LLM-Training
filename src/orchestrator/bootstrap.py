@@ -360,124 +360,29 @@ echo "bake user-data exited rc=$? — box left UP for the orchestrator (stop + C
 def _multinode_loop(
     cfg: OrchestratorConfig, *, run_id: str, nodes: int, node_index: int, nproc: str
 ) -> str:
-    """Bash for the multi-node ELASTIC loop: one long-lived torchrun per box.
+    """Bash for the multi-node EPOCH loop: hand control to the Python sidecar.
 
-    ``--nnodes=MIN:N`` (c10d rendezvous hosted by node 0's agent) is what lets
-    survivors of a peer death keep training: the dead node's collectives abort
-    on every survivor after NCCL_TIMEOUT, each box's elastic agent catches the
-    worker crash and re-rendezvouses, and the round closes with whoever is
-    present (>= MIN) after ``last_call_timeout`` — the group continues at N-1
-    while the orchestrator's replacement boots. The replacement runs this same
-    script, dials the same rendezvous, and its arrival triggers one more
-    restart back to N. Every worker (re)start runs the one proven resume path;
-    the node-local checkpoint tier makes a survivor's restore near-instant.
-
-    Rendezvous discovery stays S3-based but is publish-ONCE: node 0 writes
-    rdzv.json {addr, port} at boot; workers and replacements poll the same key.
-    No generations, no ready markers, no per-generation budget reads — the
-    run-level budget rides in the checkpoint itself (TRAIN_BUDGET_SECONDS).
-
-    The outer while is a thin retry for the paths elastic can't absorb (restart
-    budget exhausted, node 0's store lost): each attempt re-reads rdzv.json,
-    and node 0 republishes on a bumped port so a TIME_WAIT socket from its own
-    dead agent can't wedge the rebind. Attempts are bounded; on exhaustion the
-    box exits nonzero and stays up for the orchestrator's whole-group-restart
-    watchdog. metrics.json in S3 is the group-wide done signal."""
-    bucket = cfg.bucket
-    rdzv_key = cfg.run_rdzv_key(run_id)
-    metrics_key = cfg.run_metrics_key(run_id)
-    min_nodes = cfg.nodes_min_count(nodes)
-    polls = 400  # x3s = ~20 min bound on the worker's rdzv.json wait
-    max_attempts = 20
-    if node_index == 0:
-        rendezvous = f"""  # Node 0 hosts the c10d store: publish this box's address ONCE per
-  # attempt (fresh port per attempt so a relaunch never fights TIME_WAIT).
-  NODE_IP=$(hostname -I | awk '{{print $1}}')
-  RDZV_ADDR=$NODE_IP
-  PORT=$(({cfg.rdzv_port} + ATTEMPT - 1))
-  "$VENV_PY" - <<PY
-import json
-import boto3
-boto3.client("s3").put_object(
-    Bucket="{bucket}", Key="{rdzv_key}",
-    Body=json.dumps({{"addr": "$RDZV_ADDR", "port": $PORT}}).encode(),
-)
-PY
-  echo "[rdzv] node 0/{nodes}: hosting elastic rendezvous at $RDZV_ADDR:$PORT"
-"""
-    else:
-        rendezvous = f"""  # Worker: dial whatever node 0 actually published (addr/port read back
-  # from rdzv.json, never assumed) — a replacement joining a LIVE group takes
-  # this exact path. Exit 2 = the run finished while we waited.
-  NODE_IP=$(hostname -I | awk '{{print $1}}')
-  "$VENV_PY" - <<'PY' > /tmp/rdzv_join
-import json, sys, time
-import boto3
-s3 = boto3.client("s3")
-for _ in range({polls}):
-    try:
-        s3.head_object(Bucket="{bucket}", Key="{metrics_key}")
-        sys.exit(2)
-    except Exception:
-        pass
-    try:
-        doc = json.loads(s3.get_object(Bucket="{bucket}", Key="{rdzv_key}")["Body"].read())
-        print(doc["addr"], doc["port"])
-        sys.exit(0)
-    except Exception:
-        pass
-    time.sleep(3)
-sys.exit(1)
-PY
-  WRC=$?
-  if [ "$WRC" -eq 2 ]; then continue; fi
-  if [ "$WRC" -ne 0 ]; then
-    echo "[rdzv] node {node_index}: rdzv.json never appeared"
-    break
-  fi
-  read RDZV_ADDR PORT < /tmp/rdzv_join
-  echo "[rdzv] node {node_index}/{nodes}: dialing elastic rendezvous at $RDZV_ADDR:$PORT"
-"""
+    The box no longer negotiates a rendezvous with its peers. It registers its
+    IP, then the sidecar (``orchestrator.sidecar``) polls the orchestrator's
+    ``epoch.json`` and runs STATIC torchrun for whatever membership the
+    orchestrator published — killing and relaunching torchrun when the epoch
+    advances (a peer died, or a replacement joined). All the membership logic
+    lives in the supervisor + sidecar Python (tested, our logs), not in
+    torchrun's dynamic rendezvous (a version-dependent black box that hung on
+    the DLAMI's torch). ``nproc`` is passed through via NPROC_PER_NODE so the
+    sidecar's static torchrun uses one rank per GPU. The sidecar exits 0 on
+    metrics.json (run done) and nonzero if its idle budget lapses (box left up
+    for the orchestrator's whole-group-restart watchdog)."""
+    run_uri = cfg.run_uri(run_id)
     return f"""
-# --- multi-node: elastic rendezvous (survivors keep training at N-1) ---------
-# One torchrun rides out kills AND rejoins via --max-restarts; this outer loop
-# only retries the rare failures elastic can't absorb. metrics.json is the done
-# signal; MN_RC=0 only then or on a clean local exit.
-MN_RC=1
-ATTEMPT=0
-while :; do
-  "$VENV_PY" - <<'PY'
-import sys
-import boto3
-try:
-    boto3.client("s3").head_object(Bucket="{bucket}", Key="{metrics_key}")
-except Exception:
-    sys.exit(1)
-PY
-  if [ $? -eq 0 ]; then
-    echo "[rdzv] metrics.json present — run complete"
-    MN_RC=0
-    break
-  fi
-  ATTEMPT=$((ATTEMPT + 1))
-  if [ "$ATTEMPT" -gt {max_attempts} ]; then
-    echo "[rdzv] out of torchrun attempts — leaving the box up for the watchdog"
-    break
-  fi
-{rendezvous}  OMP_NUM_THREADS=1 "$VENV_PY" -m torch.distributed.run \\
-    --nnodes={min_nodes}:{nodes} --nproc_per_node={nproc} \\
-    --rdzv_backend=c10d --rdzv_endpoint="$RDZV_ADDR:$PORT" \\
-    --rdzv_id={run_id} --local_addr="$NODE_IP" \\
-    --rdzv_conf="last_call_timeout={cfg.rdzv_last_call_seconds}" \\
-    --max-restarts={cfg.max_restarts} -m spot_train.train
-  TRC=$?
-  if [ "$TRC" -eq 0 ]; then
-    MN_RC=0
-    break
-  fi
-  echo "[rdzv] torchrun exited $TRC (attempt $ATTEMPT/{max_attempts}) — retrying"
-  sleep 5
-done
+# --- multi-node: epoch protocol (orchestrator owns membership) ---------------
+# Register this box's IP, then let the sidecar obey epoch.json: static torchrun
+# per epoch, relaunched on every membership change. NPROC_PER_NODE picks the
+# per-box rank count (gpu = one per GPU). metrics.json is the group-wide done
+# signal; the sidecar's exit code is this script's exit code.
+export NPROC_PER_NODE="{nproc}"
+"$VENV_PY" -m orchestrator.sidecar --run-uri "{run_uri}" --node-index {node_index}
+MN_RC=$?
 (exit "$MN_RC")
 """
 
@@ -506,38 +411,35 @@ def build_user_data(
     forces that count. ``ddp=False`` is the plain single-process launch
     (baseline/preempt) — byte-identical to before.
 
-    ``nodes > 1`` (implies ddp) joins an N-node group via torchrun's ELASTIC
-    c10d rendezvous (see ``_multinode_loop``): node 0 hosts the store and
-    publishes its private IP + port to S3 (rdzv.json) once; the others —
-    including replacements joining a live group — poll that key and dial.
-    ``--nnodes=MIN:N`` with ``--max-restarts>0`` means a peer death only
-    restarts the WORKERS: survivors re-rendezvous and keep training at N-1
-    while the orchestrator's replacement boots and scales the group back to N.
-    Every worker (re)start resumes via the one proven resume path — from the
-    node-local checkpoint tier when this box has the agreed step, else from S3.
-    Killing node 0 still downs the store: the orchestrator's whole-group
-    restart watchdog is the documented fallback for that."""
+    ``nodes > 1`` (implies ddp) hands the box to the epoch sidecar (see
+    ``_multinode_loop``): it registers its IP and runs STATIC torchrun for
+    whatever membership the orchestrator publishes in epoch.json, relaunching on
+    every epoch change. A peer's death crashes this box's torchrun (NCCL_TIMEOUT)
+    as a backstop, but the primary signal is the orchestrator publishing the
+    next epoch — the sidecar kills and relaunches within one ~3s poll. Every
+    (re)start resumes via the one proven resume path — the node-local checkpoint
+    tier when this box has the agreed step, else S3. No node hosts a rendezvous
+    store, so any node (including epoch rank 0) is freely killable."""
     env = _trainer_env(cfg, run_id=run_id, market=market, max_seconds=max_seconds)
     if nodes > 1:
         # Short collective timeout so survivors of a node kill abort fast (see
-        # distributed.init); single-node keeps torch's default.
+        # distributed.init) — the in-band backstop to the supervisor's epoch bump.
         env["NCCL_TIMEOUT"] = str(cfg.nccl_timeout_seconds)
         # Skip torch's post-timeout debug-info dump: it added ~2 minutes to every
-        # peer-death crash (observed 18:26:51 -> 18:29:10), delaying the rejoin.
+        # peer-death crash (observed 18:26:51 -> 18:29:10), delaying the relaunch.
         env["TORCH_NCCL_DUMP_ON_TIMEOUT"] = "0"
         # Run-level budget: rides in the checkpoint (trained_seconds), so every
-        # elastic restart computes its own remaining time — no budget.json, and
+        # epoch's torchrun computes its own remaining time — no budget.json, and
         # boot/NCCL-stall/teardown are never billed. MAX_SECONDS still gets a
         # value but the trainer overrides it from this once resumed.
         env["TRAIN_BUDGET_SECONDS"] = str(max_seconds)
-        # Node-local checkpoint tier: survivors of an elastic restart resume
-        # from their own disk instead of re-downloading from S3.
+        # Node-local checkpoint tier: survivors of an epoch change resume from
+        # their own disk instead of re-downloading from S3.
         env["LOCAL_CHECKPOINT_DIR"] = "/tmp/spot-ckpt"
     steps = _provision_steps(cfg, _export_block(env))
     bucket = cfg.bucket
     logs_key = logs_key or cfg.run_logs_key(run_id)
     interval = cfg.log_stream_seconds
-    rdzv_block = ""
     if nodes > 1:
         nproc = "gpu" if nproc_per_node <= 0 else str(nproc_per_node)
         run_cmd = _multinode_loop(
@@ -596,7 +498,6 @@ set +e
 # Load the run config the trainer reads (PYTHONPATH so `spot_train` imports, plus
 # the S3 URIs, MAX_SECONDS, etc.). Provisioning wrote this file but doesn't source it.
 source /home/ubuntu/spot-train.env
-{rdzv_block}
 {run_cmd}
 RC=$?
 
