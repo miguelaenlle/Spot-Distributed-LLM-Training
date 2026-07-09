@@ -242,7 +242,10 @@ class Supervisor:
         """Private IP the box registered (node<i>.json), cached once seen."""
         if node in self.st.ips:
             return self.st.ips[node]
-        raw = s3_store.read_bytes(self.cfg.run_node_key(self.run_id, node))
+        # Full s3:// URI, not the bare key: s3_store.read_bytes treats a
+        # prefix-less string as a LOCAL path, so a bare key silently reads as
+        # "absent" and the node never counts as registered (epoch 1 never fires).
+        raw = s3_store.read_bytes(self.cfg.run_node_uri(self.run_id, node))
         if raw is None:
             return None
         try:

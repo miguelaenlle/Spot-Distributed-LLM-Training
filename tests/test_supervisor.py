@@ -189,3 +189,49 @@ def test_read_bytes_roundtrip_and_absent(tmp_path):
     assert s3_store.read_bytes(uri) is None  # absent
     s3_store.put_bytes(b'{"epoch": 1}', uri)
     assert s3_store.read_bytes(uri) == b'{"epoch": 1}'
+
+
+def test_run_node_uri_is_full_s3_uri():
+    # Regression: the supervisor reads registrations via read_bytes, which treats
+    # a prefix-less string as a LOCAL path — so it MUST be a full s3:// URI, or
+    # every node reads as unregistered and epoch 1 never publishes.
+    cfg = OrchestratorConfig(bucket="b")
+    assert cfg.run_node_uri("r", 1) == "s3://b/runs/r/nodes/node1.json"
+
+
+def test_observe_sees_registration_and_publishes_epoch_1(monkeypatch):
+    # End-to-end shell test through the real Supervisor._observe: two running,
+    # registered nodes must yield PublishEpoch(1). This exercises _node_ip's URI
+    # construction (the layer the bare-key bug lived in) that the pure-reducer
+    # tables above can't reach.
+    from orchestrator import supervisor as sup_mod
+
+    cfg = OrchestratorConfig(bucket="b")
+    cfg.node_count = 2
+    monkeypatch.setattr(sup_mod.aws, "instance_state", lambda iid: "running")
+    monkeypatch.setattr(sup_mod.aws, "object_last_modified", lambda b, k: None)
+    monkeypatch.setattr(sup_mod.aws, "max_checkpoint_step", lambda b, p: -1)
+    monkeypatch.setattr(sup_mod.aws, "object_exists", lambda b, k: False)
+    # Registrations present ONLY at the full s3:// node URIs — a bare key returns
+    # None, which is exactly the bug this guards against.
+    node_docs = {
+        cfg.run_node_uri("r", 0): b'{"ip": "10.0.0.0"}',
+        cfg.run_node_uri("r", 1): b'{"ip": "10.0.0.1"}',
+    }
+    monkeypatch.setattr(sup_mod.s3_store, "read_bytes", lambda uri: node_docs.get(uri))
+
+    from orchestrator.profile import RunProfile
+
+    s = sup_mod.Supervisor(
+        cfg,
+        RunProfile("r", kind="multinode", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={0: "i-0", 1: "i-1"},
+        logs={0: {"key": "k0", "state": {"printed": 0}}, 1: {"key": "k1", "state": {"printed": 0}}},
+        launch_node=lambda n: "i-new",
+        pull_logs=lambda: None,
+    )
+    obs = s._observe(now=0.0, wall=0.0)
+    assert all(n.registered for n in obs.nodes)
+    assert decide(obs, PREEMPT) == [PublishEpoch(1, (0, 1))]

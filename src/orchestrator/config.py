@@ -326,6 +326,9 @@ class OrchestratorConfig:
     def run_node_key(self, run_id: str, node: int) -> str:
         return f"{self.run_prefix}/{run_id}/nodes/node{node}.json"
 
+    def run_node_uri(self, run_id: str, node: int) -> str:
+        return f"s3://{self.bucket}/{self.run_node_key(run_id, node)}"
+
     def run_uri(self, run_id: str) -> str:
         """s3://bucket/runs/<run_id> — the base the box sidecar is pointed at."""
         return f"s3://{self.bucket}/{self.run_prefix}/{run_id}"
