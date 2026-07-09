@@ -39,12 +39,17 @@ _DEAD_STATES = frozenset({"shutting-down", "terminated", "stopping", "stopped"})
 
 @dataclass(frozen=True)
 class NodeObs:
-    """One node's health, as the supervisor can observe it from outside the box."""
+    """One node's health, as the supervisor can observe it from OUTSIDE the box.
+
+    Health is observation-only on purpose: even a node the orchestrator itself
+    terminated (a scheduled kill standing in for a spot reclaim) is discovered
+    dead the same way a real reclaim would be — its AWS state flips into
+    ``_DEAD_STATES`` or its log heartbeat goes stale. The orchestrator never
+    shortcuts membership with "I know I killed it"."""
 
     node: int
     aws_state: str  # DescribeInstances state, or "unknown"
     registered: bool  # node<i>.json present in S3 (the box announced its IP)
-    terminated_by_us: bool = False  # we called TerminateInstances — dead NOW, not on lag
     log_age_s: float | None = None  # seconds since the log key last changed (heartbeat)
 
 
@@ -73,8 +78,9 @@ class Policy:
 
 def _healthy(n: NodeObs, policy: Policy) -> bool:
     """A node counts toward membership iff it announced itself, AWS still shows it
-    running, we didn't just kill it, and its log heartbeat isn't stale."""
-    if n.terminated_by_us or not n.registered or n.aws_state in _DEAD_STATES:
+    running, and its log heartbeat isn't stale — all observation, no foreknowledge
+    of who we killed."""
+    if not n.registered or n.aws_state in _DEAD_STATES:
         return False
     if n.aws_state != "running":
         return False  # pending/unknown: not yet a member
@@ -125,17 +131,23 @@ def decide(obs: Observation, policy: Policy) -> list[Action]:
     The heart is trivial by design (that's the point of central orchestration):
     the membership that SHOULD be published is just the currently-healthy set,
     and an epoch is (re)published whenever that set differs from what's live.
+
+    Membership is driven ONLY by the observed ``healthy`` set. A scheduled kill
+    (``due_kills``) merely emits ``TerminateNode`` — it does NOT itself shrink
+    the group. The shrink happens a tick or two later when the terminated box is
+    OBSERVED gone (AWS state flips into _DEAD_STATES, or its heartbeat goes
+    stale), exactly as a real, un-orchestrated spot reclaim would be discovered.
     """
     if obs.metrics_exists:
         return [Done()]
 
     healthy = frozenset(n.node for n in obs.nodes if _healthy(n, policy))
 
-    # Whole-group restart floor: the group stopped making progress and can't be
-    # fixed by a membership change (also the only recourse when everyone's gone).
+    # Whole-group restart floor: the group stopped making progress, or every
+    # member is observed gone (no survivor to shrink onto).
     if obs.epoch > 0 and (
         (obs.no_progress_s is not None and obs.no_progress_s > policy.recovery_timeout_s)
-        or not (healthy - obs.due_kills)
+        or not healthy
     ):
         return [WholeGroupRestart()]
 
@@ -147,18 +159,20 @@ def decide(obs: Observation, policy: Policy) -> list[Action]:
         return []
 
     actions: list[Action] = []
+    # Scheduled kills: terminate the box (a stand-in for the reclaim). This does
+    # NOT touch membership — the shrink below only reacts to what's observed.
     for v in sorted(obs.due_kills):
         actions.append(TerminateNode(v))
 
-    # Target membership excludes anyone we're killing this very tick, so the
-    # shrink epoch goes out SAME tick as the kill — survivors' sidecars drop
-    # their NCCL-blocked torchrun within one poll (~3s), no 20s timeout wait.
-    target = healthy - obs.due_kills
-    if target and frozenset(target) != obs.members:
-        actions.append(PublishEpoch(obs.epoch + 1, tuple(sorted(target))))
+    # Reconcile membership to the observed healthy set. A member that is no
+    # longer healthy (a reclaimed/terminated box observed dead) drops out and
+    # the group shrinks; a newly-healthy non-member (a replacement that booted)
+    # grows it back.
+    if healthy and healthy != obs.members:
+        actions.append(PublishEpoch(obs.epoch + 1, tuple(sorted(healthy))))
 
     if policy.replace_on_loss:
-        for v in sorted(obs.members - target):  # members that left (killed or died)
+        for v in sorted(obs.members - healthy):  # members observed gone
             actions.append(LaunchReplacement(v))
 
     return actions
@@ -188,7 +202,7 @@ class SupervisorState:
 
     epoch: int = 0
     members: frozenset[int] = frozenset()
-    terminated_by_us: set[int] = field(default_factory=set)  # dead NOW, ignore AWS lag
+    killed: set[int] = field(default_factory=set)  # already terminated; dedup TerminateNode ONLY
     replacing: set[int] = field(default_factory=set)  # a LaunchReplacement is in flight
     ips: dict[int, str] = field(default_factory=dict)  # node -> private IP (from registration)
     ckpt_step: int = -1
@@ -234,7 +248,6 @@ class Supervisor:
         self.ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
         self.metrics_key = cfg.run_metrics_key(run_id)
         self._train_start: float | None = None
-        self._killed_at: dict[int, float] = {}  # victim -> monotonic time we terminated it
         self.metrics: dict | None = None
 
     # -- observation ------------------------------------------------------- #
@@ -265,7 +278,6 @@ class Supervisor:
                     node=node,
                     aws_state=state,
                     registered=self._node_ip(node) is not None,
-                    terminated_by_us=node in self.st.terminated_by_us,
                     log_age_s=(wall - log_lm) if log_lm is not None else None,
                 )
             )
@@ -279,7 +291,7 @@ class Supervisor:
         if self._train_start is not None:
             elapsed = now - self._train_start
             for secs, victim in self.kill_schedule:
-                if elapsed >= secs and victim not in self.st.terminated_by_us:
+                if elapsed >= secs and victim not in self.st.killed:
                     due.add(victim)
 
         return Observation(
@@ -305,6 +317,7 @@ class Supervisor:
         doc = epoch_doc(self.run_id, epoch, members, self.st.ips, self.cfg.rdzv_port)
         aws.put_text(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id), json.dumps(doc))
         self.st.epoch, self.st.members = epoch, frozenset(members)
+        self.st.replacing -= set(members)  # any admitted member is no longer "in flight"
         print(
             f"[supervisor] published epoch {epoch}: members {sorted(members)} "
             f"(master {doc['master_addr']}:{doc['master_port']})",
@@ -318,15 +331,16 @@ class Supervisor:
             self.st.shrink_baseline = None  # back to full; full_world handled in _emit_marks
 
     def _terminate(self, node: int) -> None:
-        if node in self.st.terminated_by_us:
+        # Stand in for a spot reclaim: kill the box. Membership is NOT touched
+        # here — the shrink comes later, when the reducer OBSERVES the box gone.
+        if node in self.st.killed:
             return
         self.st.full_ws = self._latest_ws()
         self.st.shrink_baseline = self.st.ckpt_step
         self.st.marks.discard("shrink_resume")
         self.st.marks.discard("full_world")
         aws.terminate(self.node_ids[node])
-        self.st.terminated_by_us.add(node)
-        self._killed_at[node] = time.monotonic()
+        self.st.killed.add(node)
         self.profile.instance_stopped(self.node_ids[node])
         self.profile.mark("kill")
         print(f"[supervisor] terminated node {node} ({self.node_ids[node]})", file=sys.stderr)
@@ -337,7 +351,7 @@ class Supervisor:
         self.st.replacing.add(node)
         aws.wait_quota_released(self.node_ids[node])
         aws.wait_vcpu_headroom(self.cfg.instance_vcpu_count(), self.cfg.vcpu_quota)
-        self.st.terminated_by_us.discard(node)
+        self.st.killed.discard(node)  # the replacement can itself be killed in a later round
         self.st.ips.pop(node, None)  # force re-read of the replacement's fresh registration
         self.node_ids[node] = self._launch_node(node)
         self.profile.mark("relaunch")

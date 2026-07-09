@@ -24,14 +24,8 @@ SHRINK = Policy(replace_on_loss=False, recovery_timeout_s=600)
 PREEMPT = Policy(replace_on_loss=True, recovery_timeout_s=600)
 
 
-def _node(i, state="running", registered=True, terminated=False, log_age=None):
-    return NodeObs(
-        node=i,
-        aws_state=state,
-        registered=registered,
-        terminated_by_us=terminated,
-        log_age_s=log_age,
-    )
+def _node(i, state="running", registered=True, log_age=None):
+    return NodeObs(node=i, aws_state=state, registered=registered, log_age_s=log_age)
 
 
 def _obs(nodes, *, epoch, members, node_count=None, metrics=False, no_progress=None, due=()):
@@ -84,20 +78,22 @@ def test_lost_member_shrinks_and_relaunches_under_preempt_policy():
     assert decide(obs, PREEMPT) == [PublishEpoch(2, (0,)), LaunchReplacement(1)]
 
 
-def test_scheduled_kill_publishes_shrink_same_tick():
-    # due_kills=1: terminate it AND publish the survivor epoch in the same tick,
-    # so survivors' sidecars drop their NCCL-blocked torchrun within one poll.
+def test_scheduled_kill_only_terminates_membership_unchanged():
+    # due_kills=1: TERMINATE the box, but do NOT shrink yet — node 1 still reads
+    # healthy (AWS lag), so membership is untouched. The shrink is observation-
+    # driven and comes a tick or two later (next test).
     obs = _obs([_node(0), _node(1)], epoch=1, members=[0, 1], due=[1])
-    assert decide(obs, SHRINK) == [TerminateNode(1), PublishEpoch(2, (0,))]
+    assert decide(obs, SHRINK) == [TerminateNode(1)]
+    assert decide(obs, PREEMPT) == [TerminateNode(1)]
 
 
-def test_scheduled_kill_under_preempt_also_relaunches():
-    obs = _obs([_node(0), _node(1)], epoch=1, members=[0, 1], due=[1])
-    assert decide(obs, PREEMPT) == [
-        TerminateNode(1),
-        PublishEpoch(2, (0,)),
-        LaunchReplacement(1),
-    ]
+def test_shrink_happens_when_kill_is_observed_next_tick():
+    # After the terminate, once AWS shows node 1 gone (shutting-down), the same
+    # reducer that handles a real reclaim shrinks — and, under preempt, replaces.
+    # due is empty now (the shell dedups the already-issued kill).
+    obs = _obs([_node(0), _node(1, state="shutting-down")], epoch=1, members=[0, 1])
+    assert decide(obs, SHRINK) == [PublishEpoch(2, (0,))]
+    assert decide(obs, PREEMPT) == [PublishEpoch(2, (0,)), LaunchReplacement(1)]
 
 
 # --------------------------------------------------------------------------- #
@@ -235,3 +231,46 @@ def test_observe_sees_registration_and_publishes_epoch_1(monkeypatch):
     obs = s._observe(now=0.0, wall=0.0)
     assert all(n.registered for n in obs.nodes)
     assert decide(obs, PREEMPT) == [PublishEpoch(1, (0, 1))]
+
+
+def test_terminate_does_not_shortcut_membership(monkeypatch):
+    # The heart of "observation-driven": after the supervisor terminates a node,
+    # its health follows AWS state, NOT the fact that we killed it. While AWS
+    # still lags at "running" the node stays healthy (no shrink); only once AWS
+    # reports it gone does membership react.
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+
+    cfg = OrchestratorConfig(bucket="b")
+    cfg.node_count = 2
+    state = {"i-0": "running", "i-1": "running"}
+    monkeypatch.setattr(sup_mod.aws, "instance_state", lambda iid: state[iid])
+    monkeypatch.setattr(sup_mod.aws, "object_last_modified", lambda b, k: None)
+    monkeypatch.setattr(sup_mod.aws, "max_checkpoint_step", lambda b, p: 5)
+    monkeypatch.setattr(sup_mod.aws, "object_exists", lambda b, k: False)
+    monkeypatch.setattr(sup_mod.aws, "terminate", lambda iid: None)  # AWS lag: state unchanged
+    docs = {
+        cfg.run_node_uri("r", 0): b'{"ip": "10.0.0.0"}',
+        cfg.run_node_uri("r", 1): b'{"ip": "10.0.0.1"}',
+    }
+    monkeypatch.setattr(sup_mod.s3_store, "read_bytes", lambda uri: docs.get(uri))
+
+    s = sup_mod.Supervisor(
+        cfg,
+        RunProfile("r", kind="multinode-shrink", market="spot"),
+        run_id="r",
+        policy=SHRINK,
+        node_ids={0: "i-0", 1: "i-1"},
+        logs={0: {"key": "k0", "state": {"printed": 0}}, 1: {"key": "k1", "state": {"printed": 0}}},
+        launch_node=lambda n: "i-new",
+        pull_logs=lambda: None,
+    )
+    s.st.epoch, s.st.members = 1, frozenset({0, 1})
+
+    s._terminate(1)  # kill the box; AWS still shows it running (lag)
+    obs = s._observe(now=1.0, wall=1.0)
+    assert decide(obs, SHRINK) == []  # NOT shrunk — node 1 still observed healthy
+
+    state["i-1"] = "shutting-down"  # AWS finally reflects the death
+    obs = s._observe(now=2.0, wall=2.0)
+    assert decide(obs, SHRINK) == [PublishEpoch(2, (0,))]  # now it reacts

@@ -84,10 +84,14 @@ orchestrator process) is observe → decide → act, one tick per
 - **decide** — a PURE reducer `decide(Observation, Policy) -> [Action]`. The
   whole membership policy, table-tested without AWS. The core is deliberately
   trivial: the membership that *should* be published is just the currently
-  healthy set, and an epoch is (re)published whenever that differs from what's
-  live. A scheduled kill emits `TerminateNode` **and** the shrink `PublishEpoch`
-  in the SAME tick, so survivors' sidecars drop their (soon-to-be-dead)
-  torchrun within one ~3s poll — no waiting on the 20s NCCL timeout;
+  observed-healthy set, and an epoch is (re)published whenever that differs from
+  what's live. **Membership is observation-driven only.** A scheduled kill (the
+  experiments' stand-in for a spot reclaim) emits *only* `TerminateNode` — it
+  does **not** itself shrink the group. The shrink happens a tick or two later
+  when the terminated box is OBSERVED gone (AWS state flips into `_DEAD_STATES`,
+  or its heartbeat goes stale), the identical path a real, un-orchestrated
+  reclaim takes. The orchestrator never shortcuts membership with "I know I
+  killed it"; the 20s NCCL timeout is the in-band backstop if observation lags;
 - **act** — `Effects` executes via existing `aws.*` and emits the profile marks
   the W&B viz consumes (`kill`, `shrink_resume` when checkpoints advance past
   the kill baseline, `relaunch`, `full_world` when a `ws==N` sample returns).
@@ -96,7 +100,7 @@ orchestrator process) is observe → decide → act, one tick per
 
 | Failure | Handling |
 |---|---|
-| Worker node dies | Supervisor publishes the shrink epoch (~1 tick); survivors' sidecars kill + relaunch at N−1 (~15–30s). NCCL_TIMEOUT crash is the in-band backstop if the supervisor is slow. |
+| Worker node dies (real reclaim OR scheduled kill) | Discovered by observation — AWS state flip / stale heartbeat — never by orchestrator foreknowledge. Supervisor then publishes the shrink epoch; survivors' sidecars relaunch at N−1. NCCL_TIMEOUT crash is the in-band backstop if observation lags. |
 | Epoch rank-0 dies | Same — the next epoch just names a new lowest-index master; fresh port avoids TIME_WAIT. No node is special (the elastic design's biggest hole, closed). |
 | Replacement never registers | It's never admitted (stays out of every epoch); the whole-group-restart floor recovers the run. |
 | Two nodes die | Shrink epoch with N−2 members (static K = member count; no min-nodes concept). |
