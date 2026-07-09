@@ -202,7 +202,6 @@ class SupervisorState:
 
     epoch: int = 0
     members: frozenset[int] = frozenset()
-    killed: set[int] = field(default_factory=set)  # already terminated; dedup TerminateNode ONLY
     replacing: set[int] = field(default_factory=set)  # a LaunchReplacement is in flight
     ips: dict[int, str] = field(default_factory=dict)  # node -> private IP (from registration)
     ckpt_step: int = -1
@@ -248,6 +247,13 @@ class Supervisor:
         self.ckpt_prefix = f"{cfg.run_prefix}/{run_id}/checkpoints/"
         self.metrics_key = cfg.run_metrics_key(run_id)
         self._train_start: float | None = None
+        # Kill scheduling is EDGE-triggered per schedule ENTRY (not per node):
+        # once entry i has been issued it never fires again, even after its
+        # victim is replaced and re-added to the group. (A level trigger on
+        # "elapsed >= secs" plus per-node dedup would re-kill every replacement
+        # the instant it rejoined — an infinite kill loop.)
+        self._fired_kills: set[int] = set()
+        self._terminated_iids: set[str] = set()  # guard against double-terminating a box
         self.metrics: dict | None = None
 
     # -- observation ------------------------------------------------------- #
@@ -290,9 +296,10 @@ class Supervisor:
         due = set()
         if self._train_start is not None:
             elapsed = now - self._train_start
-            for secs, victim in self.kill_schedule:
-                if elapsed >= secs and victim not in self.st.killed:
+            for i, (secs, victim) in enumerate(self.kill_schedule):
+                if elapsed >= secs and i not in self._fired_kills:
                     due.add(victim)
+                    self._fired_kills.add(i)  # fire this entry exactly once
 
         return Observation(
             node_count=self.cfg.node_count,
@@ -333,17 +340,18 @@ class Supervisor:
     def _terminate(self, node: int) -> None:
         # Stand in for a spot reclaim: kill the box. Membership is NOT touched
         # here — the shrink comes later, when the reducer OBSERVES the box gone.
-        if node in self.st.killed:
+        iid = self.node_ids[node]
+        if iid in self._terminated_iids:
             return
         self.st.full_ws = self._latest_ws()
         self.st.shrink_baseline = self.st.ckpt_step
         self.st.marks.discard("shrink_resume")
         self.st.marks.discard("full_world")
-        aws.terminate(self.node_ids[node])
-        self.st.killed.add(node)
-        self.profile.instance_stopped(self.node_ids[node])
+        aws.terminate(iid)
+        self._terminated_iids.add(iid)
+        self.profile.instance_stopped(iid)
         self.profile.mark("kill")
-        print(f"[supervisor] terminated node {node} ({self.node_ids[node]})", file=sys.stderr)
+        print(f"[supervisor] terminated node {node} ({iid})", file=sys.stderr)
 
     def _launch_replacement(self, node: int) -> None:
         if node in self.st.replacing:
@@ -351,7 +359,6 @@ class Supervisor:
         self.st.replacing.add(node)
         aws.wait_quota_released(self.node_ids[node])
         aws.wait_vcpu_headroom(self.cfg.instance_vcpu_count(), self.cfg.vcpu_quota)
-        self.st.killed.discard(node)  # the replacement can itself be killed in a later round
         self.st.ips.pop(node, None)  # force re-read of the replacement's fresh registration
         self.node_ids[node] = self._launch_node(node)
         self.profile.mark("relaunch")

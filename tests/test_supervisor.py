@@ -274,3 +274,45 @@ def test_terminate_does_not_shortcut_membership(monkeypatch):
     state["i-1"] = "shutting-down"  # AWS finally reflects the death
     obs = s._observe(now=2.0, wall=2.0)
     assert decide(obs, SHRINK) == [PublishEpoch(2, (0,))]  # now it reacts
+
+
+def test_scheduled_kill_fires_exactly_once_even_after_replacement(monkeypatch):
+    # Regression: the kill schedule is level-triggered on "elapsed >= secs", so
+    # without per-ENTRY edge-triggering it re-fires every tick after the due
+    # time — and re-kills each replacement the instant it rejoins (an infinite
+    # kill loop, observed on AWS as epochs 5,6,7,8,... churning).
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+
+    cfg = OrchestratorConfig(bucket="b")
+    cfg.node_count = 2
+    monkeypatch.setattr(sup_mod.aws, "instance_state", lambda iid: "running")
+    monkeypatch.setattr(sup_mod.aws, "object_last_modified", lambda b, k: None)
+    monkeypatch.setattr(sup_mod.aws, "max_checkpoint_step", lambda b, p: 5)
+    monkeypatch.setattr(sup_mod.aws, "object_exists", lambda b, k: False)
+    docs = {
+        cfg.run_node_uri("r", 0): b'{"ip": "10.0.0.0"}',
+        cfg.run_node_uri("r", 1): b'{"ip": "10.0.0.1"}',
+    }
+    monkeypatch.setattr(sup_mod.s3_store, "read_bytes", lambda uri: docs.get(uri))
+
+    s = sup_mod.Supervisor(
+        cfg,
+        RunProfile("r", kind="multinode-preempt", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={0: "i-0", 1: "i-1"},
+        logs={0: {"key": "k0", "state": {"printed": 0}}, 1: {"key": "k1", "state": {"printed": 0}}},
+        launch_node=lambda n: "i-new",
+        pull_logs=lambda: None,
+        kill_schedule=[(100.0, 1)],  # one kill, at 100s after train start
+    )
+    s._train_start = 0.0
+
+    # Well past the due time: the kill fires on the first observe...
+    assert 1 in s._observe(now=200.0, wall=0.0).due_kills
+    # ...and NEVER again, even though elapsed is still >> 100 and node 1 has been
+    # "replaced" (fresh instance id, as _launch_replacement would set).
+    s.node_ids[1] = "i-1-replacement"
+    for t in (210.0, 220.0, 300.0):
+        assert s._observe(now=t, wall=0.0).due_kills == frozenset()
