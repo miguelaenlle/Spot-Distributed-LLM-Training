@@ -19,11 +19,12 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 
 import torch
 
-from . import checkpoint, distributed, s3_store, sampling
+from . import checkpoint, distributed, events, s3_store, sampling
 from .config import TrainConfig
 from .data import PositionedLoader
 from .interruption import InterruptionListener
@@ -275,6 +276,49 @@ def train(cfg: TrainConfig) -> dict:
     ckpt_count = 0
     reason = "max_steps"
 
+    # --- node lifecycle events (event-sourced Gantt) --------------------- #
+    # One emitter per NODE (local rank 0). node/epoch come from the sidecar's
+    # env; the timestamp is stamped here, at the source, so the timeline is
+    # derived not inferred. "training" fires now — we've cleared restore and are
+    # about to enter the loop (the accurate start, not "torchrun launched").
+    _emit_node = ddp.local_rank == 0
+    _node_idx = int(os.environ.get("SPOT_NODE_INDEX", ddp.rank))
+    _epoch_env = os.environ.get("SPOT_EPOCH")
+    _epoch = int(_epoch_env) if _epoch_env else None
+
+    def _ev(state: str, *, ts: float | None = None, cause: str | None = None) -> None:
+        if _emit_node:
+            events.emit(
+                state,
+                by="trainer",
+                node=_node_idx,
+                epoch=_epoch,
+                world=ddp.world_size,
+                step=step,
+                ts=ts,
+                cause=cause,
+            )
+
+    _ev("training", ts=train_started_at)
+    # Stall watchdog: a peer going down blocks this rank inside NCCL, where it
+    # can't emit. A daemon thread watches forward progress and, past a threshold,
+    # emits "stalled" stamped at the LAST good step (the true onset, not when we
+    # noticed). The main loop emits "training" again the instant a step completes.
+    _hb = {"mono": time.monotonic(), "wall": train_started_at, "stalled": False}
+    _stop_wd = threading.Event()
+    _stall_after = float(os.environ.get("STALL_THRESHOLD_SECONDS", "8"))
+
+    def _watchdog() -> None:
+        while not _stop_wd.wait(1.0):
+            if not _hb["stalled"] and (time.monotonic() - _hb["mono"]) > _stall_after:
+                _hb["stalled"] = True
+                _ev("stalled", ts=_hb["wall"], cause="peer-stall")
+
+    _wd = None
+    if _emit_node:
+        _wd = threading.Thread(target=_watchdog, name="stall-watchdog", daemon=True)
+        _wd.start()
+
     while step < cfg.max_steps:
         lr = get_lr(cfg, step)
         for group in optimizer.param_groups:
@@ -394,6 +438,15 @@ def train(cfg: TrainConfig) -> dict:
                     step,
                 )
 
+        # Forward progress marker for the stall watchdog: a full iteration
+        # (step + eval + checkpoint) completed, so we were NOT blocked in a
+        # collective. A stall in the NEXT backward leaves this stale -> detected.
+        if _emit_node:
+            _hb["mono"], _hb["wall"] = time.monotonic(), time.time()
+            if _hb["stalled"]:  # steps flowed again -> resumed, emit at this step
+                _hb["stalled"] = False
+                _ev("training", cause="resumed")
+
         # Coordinated stop — the LAST collective every step, so all ranks break on
         # the same iteration and none is left blocking on the next backward.
         if listener.should_stop.is_set():
@@ -402,6 +455,8 @@ def train(cfg: TrainConfig) -> dict:
             reason = "time_budget"
         if distributed.all_reduce_stop(ddp, reason != "max_steps"):
             break
+
+    _stop_wd.set()  # retire the stall watchdog before teardown collectives
 
     # Agree the stop REASON across ranks (balanced collective — every rank broke the
     # loop together). If ANY rank saw the SIGTERM, all treat it as preempt so rank 0

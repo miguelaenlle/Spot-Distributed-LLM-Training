@@ -25,7 +25,7 @@ import sys
 import time
 import urllib.request
 
-from spot_train import s3_store
+from spot_train import events, s3_store
 
 POLL_SECONDS = 3
 # Total time to wait with no epoch naming us before giving up (box stays up for
@@ -74,6 +74,10 @@ def register(
         _join(run_uri, f"nodes/node{node_index}.json"),
     )
     _log(f"node {node_index}: registered ip={ip} instance={instance_id}")
+    # First lifecycle event: the box booted and the sidecar is alive (provisioning
+    # — clone/pip/dataset done). The trainer emits "training" once it clears
+    # checkpoint restore and enters the loop.
+    events.emit("provisioning", by="sidecar", node=node_index, cause="boot")
     return ip
 
 
@@ -147,6 +151,9 @@ def run(
     metrics.json appeared; nonzero = idle budget exhausted, box left up)."""
     epoch_uri = _join(run_uri, "epoch.json")
     metrics_uri = _join(run_uri, "metrics.json")
+    # Passed to the trainer (via torchrun's inherited env) so its lifecycle events
+    # are attributed to this node and epoch — see spot_train.train.
+    os.environ["SPOT_NODE_INDEX"] = str(node_index)
     proc: subprocess.Popen | None = None
     running_epoch = -1  # the epoch `proc` was launched for
     idle_deadline = time.monotonic() + idle_budget
@@ -180,13 +187,33 @@ def run(
                         f"node {node_index}: entering epoch {epoch} as rank {rank}/{node_count} "
                         f"(master {master_addr}:{master_port})"
                     )
+                    # Re-rendezvous / restore window: this node is provisioning at
+                    # the new world size until its trainer emits "training". Expose
+                    # the epoch so the trainer stamps its events with it.
+                    os.environ["SPOT_EPOCH"] = str(epoch)
+                    events.emit(
+                        "provisioning",
+                        by="sidecar",
+                        node=node_index,
+                        epoch=epoch,
+                        world=node_count,
+                        cause="launching",
+                    )
                     proc = launch(epoch, rank, node_count, master_addr, master_port)
                     running_epoch = epoch
                 elif crashed:
                     # torchrun died on its own (a peer's death crashed our
                     # collective) — the supervisor will publish the next epoch;
                     # drop the corpse and let the epoch-change branch relaunch.
-                    _log(f"node {node_index}: torchrun exited {proc.poll()} in epoch {epoch}")
+                    code = proc.poll()
+                    _log(f"node {node_index}: torchrun exited {code} in epoch {epoch}")
+                    events.emit(
+                        "provisioning",
+                        by="sidecar",
+                        node=node_index,
+                        epoch=epoch,
+                        cause=f"torchrun-exit:{code}",
+                    )
                     proc = None
                     running_epoch = -1
                 idle_deadline = time.monotonic() + idle_budget  # being a member resets idle

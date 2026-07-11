@@ -502,6 +502,38 @@ def test_replacement_attempt_is_not_born_dead(monkeypatch):
     assert st2[(1, 0)] == "dead"  # predecessor carried forward, frozen
 
 
+def test_supervisor_emits_parseable_lifecycle_events():
+    # The orchestrator half of the event-sourced timeline: killed/down/epoch land
+    # in orchestrator.log as structured [event] records the viewer parses.
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+    from spot_train import events as ev
+
+    cfg = OrchestratorConfig(bucket="b")
+    cfg.node_count = 2
+    s = sup_mod.Supervisor(
+        cfg,
+        RunProfile("r", kind="multinode-preempt", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={0: "i-0", 1: "i-1"},
+        logs={0: {"key": "k0", "attempt": 0}, 1: {"key": "k1", "attempt": 0}},
+        launch_node=lambda n: "i-new",
+        pull_logs=lambda: None,
+    )
+    s._emit_event("epoch", epoch=2, world=1)
+    s._emit_event("killed", node=1, cause="scheduled-kill")
+    s._emit_event("down", node=0, cause="reclaimed")
+
+    recs = ev.parse("\n".join(s._orch_lines))
+    by_state = {r["state"]: r for r in recs}
+    assert set(by_state) == {"epoch", "killed", "down"}
+    assert by_state["epoch"]["world"] == 1 and by_state["epoch"]["by"] == "orch"
+    assert by_state["killed"]["node"] == 1 and by_state["killed"]["cause"] == "scheduled-kill"
+    assert by_state["down"]["node"] == 0 and by_state["down"]["cause"] == "reclaimed"
+    assert s._orch_dirty is True  # flagged for the next status upload
+
+
 def test_scheduled_kill_fires_exactly_once_even_after_replacement(monkeypatch):
     # Regression: the kill schedule is level-triggered on "elapsed >= secs", so
     # without per-ENTRY edge-triggering it re-fires every tick after the due

@@ -6,11 +6,12 @@ polls per scenario by feeding it epoch docs and asserting what it launched/kille
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 
 from orchestrator import sidecar
-from spot_train import s3_store
+from spot_train import events, s3_store
 
 
 class FakeProc:
@@ -80,6 +81,33 @@ def test_register_writes_node_doc(tmp_path):
     sidecar.register(run_uri, 2, ip="10.1.2.3", instance_id="i-abc")
     doc = json.loads(s3_store.read_bytes(sidecar._join(run_uri, "nodes/node2.json")))
     assert doc == {"ip": "10.1.2.3", "instance_id": "i-abc"}
+
+
+def test_register_emits_provisioning_event(tmp_path, capsys):
+    sidecar.register(str(tmp_path), 2, ip="10.1.2.3", instance_id="i-abc")
+    recs = events.parse(capsys.readouterr().err)
+    prov = [r for r in recs if r["state"] == "provisioning"]
+    assert prov and prov[0]["node"] == 2 and prov[0]["by"] == "sidecar"
+
+
+def test_launch_emits_provisioning_and_exports_node_env(tmp_path, monkeypatch, capsys):
+    run_uri = str(tmp_path)
+    h = Harness(monkeypatch)
+    monkeypatch.setattr(sidecar, "POLL_SECONDS", 0.05)
+    _write_epoch(run_uri, 1, [0, 1])
+    t, result = _run_in_thread(run_uri, 0, h.launch)
+    t.start()
+    _spin(lambda: len(h.launches) == 1)
+    s3_store.put_bytes(b"{}", sidecar._join(run_uri, "metrics.json"))
+    t.join(timeout=3)
+    # The trainer reads this to attribute its events to node 0.
+    assert os.environ.get("SPOT_NODE_INDEX") == "0"
+    launching = [
+        r
+        for r in events.parse(capsys.readouterr().err)
+        if r["state"] == "provisioning" and r.get("cause") == "launching"
+    ]
+    assert launching and launching[0]["node"] == 0 and launching[0]["world"] == 2
 
 
 def test_enters_epoch_then_exits_on_metrics(tmp_path, monkeypatch):

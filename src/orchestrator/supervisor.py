@@ -18,12 +18,13 @@ This module splits cleanly into:
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import time
 from dataclasses import dataclass, field
 
-from spot_train import s3_store
+from spot_train import events, s3_store
 
 from . import aws
 from .config import OrchestratorConfig
@@ -340,6 +341,7 @@ class Supervisor:
         self._last_status: dict | None = None
         self._orch_lines: list[str] = []
         self._orch_dirty = False
+        self._downed: set[tuple[int, str]] = set()  # (node, iid) already emitted down/killed
 
     # -- observability ------------------------------------------------------ #
     def _event(self, msg: str) -> None:
@@ -347,6 +349,17 @@ class Supervisor:
         buffer the next _write_status uploads."""
         print(f"[supervisor] {msg}", file=sys.stderr)
         self._orch_lines.append(f"[{time.strftime('%H:%M:%S')}] [supervisor] {msg}")
+        self._orch_dirty = True
+
+    def _emit_event(self, state: str, **fields) -> None:
+        """A structured ``[event]`` record (the event-sourced timeline's orch
+        half): appended to orchestrator.log — which the viewer parses — AND
+        echoed to stderr. ts is stamped at the source here, not on parse."""
+        buf = io.StringIO()
+        events.emit(state, by="orch", stream=buf, **fields)
+        line = buf.getvalue().rstrip("\n")
+        print(line, file=sys.stderr, flush=True)
+        self._orch_lines.append(line)
         self._orch_dirty = True
 
     def _write_status(self, obs: Observation, wall: float, *, done: bool = False) -> None:
@@ -450,6 +463,9 @@ class Supervisor:
             f"published epoch {epoch}: members {sorted(members)} "
             f"(master {doc['master_addr']}:{doc['master_port']})"
         )
+        # World-size sample for the timeline (the N -> N-1 -> N staircase),
+        # authoritative from the membership decision, not inferred by polling.
+        self._emit_event("epoch", epoch=epoch, world=len(members))
         if shrinking:
             # The kill mark + baselines were captured in _terminate; a grow resets
             # the shrink markers so the next kill re-arms them.
@@ -472,6 +488,9 @@ class Supervisor:
         self.profile.instance_stopped(iid)
         self.profile.mark("kill")
         self._event(f"terminated node {node} ({iid})")
+        # Orchestrator-initiated stop => "killed" (vs a spot reclaim => "down").
+        self._emit_event("killed", node=node, cause="scheduled-kill")
+        self._downed.add((node, iid))
 
     def _launch_replacement(self, node: int) -> None:
         if node in self.st.replacing:
@@ -547,6 +566,17 @@ class Supervisor:
             if self._train_start is None and self.st.ckpt_step >= 0 and self.st.epoch > 0:
                 self._train_start = now
                 self.profile.mark("train_start")
+            # Reclaim detection: a member observed gone that we did NOT terminate
+            # is a spot reclaim => emit "down" (stamped now, ~one tick after the
+            # box actually vanished). A member we killed already emitted "killed".
+            healthy = frozenset(n.node for n in obs.nodes if _healthy(n, self.policy))
+            for node in sorted(self.st.members - healthy):
+                iid = self.node_ids.get(node, "")
+                if (node, iid) in self._downed:
+                    continue
+                self._downed.add((node, iid))
+                if iid not in self._terminated_iids:
+                    self._emit_event("down", node=node, cause="reclaimed")
             actions = decide(obs, self.policy)
             if any(isinstance(a, Done) for a in actions):
                 self._pull_logs()

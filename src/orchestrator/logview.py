@@ -31,7 +31,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-from spot_train import s3_store
+from spot_train import events, s3_store
 
 from .config import OrchestratorConfig
 
@@ -276,7 +276,7 @@ def render_frame(
     visible += [""] * (body_rows - len(visible))
 
     follow = "[FOLLOW]" if scroll == 0 else f"[SCROLL -{scroll}]"
-    help_txt = "←/→ node   ↑/↓ scroll   g grid   t timeline   0-9 jump   q quit"
+    help_txt = "←/→ node   ↑/↓ scroll   g grid   t timeline   v events   q quit"
     footer = (help_txt + " " * max(1, cols - len(help_txt) - len(follow)) + follow)[:cols]
 
     return "\n".join([bar, status, "─" * cols, *visible, footer])
@@ -343,19 +343,39 @@ def render_grid(tabs: list[Tab], size: tuple[int, int], meta: dict, now: float) 
 # actually observes per node, tick by tick, and draws it as a Gantt — the truth,
 # per node. It reflects what the viewer saw, so attach at run start for the full
 # history.
-# prov = booting/joining, train = productively training, restart = survivor whose
-# torchrun crashed on a peer's NCCL abort and is re-rendezvousing at the new world
-# size, down = dead/reclaimed.
-_GANTT = {"prov": "░", "train": "▓", "restart": "▒", "down": "·"}  # cell glyph per state
+# prov = booting/joining/restoring, train = productively training, stalled =
+# alive but blocked on a down peer (pre-NCCL-timeout hang), restart = the
+# inferred-fallback survivor re-rendezvous, down = dead/reclaimed/killed.
+_GANTT = {"prov": "░", "train": "▓", "stalled": "▚", "restart": "▒", "down": "·"}  # glyph per state
 _GANTT_COLORS = {  # for the PNG (order = legend order)
     "prov": "#4C78A8",
     "train": "#59A14F",
+    "stalled": "#E45756",
     "restart": "#F58518",
     "down": "#BAB0AC",
 }
 # A restart window with no observable checkpoint progress is capped here so a
 # missing/never-advancing ckpt_step can't paint a permanent restart bar.
 _RESTART_CAP_S = 90.0
+
+# Event-sourced timeline: node lifecycle event `state` -> Gantt label. killed and
+# down are the same "gone" bar (distinguished by cause + the ✗ marker).
+_EVENT_STATE_MAP = {
+    "provisioning": "prov",
+    "training": "train",
+    "stalled": "stalled",
+    "down": "down",
+    "killed": "down",
+}
+# One-line human descriptions for the events view.
+_EVENT_HUMAN = {
+    "provisioning": "provisioning",
+    "training": "training",
+    "stalled": "STALLED (blocked on down peer)",
+    "down": "DOWN (reclaimed)",
+    "killed": "KILLED",
+    "epoch": "epoch published",
+}
 
 
 def _compress(samples: list[tuple[float, object]], t0: float, now: float) -> list[tuple]:
@@ -484,6 +504,33 @@ class TimelineRecorder:
             "windows": windows,
         }
 
+    @classmethod
+    def from_events(cls, records: list[dict], now: float) -> TimelineRecorder:
+        """Build the timeline from source-stamped lifecycle events instead of
+        polled inference: per-node state spans from node events, the world-size
+        curve from the orchestrator's ``epoch`` events, kill markers from
+        down/killed. Every timestamp is the emitter's own ``ts`` — exact, and
+        reconstructable post-mortem from the logs alone. Returns an empty
+        recorder (``.samples`` falsy) when there are no usable events, so the
+        caller can fall back to the inferred timeline."""
+        rec = cls()
+        node_recs = [
+            r for r in records if r.get("state") in _EVENT_STATE_MAP and r.get("node") is not None
+        ]
+        world_recs = [
+            r for r in records if r.get("state") == "epoch" and r.get("world") is not None
+        ]
+        if not node_recs and not world_recs:
+            return rec
+        rec.t0 = min(r["ts"] for r in node_recs + world_recs)
+        for r in sorted(node_recs, key=lambda r: r["ts"]):
+            rec.samples.setdefault(r["node"], []).append((r["ts"], _EVENT_STATE_MAP[r["state"]]))
+            if r["state"] in ("killed", "down"):
+                rec.kills.append((r["ts"], r["node"]))
+        rec.world = sorted((r["ts"], int(r["world"])) for r in world_recs)
+        rec.full = max((w for _t, w in rec.world), default=0)
+        return rec
+
 
 def render_gantt(
     rec: TimelineRecorder, now: float, size: tuple[int, int], meta: dict, note: str = ""
@@ -544,13 +591,58 @@ def render_gantt(
     )[:cols]
 
     rule = "─" * labelw + "┴" + "─" * inner
-    legend = " ░ provision   ▓ training   ▒ restart(re-rdzv)   · down   ✗ killed"[:cols]
-    footer = (note or "[e] export PNG   [t] tabs   [g] grid   [q] quit")[:cols]
+    legend = " ░ provision   ▓ training   ▚ stalled   · down   ✗ killed/gone"[:cols]
+    footer = (note or "[e] export   [v] events   [t] tabs   [g] grid   [q] quit")[:cols]
     head = [title, axis]
     foot = [rule, ws_row, summary, legend, footer]
     avail = rows - len(head) - len(foot)
     body = (body + [""] * avail)[:avail]
     return "\n".join([*head, *body, *foot])
+
+
+def collect_events(tabs: dict[tuple[int, int], Tab]) -> list[dict]:
+    """Parse every ``[event]`` record out of all tab buffers. Node logs carry
+    node-lifecycle events (default-attributed to the tab's node); the orchestrator
+    log carries epoch / killed / down. Idempotent: each line lives in exactly one
+    buffer, so re-parsing the growing buffers never duplicates."""
+    recs: list[dict] = []
+    for (node, _a), tab in tabs.items():
+        text = tab.buf.decode("utf-8", errors="replace")
+        recs += events.parse(text, default_node=None if node == ORCH else node)
+    return recs
+
+
+def _event_line(r: dict, t0: float, cols: int) -> str:
+    ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
+    who = "orch" if r.get("node") is None else f"node{r['node']}"
+    base = _EVENT_HUMAN.get(r["state"], r["state"])
+    extra = []
+    if r.get("world") is not None:
+        extra.append(f"world {r['world']}")
+    if r.get("step") is not None:
+        extra.append(f"step {r['step']}")
+    if r.get("cause"):
+        extra.append(str(r["cause"]))
+    tail = ("  (" + ", ".join(extra) + ")") if extra else ""
+    return f"{ts}  t+{int(r['ts'] - t0):>4}s  {who:>6}: {base}{tail}"[:cols]
+
+
+def render_events(
+    records: list[dict], now: float, size: tuple[int, int], meta: dict, scroll: int = 0
+) -> str:
+    """The per-node event log: every source-stamped transition, newest at the
+    bottom, with absolute (HH:MM:SS) and relative (t+Ns) times. Pure."""
+    cols, rows = max(40, size[0]), max(6, size[1])
+    recs = sorted(records, key=lambda r: r["ts"])
+    t0 = recs[0]["ts"] if recs else now
+    title = f"Events — {meta.get('run_id', '?')}   {len(recs)} transitions"[:cols]
+    body_rows = rows - 3
+    lines = [_event_line(r, t0, cols) for r in recs] or ["(no [event] records yet)"]
+    end = max(0, len(lines) - scroll)
+    visible = lines[max(0, end - body_rows) : end]
+    visible += [""] * (body_rows - len(visible))
+    footer = "↑/↓ PgUp/PgDn scroll   t timeline   g grid   e export   q quit"[:cols]
+    return "\n".join([title, "─" * cols, *visible, footer])
 
 
 def export_gantt(
@@ -561,10 +653,12 @@ def export_gantt(
     out_dir: str = ".",
     cfg: OrchestratorConfig | None = None,
     local_only: bool = False,
+    records: list[dict] | None = None,
 ) -> list[str]:
-    """Render the Gantt to a PNG and return where it landed (local path, plus an
-    s3:// URI when a bucket is configured). Lazy matplotlib import — same Agg
-    backend the run profile uses."""
+    """Render the Gantt to a PNG (and, when ``records`` are given, a companion
+    ``events.txt`` of every source-stamped transition) and return where they
+    landed — local paths, plus s3:// URIs when a bucket is configured. Lazy
+    matplotlib import — same Agg backend the run profile uses."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -640,15 +734,29 @@ def export_gantt(
     path = os.path.abspath(os.path.join(out_dir, f"{run_id}-timeline.png"))
     fig.savefig(path, bbox_inches="tight", dpi=120)
     plt.close(fig)
+    local = [path]
 
-    where = [path]
+    if records:  # a shareable, plain-text record of every source-stamped event
+        txt = os.path.abspath(os.path.join(out_dir, f"{run_id}-events.txt"))
+        recs = sorted(records, key=lambda r: r["ts"])
+        t0 = recs[0]["ts"]
+        with open(txt, "w") as f:
+            f.write(f"Run events — {run_id}\n")
+            for r in recs:
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"]))
+                f.write(f"{stamp}  {_event_line(r, t0, 200).split('  ', 1)[1]}\n")
+        local.append(txt)
+
+    where = list(local)
     if cfg is not None and not local_only and getattr(cfg, "bucket", ""):
-        uri = f"s3://{cfg.bucket}/{cfg.run_prefix}/{run_id}/timeline.png"
-        try:
-            s3_store.put_file(path, uri)
-            where.append(uri)
-        except Exception as exc:  # noqa: BLE001 — S3 optional; local PNG already written
-            where.append(f"(s3 upload failed: {exc})")
+        for p in local:
+            name = os.path.basename(p)
+            uri = f"s3://{cfg.bucket}/{cfg.run_prefix}/{run_id}/{name}"
+            try:
+                s3_store.put_file(p, uri)
+                where.append(uri)
+            except Exception as exc:  # noqa: BLE001 — S3 optional; locals already written
+                where.append(f"(s3 upload failed for {name}: {exc})")
     return where
 
 
@@ -660,6 +768,8 @@ def decode_key(raw: bytes) -> str | None:
         return "grid"
     if raw in (b"t", b"T"):
         return "timeline"
+    if raw in (b"v", b"V"):
+        return "events"
     if raw in (b"e", b"E"):
         return "export"
     if raw.isdigit():
@@ -761,9 +871,17 @@ def run_logs(
     want_node = node  # select this node's tab once it appears (None = first real node)
     scroll = 0
     mode = "grid" if grid else "single"
-    timeline = TimelineRecorder()  # accrues every tick, in any mode
+    timeline = TimelineRecorder()  # inferred fallback (runs without [event] lines)
+    records: list[dict] = []  # source-stamped events parsed from the logs
     export_note = ""
     fd = sys.stdin.fileno()
+
+    def active_timeline(at: float) -> TimelineRecorder:
+        """Prefer the event-sourced timeline (exact, source-stamped); fall back to
+        the inferred one for older runs that emit no [event] lines."""
+        evt = TimelineRecorder.from_events(records, at)
+        return evt if (evt.samples or evt.world) else timeline
+
     import termios
     import tty
 
@@ -793,9 +911,15 @@ def run_logs(
                     if sel_key not in tabs:
                         pick = next((t for t in order if t.node != ORCH), order[0])
                         sel_key = (pick.node, pick.attempt)
-                # Grid polls EVERY visible pane; single view only the selected
-                # tab. Dead panes get one forced fetch so their final bytes show.
-                to_poll = _grid_tabs(tabs) if mode == "grid" else [tabs.get(sel_key)]
+                # timeline/events need every node's events (embedded in its log),
+                # so poll ALL tabs there; grid polls its visible panes; single view
+                # only the selected tab. Dead panes get one forced fetch.
+                if mode in ("timeline", "events"):
+                    to_poll = list(tabs.values())
+                elif mode == "grid":
+                    to_poll = _grid_tabs(tabs)
+                else:
+                    to_poll = [tabs.get(sel_key)]
                 for t in to_poll:
                     if t is not None:
                         poll(t, force=t.state == "dead" and t.fetched == 0)
@@ -810,6 +934,7 @@ def run_logs(
                         epoch=meta.get("epoch"),
                         ckpt_step=meta.get("ckpt_step"),
                     )
+                records = collect_events(tabs)  # re-parse the (small) event lines
                 next_tick = now + interval
                 dirty = True
 
@@ -827,13 +952,23 @@ def run_logs(
                     scroll = 0
                     sys.stdout.write("\x1b[2J")
                     dirty = True
+                elif key == "events":
+                    mode = "single" if mode == "events" else "events"
+                    scroll = 0
+                    sys.stdout.write("\x1b[2J")
+                    dirty = True
                 elif key == "export":
+                    for t in tabs.values():  # sweep every tab so the export is complete
+                        poll(t, force=t.state == "dead" and t.fetched == 0)
+                    records = collect_events(tabs)
+                    at = meta.get("updated_at") or now
                     where = export_gantt(
-                        timeline,
+                        active_timeline(at),
                         run_id,
-                        meta.get("updated_at") or now,
+                        at,
                         cfg=cfg,
                         local_only=bool(uri),
+                        records=records,
                     )
                     export_note = "exported → " + "   ".join(where)
                     dirty = True
@@ -845,7 +980,19 @@ def run_logs(
                         sys.stdout.write("\x1b[2J")
                         dirty = True
                 elif mode == "timeline":
-                    pass  # timeline is a read-only overview; e/t/g/q handled above
+                    pass  # timeline is a read-only overview; e/t/g/v/q handled above
+                elif mode == "events":
+                    n_lines = max(1, len(records))
+                    page = max(1, shutil.get_terminal_size().lines - 3)
+                    if key == "up":
+                        scroll = min(n_lines - 1, scroll + 1)
+                    elif key == "down":
+                        scroll = max(0, scroll - 1)
+                    elif key == "pgup":
+                        scroll = min(n_lines - 1, scroll + page)
+                    elif key == "pgdn":
+                        scroll = max(0, scroll - page)
+                    dirty = True
                 else:  # single view
                     order = _ordered(tabs)
                     idx = _index_of(order, sel_key)
@@ -872,16 +1019,17 @@ def run_logs(
 
             if dirty:
                 size = shutil.get_terminal_size()
+                sz = (size.columns, size.lines)
                 if mode == "grid":
-                    frame = render_grid(_grid_tabs(tabs), (size.columns, size.lines), meta, now)
+                    frame = render_grid(_grid_tabs(tabs), sz, meta, now)
                 elif mode == "timeline":
-                    frame = render_gantt(
-                        timeline, now, (size.columns, size.lines), meta, note=export_note
-                    )
+                    frame = render_gantt(active_timeline(now), now, sz, meta, note=export_note)
+                elif mode == "events":
+                    frame = render_events(records, now, sz, meta, scroll)
                 else:
                     order = _ordered(tabs)
                     idx = _index_of(order, sel_key)
-                    frame = render_frame(order, idx, scroll, (size.columns, size.lines), meta, now)
+                    frame = render_frame(order, idx, scroll, sz, meta, now)
                 _paint(frame)
     finally:
         sys.stdout.write("\x1b[?25h\n")
@@ -899,8 +1047,8 @@ def _run_plain(run_uri: str, interval: float, node: int | None) -> None:
     target = 0 if node is None else node
     while True:
         now = time.time()
-        meta, events = _tick(run_uri, tabs, now)
-        for kind, t in events:
+        meta, evts = _tick(run_uri, tabs, now)
+        for kind, t in evts:
             note = "+" if kind == "new" else "DEAD"
             print(f"[logs] {note} {t.label} ({t.state})", file=sys.stderr)
         cands = [t for t in tabs.values() if t.node == target]
