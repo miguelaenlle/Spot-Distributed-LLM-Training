@@ -48,3 +48,6 @@ credentials
 .idea/
 .vscode/
 reports/
+
+# Local Gantt timeline exports written by `spot-orchestrate logs` (the `e` key)
+*-timeline.png

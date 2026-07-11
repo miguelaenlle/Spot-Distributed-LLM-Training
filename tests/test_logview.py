@@ -15,12 +15,15 @@ from orchestrator import logview
 from orchestrator.logview import (
     ORCH,
     Tab,
+    TimelineRecorder,
     _grid_tabs,
     decode_key,
     discover,
+    export_gantt,
     merge,
     poll,
     render_frame,
+    render_gantt,
     render_grid,
 )
 from spot_train import s3_store
@@ -252,8 +255,151 @@ def test_render_grid_empty_is_stable():
     assert frame.count("\n") == 11  # header + 10 blank body rows + footer == rows
 
 
+# --------------------------------------------------------------------------- #
+# Timeline (Gantt): recorder, renderer, export
+# --------------------------------------------------------------------------- #
+def _tl_tabs(states):  # {node: state} -> tabs dict at their newest attempt
+    return {(n, 0): Tab(n, 0, "u", s) for n, s in states.items()}
+
+
+# A realistic 2-node preempt seen through status.json ticks: both boot (members
+# empty), epoch 1 admits [0,1], node1 killed -> members [0], replacement boots
+# then rejoins -> members [0,1] again. (w, tabs, members) per tick.
+def _seed_preempt(rec):
+    rec.update(0.0, _tl_tabs({0: "pending", 1: "pending"}), set())  # booting: not members
+    rec.update(10.0, _tl_tabs({0: "alive", 1: "alive"}), {0, 1})  # epoch 1: both train
+    rec.update(20.0, {(0, 0): Tab(0, 0, "u", "alive"), (1, 0): Tab(1, 0, "u", "dead")}, {0})
+    rec.update(  # replacement booting (attempt 1 pending), still world 1
+        30.0,
+        {
+            (0, 0): Tab(0, 0, "u", "alive"),
+            (1, 0): Tab(1, 0, "u", "dead"),
+            (1, 1): Tab(1, 1, "u", "pending"),
+        },
+        {0},
+    )
+    rec.update(40.0, {(0, 0): Tab(0, 0, "u", "alive"), (1, 1): Tab(1, 1, "u", "alive")}, {0, 1})
+
+
+def test_timeline_labels_by_membership_never_trains_before_admitted():
+    # The bug this guards: a booting node's fresh log made the listing fallback
+    # call it "alive", drawing green (training) BEFORE its blue provisioning.
+    # Membership-driven labels make a node "train" only once it's an epoch member.
+    rec = TimelineRecorder()
+    _seed_preempt(rec)
+    assert rec.t0 == 0.0
+    # node0 provisions (not a member yet) THEN trains — never the reverse.
+    assert [lbl for _w, lbl in rec.samples[0]] == ["prov", "train", "train", "train", "train"]
+    assert [lbl for _w, lbl in rec.samples[1]] == ["prov", "train", "down", "prov", "train"]
+    assert rec.kills == [(20.0, 1)]  # the one alive->down transition
+    # ORCH is never a Gantt row
+    rec.update(50.0, {(ORCH, 0): Tab(ORCH, 0, "u", "alive")}, {0, 1})
+    assert ORCH not in rec.samples
+
+
+def test_timeline_survivor_restart_on_epoch_change():
+    # node0 survives node1's kill, but its torchrun crashes on the NCCL abort and
+    # re-rendezvouses at the smaller world — a "restart" span until checkpoint
+    # progress resumes. Same on the grow (rejoin). Driven by epoch + ckpt_step.
+    rec = TimelineRecorder()
+    both = _tl_tabs({0: "alive", 1: "alive"})
+    dead1 = {(0, 0): Tab(0, 0, "u", "alive"), (1, 0): Tab(1, 0, "u", "dead")}
+    rejoined = {(0, 0): Tab(0, 0, "u", "alive"), (1, 1): Tab(1, 1, "u", "alive")}
+    # epoch 1 world 2, ckpt climbing
+    rec.update(0.0, both, {0, 1}, epoch=1, ckpt_step=10)
+    rec.update(10.0, both, {0, 1}, epoch=1, ckpt_step=20)
+    # epoch 2: node1 gone, world 1 — node0 is a survivor -> restart until ckpt moves
+    rec.update(20.0, dead1, {0}, epoch=2, ckpt_step=20)
+    rec.update(30.0, dead1, {0}, epoch=2, ckpt_step=20)  # still restarting (no progress)
+    rec.update(40.0, dead1, {0}, epoch=2, ckpt_step=25)  # ckpt advanced -> resumed
+    # epoch 3: replacement rejoins, world 2 — node0 restarts again
+    rec.update(50.0, rejoined, {0, 1}, epoch=3, ckpt_step=25)
+    rec.update(60.0, rejoined, {0, 1}, epoch=3, ckpt_step=30)  # resumed
+
+    assert [lbl for _w, lbl in rec.samples[0]] == [
+        "train",
+        "train",  # epoch 1
+        "restart",
+        "restart",  # shrink: re-rendezvous at world 1
+        "train",  # resumed (ckpt advanced)
+        "restart",  # grow: re-rendezvous at world 2
+        "train",  # resumed
+    ]
+    runs = rec.runs(0, now=70.0)
+    assert "restart" in [lbl for _s, _d, lbl in runs]
+
+
+def test_timeline_world_curve_and_degraded():
+    rec = TimelineRecorder()
+    _seed_preempt(rec)
+    # World size = |members|: 0 (booting) -> 2 -> 1 (shrunk) -> 2 (regrown).
+    assert rec.full == 2
+    assert rec.world_runs(now=50.0) == [
+        (0.0, 10.0, 0),
+        (10.0, 10.0, 2),
+        (20.0, 20.0, 1),
+        (40.0, 10.0, 2),
+    ]
+    deg = rec.degraded(now=50.0)
+    assert deg["full"] == 2 and deg["current"] == 2
+    # Only the POST-startup shrink counts: the 0-10s boot ramp (ws0) is
+    # provisioning, not downtime-due-to-world-change; the 20-40s dip to ws1 is.
+    assert deg["total"] == 20.0 and len(deg["windows"]) == 1
+    assert deg["windows"][0] == (20.0, 20.0, 1)  # 20s shrunk to world 1
+
+
+def test_timeline_recorder_runs_compresses_spans():
+    rec = TimelineRecorder()
+    seq = [
+        (0.0, "pending", set()),
+        (10.0, "alive", {0}),
+        (20.0, "alive", {0}),
+        (30.0, "dead", set()),
+    ]
+    for w, s, m in seq:
+        rec.update(w, _tl_tabs({0: s}), m)
+    assert rec.runs(0, now=40.0) == [
+        (0.0, 10.0, "prov"),
+        (10.0, 20.0, "train"),
+        (30.0, 10.0, "down"),
+    ]
+
+
+def test_render_gantt_rows_world_strip_and_summary():
+    rec = TimelineRecorder()
+    _seed_preempt(rec)
+    frame = render_gantt(rec, now=50.0, size=(80, 14), meta={"run_id": "mn-1"})
+    assert "Run timeline — mn-1" in frame and "elapsed 50s" in frame
+    assert " n0 │" in frame and " n1 │" in frame  # one row per node
+    assert " ws │" in frame  # world-size strip under the gantt
+    assert "▓" in frame and "·" in frame and "✗" in frame  # train, down, kill glyphs
+    assert "world 2/2" in frame and "degraded 20s" in frame  # post-startup downtime
+    assert frame.count("\n") == 13  # exactly fills `rows`
+
+
+def test_render_gantt_shows_export_note():
+    rec = TimelineRecorder()
+    rec.update(0.0, _tl_tabs({0: "alive"}), {0})
+    frame = render_gantt(
+        rec, now=5.0, size=(80, 10), meta={"run_id": "r"}, note="exported → /tmp/r.png"
+    )
+    assert "exported → /tmp/r.png" in frame
+
+
+def test_export_gantt_writes_png(tmp_path):
+    rec = TimelineRecorder()
+    _seed_preempt(rec)
+    where = export_gantt(rec, "mn-1", now=50.0, out_dir=str(tmp_path), local_only=True)
+    assert len(where) == 1
+    png = where[0]
+    assert png.endswith("mn-1-timeline.png") and os.path.exists(png)
+    assert os.path.getsize(png) > 1000  # a real PNG, not an empty stub
+
+
 def test_decode_key():
     assert decode_key(b"g") == "grid"
+    assert decode_key(b"t") == "timeline"
+    assert decode_key(b"e") == "export"
     assert decode_key(b"\x1b[C") == "right"
     assert decode_key(b"\x1b[D") == "left"
     assert decode_key(b"\x1b[A") == "up"

@@ -209,6 +209,7 @@ def status_doc(
     orch_log_key: str,
     prev: dict | None,
     now: float,
+    ckpt_step: int = -1,
     done: bool = False,
 ) -> dict:
     """The observability document (status.json), rewritten every tick so ANY
@@ -261,6 +262,11 @@ def status_doc(
         "updated_at": now,
         "epoch": epoch,
         "members": sorted(members),
+        # Checkpoint progress: the viewer uses this to tell when survivors have
+        # actually resumed training after an epoch change (their torchrun crashed
+        # on the NCCL abort and re-rendezvoused at the new world size) vs. are
+        # still restarting/restoring.
+        "ckpt_step": ckpt_step,
         "done": done,
         "orchestrator": {"log_key": orch_log_key},
         "nodes": [entries[k] for k in sorted(entries)],
@@ -360,6 +366,7 @@ class Supervisor:
                 orch_log_key=self.orch_log_key,
                 prev=self._last_status,
                 now=wall,
+                ckpt_step=self.st.ckpt_step,
                 done=done,
             )
             aws.put_text(self.cfg.bucket, self.status_key, json.dumps(doc))

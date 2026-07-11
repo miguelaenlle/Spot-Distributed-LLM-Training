@@ -85,6 +85,7 @@ def _from_status(base: str, doc: dict) -> tuple[dict, list[dict]]:
         "run_id": doc.get("run_id", base.rsplit("/", 1)[-1]),
         "epoch": doc.get("epoch"),
         "members": doc.get("members"),
+        "ckpt_step": doc.get("ckpt_step"),
         "updated_at": doc.get("updated_at"),
         "done": bool(doc.get("done")),
         "source": "status",
@@ -275,7 +276,7 @@ def render_frame(
     visible += [""] * (body_rows - len(visible))
 
     follow = "[FOLLOW]" if scroll == 0 else f"[SCROLL -{scroll}]"
-    help_txt = "←/→ node   ↑/↓ PgUp/PgDn scroll   g grid   0-9 jump   q quit"
+    help_txt = "←/→ node   ↑/↓ scroll   g grid   t timeline   0-9 jump   q quit"
     footer = (help_txt + " " * max(1, cols - len(help_txt) - len(follow)) + follow)[:cols]
 
     return "\n".join([bar, status, "─" * cols, *visible, footer])
@@ -310,7 +311,7 @@ def render_grid(tabs: list[Tab], size: tuple[int, int], meta: dict, now: float) 
     show = tabs[:MAX_GRID]
     n = len(show)
     body_rows = rows - 2
-    footer = ("grid — 0-9 focus pane   g single-view   q quit")[:cols]
+    footer = ("grid — 0-9 focus pane   t timeline   g single-view   q quit")[:cols]
     if n == 0:
         blank = [""] * body_rows
         return "\n".join([header, *blank, footer])
@@ -333,12 +334,334 @@ def render_grid(tabs: list[Tab], size: tuple[int, int], meta: dict, now: float) 
     return "\n".join([header, *lines, footer])
 
 
+# --------------------------------------------------------------------------- #
+# Timeline (Gantt): one row per node, wall-clock x-axis, observed states
+# --------------------------------------------------------------------------- #
+# The stacked phase bar in the run profile collapses the whole run into one
+# global "provisioning/training/degraded" timeline, which mislabels a node that
+# died-and-rejoined as blanket "degraded". This view records what the dashboard
+# actually observes per node, tick by tick, and draws it as a Gantt — the truth,
+# per node. It reflects what the viewer saw, so attach at run start for the full
+# history.
+# prov = booting/joining, train = productively training, restart = survivor whose
+# torchrun crashed on a peer's NCCL abort and is re-rendezvousing at the new world
+# size, down = dead/reclaimed.
+_GANTT = {"prov": "░", "train": "▓", "restart": "▒", "down": "·"}  # cell glyph per state
+_GANTT_COLORS = {  # for the PNG (order = legend order)
+    "prov": "#4C78A8",
+    "train": "#59A14F",
+    "restart": "#F58518",
+    "down": "#BAB0AC",
+}
+# A restart window with no observable checkpoint progress is capped here so a
+# missing/never-advancing ckpt_step can't paint a permanent restart bar.
+_RESTART_CAP_S = 90.0
+
+
+def _compress(samples: list[tuple[float, object]], t0: float, now: float) -> list[tuple]:
+    """Merge consecutive equal-value samples into (start_rel, duration, value)."""
+    out: list[list] = []
+    for i, (w, v) in enumerate(samples):
+        end = samples[i + 1][0] if i + 1 < len(samples) else now
+        if out and out[-1][2] == v:
+            out[-1][1] = end - t0 - out[-1][0]
+        else:
+            out.append([w - t0, end - w, v])
+    return [tuple(r) for r in out]
+
+
+@dataclass
+class TimelineRecorder:
+    """Per-node observed history + the world-size (epoch membership) curve,
+    accumulated one sample per tick.
+
+    A node's label is driven by MEMBERSHIP, not raw liveness: it's ``train`` only
+    while it's an admitted member of the current epoch, ``prov`` while it's
+    booting/joining-but-not-yet-a-member, ``down`` once dead. That's why a
+    booting node reads as provisioning, never as "training before it started" —
+    fresh-boot-log liveness (the listing fallback's only signal) is deliberately
+    NOT trusted here; the caller feeds only status.json ticks, which carry the
+    epoch's member set. World size = |members|; the full world is the max seen."""
+
+    t0: float | None = None
+    samples: dict[int, list[tuple[float, str]]] = field(default_factory=dict)
+    kills: list[tuple[float, int]] = field(default_factory=list)
+    world: list[tuple[float, int]] = field(default_factory=list)  # (wall, world size)
+    full: int = 0  # full world size (max |members| ever observed)
+    _last: dict[int, str] = field(default_factory=dict)
+    _epoch: int | None = None
+    _prev_members: set[int] = field(default_factory=set)
+    _restarting: set[int] = field(default_factory=set)  # survivors re-rendezvousing now
+    _restart_at: float = 0.0
+    _restart_ckpt: int | None = None  # ckpt step at the epoch change; resumed once it advances
+
+    def _track_restart(self, w: float, members: set[int], epoch: int | None, ckpt: int | None):
+        """A survivor (a continuing member across an epoch change) re-rendezvouses
+        at the new world size: its torchrun crashed on the peer's NCCL abort and
+        relaunches, not training until checkpoint progress resumes. Detect that
+        window from observable signals — the epoch bump and checkpoint step."""
+        if epoch is not None and self._epoch is not None and epoch != self._epoch:
+            survivors = set(members) & self._prev_members  # in both epochs => restarting
+            if survivors:
+                self._restarting = survivors
+                self._restart_at = w
+                self._restart_ckpt = ckpt
+        if epoch is not None:
+            self._epoch = epoch
+        self._prev_members = set(members)
+        # Resume: checkpoint advanced past the change, OR the safety cap elapsed.
+        resumed = self._restart_ckpt is not None and ckpt is not None and ckpt > self._restart_ckpt
+        if resumed or (w - self._restart_at) > _RESTART_CAP_S:
+            self._restarting = set()
+        self._restarting &= set(members)  # a node that left is no longer "restarting"
+
+    def update(
+        self,
+        w: float,
+        tabs: dict[tuple[int, int], Tab],
+        members: set[int],
+        epoch: int | None = None,
+        ckpt_step: int | None = None,
+    ) -> None:
+        if self.t0 is None:
+            self.t0 = w
+        self._track_restart(w, members, epoch, ckpt_step)
+        for node in sorted({n for (n, _a) in tabs if n != ORCH}):
+            newest = max((t for (n, _a), t in tabs.items() if n == node), key=lambda t: t.attempt)
+            if newest.state == "dead":
+                label = "down"
+            elif node in self._restarting:
+                label = "restart"  # survivor re-rendezvousing at the new world size
+            elif node in members:
+                label = "train"  # admitted to the epoch => actually in the group
+            else:
+                label = "prov"  # registered/booting/joining, not yet a member
+            if self._last.get(node) == "train" and label == "down":
+                self.kills.append((w, node))
+            self.samples.setdefault(node, []).append((w, label))
+            self._last[node] = label
+        ws = len(members)
+        self.world.append((w, ws))
+        self.full = max(self.full, ws)
+
+    def runs(self, node: int, now: float) -> list[tuple[float, float, str]]:
+        """A node's spans as (start_rel, duration, label)."""
+        t0 = self.t0 if self.t0 is not None else now  # not `or`: t0 can be 0.0
+        return _compress(self.samples.get(node, []), t0, now)
+
+    def world_runs(self, now: float) -> list[tuple[float, float, int]]:
+        """The world-size curve as (start_rel, duration, world_size) spans."""
+        t0 = self.t0 if self.t0 is not None else now
+        return _compress(self.world, t0, now)
+
+    def degraded(self, now: float) -> dict:
+        """Downtime attributable to world-size CHANGE: spans below full world,
+        counted only AFTER full world is first reached (the initial boot ramp is
+        provisioning, not a shrink). Grouped into recovery windows: ``total``
+        seconds + per-window (start_rel, duration, min_ws) — "how long were we
+        shrunk by preemption, and for each dip how far?"."""
+        windows: list[tuple[float, float, int]] = []
+        cur: list | None = None
+        reached_full = False
+        for s, d, ws in self.world_runs(now):
+            if self.full and ws >= self.full:
+                reached_full = True
+            if reached_full and self.full and ws < self.full:
+                if cur is None:
+                    cur = [s, d, ws]
+                else:
+                    cur[1] += d
+                    cur[2] = min(cur[2], ws)
+            elif cur is not None:
+                windows.append(tuple(cur))
+                cur = None
+        if cur is not None:
+            windows.append(tuple(cur))
+        return {
+            "full": self.full,
+            "current": self.world[-1][1] if self.world else 0,
+            "total": sum(w[1] for w in windows),
+            "windows": windows,
+        }
+
+
+def render_gantt(
+    rec: TimelineRecorder, now: float, size: tuple[int, int], meta: dict, note: str = ""
+) -> str:
+    """One frame of the per-node Gantt. Pure — drives the snapshot tests."""
+    cols, rows = max(40, size[0]), max(8, size[1])
+    labelw = 4
+    inner = cols - labelw - 1
+    t0 = rec.t0 if rec.t0 is not None else now
+    span = max(1.0, now - t0)
+
+    title = f"Run timeline — {meta.get('run_id', '?')}   elapsed {int(span)}s"[:cols]
+    scale = [" "] * inner
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        txt, xi = f"{int(span * frac)}s", min(inner - 1, int(frac * (inner - 1)))
+        xi = max(0, min(xi, inner - len(txt)))
+        for j, ch in enumerate(txt):
+            scale[xi + j] = ch
+    axis = " " * (labelw + 1) + "".join(scale)
+
+    def _at(samples: list, t: float, k: int) -> tuple[object, int]:
+        while k + 1 < len(samples) and samples[k + 1][0] <= t:
+            k += 1
+        return (samples[k][1] if samples else None), k
+
+    body: list[str] = []
+    for node in sorted(rec.samples):
+        s = rec.samples[node]
+        chars, k = [], 0
+        for x in range(inner):
+            lbl, k = _at(s, t0 + (x + 0.5) * span / inner, k)
+            chars.append(_GANTT.get(lbl, " "))
+        for kw, kn in rec.kills:
+            if kn == node:
+                xi = int((kw - t0) / span * inner)
+                if 0 <= xi < inner:
+                    chars[xi] = "✗"
+        body.append(f"n{node}".center(labelw) + "│" + "".join(chars))
+
+    # World-size strip: the N -> N-1 -> N staircase as a sparkline under the rows.
+    blocks = " ▁▂▃▄▅▆▇█"
+    ws_chars, k = [], 0
+    for x in range(inner):
+        ws, k = _at(rec.world, t0 + (x + 0.5) * span / inner, k)
+        if not ws or not rec.full:
+            ws_chars.append(" ")
+        else:
+            ws_chars.append(blocks[max(1, round(ws / rec.full * 8))])
+    ws_row = "ws".center(labelw) + "│" + "".join(ws_chars)
+
+    deg = rec.degraded(now)
+    longest = int(max((d for _s, d, _w in deg["windows"]), default=0))
+    n_dips = len(deg["windows"])
+    summary = (
+        f" world {deg['current']}/{deg['full']}   "
+        f"degraded {int(deg['total'])}s ({n_dips} dip{'' if n_dips == 1 else 's'})   "
+        f"longest recovery {longest}s"
+    )[:cols]
+
+    rule = "─" * labelw + "┴" + "─" * inner
+    legend = " ░ provision   ▓ training   ▒ restart(re-rdzv)   · down   ✗ killed"[:cols]
+    footer = (note or "[e] export PNG   [t] tabs   [g] grid   [q] quit")[:cols]
+    head = [title, axis]
+    foot = [rule, ws_row, summary, legend, footer]
+    avail = rows - len(head) - len(foot)
+    body = (body + [""] * avail)[:avail]
+    return "\n".join([*head, *body, *foot])
+
+
+def export_gantt(
+    rec: TimelineRecorder,
+    run_id: str,
+    now: float,
+    *,
+    out_dir: str = ".",
+    cfg: OrchestratorConfig | None = None,
+    local_only: bool = False,
+) -> list[str]:
+    """Render the Gantt to a PNG and return where it landed (local path, plus an
+    s3:// URI when a bucket is configured). Lazy matplotlib import — same Agg
+    backend the run profile uses."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.patches as mpatches
+    import matplotlib.pyplot as plt
+
+    t0 = rec.t0 if rec.t0 is not None else now
+    nodes = sorted(rec.samples)
+    deg = rec.degraded(now)
+    # Two stacked panels sharing the time axis: the per-node Gantt on top, the
+    # world-size (membership) staircase below.
+    fig, (ax, wax) = plt.subplots(
+        2,
+        1,
+        figsize=(12, 1.6 + 0.7 * max(1, len(nodes))),
+        gridspec_kw={"height_ratios": [max(1, len(nodes)), 1.1], "hspace": 0.32},
+        sharex=True,
+    )
+    for i, node in enumerate(nodes):
+        runs = rec.runs(node, now)
+        ax.broken_barh(
+            [(s, d) for s, d, _lbl in runs],
+            (i * 10 + 2, 6),
+            facecolors=[_GANTT_COLORS.get(lbl, "#ccc") for _s, _d, lbl in runs],
+        )
+        for s, d, _lbl in runs:  # segment-length labels (PNG only)
+            if d >= 0.04 * max(1.0, now - t0):  # skip slivers too thin for text
+                ax.text(
+                    s + d / 2,
+                    i * 10 + 5,
+                    f"{int(d)}s",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white",
+                )
+        for kw, kn in rec.kills:
+            if kn == node:
+                ax.plot(kw - t0, i * 10 + 5, marker="x", color="#E45756", ms=11, mew=3)
+    ax.set_yticks([i * 10 + 5 for i in range(len(nodes))])
+    ax.set_yticklabels([f"node{n}" for n in nodes])
+    ax.set_ylim(0, max(1, len(nodes)) * 10)
+    ax.set_title(f"Run timeline — {run_id}")
+    ax.legend(
+        handles=[mpatches.Patch(color=c, label=lbl) for lbl, c in _GANTT_COLORS.items()]
+        + [mpatches.Patch(color="#E45756", label="killed")],
+        loc="upper right",
+        fontsize=8,
+    )
+
+    # World-size panel: the membership staircase, with the full line dashed and
+    # every below-full (shrunk) window shaded — the downtime due to world change.
+    wruns = rec.world_runs(now)
+    xs, ys = [0.0], [wruns[0][2] if wruns else 0]
+    for s, d, ws in wruns:
+        xs += [s, s + d]
+        ys += [ws, ws]
+    wax.step(xs, ys, where="post", color="#4C78A8", lw=2)
+    if rec.full:
+        wax.axhline(rec.full, ls="--", lw=1, color="#888")
+    for s, d, _mn in deg["windows"]:
+        wax.axvspan(s, s + d, color="#E45756", alpha=0.15)
+    wax.set_ylim(0, rec.full + 1)
+    wax.set_yticks(range(rec.full + 1))
+    wax.set_ylabel("world")
+    wax.set_xlabel("seconds")
+    wax.set_title(
+        f"world {deg['current']}/{deg['full']}   "
+        f"degraded {int(deg['total'])}s across {len(deg['windows'])} dip(s)",
+        fontsize=9,
+    )
+
+    path = os.path.abspath(os.path.join(out_dir, f"{run_id}-timeline.png"))
+    fig.savefig(path, bbox_inches="tight", dpi=120)
+    plt.close(fig)
+
+    where = [path]
+    if cfg is not None and not local_only and getattr(cfg, "bucket", ""):
+        uri = f"s3://{cfg.bucket}/{cfg.run_prefix}/{run_id}/timeline.png"
+        try:
+            s3_store.put_file(path, uri)
+            where.append(uri)
+        except Exception as exc:  # noqa: BLE001 — S3 optional; local PNG already written
+            where.append(f"(s3 upload failed: {exc})")
+    return where
+
+
 def decode_key(raw: bytes) -> str | None:
     """Raw stdin bytes (cbreak mode) -> a semantic key, or None if unmapped."""
     if raw in (b"q", b"Q", b"\x03"):  # Ctrl-C arrives as \x03 in cbreak
         return "quit"
     if raw in (b"g", b"G"):
         return "grid"
+    if raw in (b"t", b"T"):
+        return "timeline"
+    if raw in (b"e", b"E"):
+        return "export"
     if raw.isdigit():
         return raw.decode()
     return {
@@ -438,6 +761,8 @@ def run_logs(
     want_node = node  # select this node's tab once it appears (None = first real node)
     scroll = 0
     mode = "grid" if grid else "single"
+    timeline = TimelineRecorder()  # accrues every tick, in any mode
+    export_note = ""
     fd = sys.stdin.fileno()
     import termios
     import tty
@@ -474,6 +799,17 @@ def run_logs(
                 for t in to_poll:
                     if t is not None:
                         poll(t, force=t.state == "dead" and t.fetched == 0)
+                # Feed the timeline only status.json ticks: they carry the epoch
+                # member set, so a booting node reads as provisioning (not the
+                # listing fallback's fresh-log = "alive" = falsely "training").
+                if meta.get("source") == "status":
+                    timeline.update(
+                        meta.get("updated_at") or now,
+                        tabs,
+                        set(meta.get("members") or []),
+                        epoch=meta.get("epoch"),
+                        ckpt_step=meta.get("ckpt_step"),
+                    )
                 next_tick = now + interval
                 dirty = True
 
@@ -486,6 +822,21 @@ def run_logs(
                     mode, scroll = ("single" if mode == "grid" else "grid"), 0
                     sys.stdout.write("\x1b[2J")  # layout changes shape — clear once
                     dirty = True
+                elif key == "timeline":
+                    mode = "single" if mode == "timeline" else "timeline"
+                    scroll = 0
+                    sys.stdout.write("\x1b[2J")
+                    dirty = True
+                elif key == "export":
+                    where = export_gantt(
+                        timeline,
+                        run_id,
+                        meta.get("updated_at") or now,
+                        cfg=cfg,
+                        local_only=bool(uri),
+                    )
+                    export_note = "exported → " + "   ".join(where)
+                    dirty = True
                 elif mode == "grid":
                     panes = _grid_tabs(tabs)
                     if key and key.isdigit() and int(key) < len(panes):
@@ -493,6 +844,8 @@ def run_logs(
                         sel_key, scroll, mode = (p.node, p.attempt), 0, "single"
                         sys.stdout.write("\x1b[2J")
                         dirty = True
+                elif mode == "timeline":
+                    pass  # timeline is a read-only overview; e/t/g/q handled above
                 else:  # single view
                     order = _ordered(tabs)
                     idx = _index_of(order, sel_key)
@@ -521,6 +874,10 @@ def run_logs(
                 size = shutil.get_terminal_size()
                 if mode == "grid":
                     frame = render_grid(_grid_tabs(tabs), (size.columns, size.lines), meta, now)
+                elif mode == "timeline":
+                    frame = render_gantt(
+                        timeline, now, (size.columns, size.lines), meta, note=export_note
+                    )
                 else:
                     order = _ordered(tabs)
                     idx = _index_of(order, sel_key)
@@ -530,6 +887,8 @@ def run_logs(
         sys.stdout.write("\x1b[?25h\n")
         sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        if export_note:  # leave the export path in the scrollback after quitting
+            print(f"[logs] {export_note}", file=sys.stderr)
 
 
 def _run_plain(run_uri: str, interval: float, node: int | None) -> None:
