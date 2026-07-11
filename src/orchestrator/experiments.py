@@ -836,35 +836,57 @@ def run_overfit_experiment(cfg: OrchestratorConfig) -> list[dict]:
             f"\n[overfit-experiment] === {label} (nodes={nodes}, kills={kills}) ===",
             file=sys.stderr,
         )
-        profile, _metrics = _run_supervised(
-            cfg,
-            kind="multinode-preempt" if kills else "multinode",
-            budget=budget,
-            replace_on_loss=bool(kills),
-            kill_schedule=kills,
-            return_profile=True,
-        )
-        analysis = _analyze_overfit(profile)
-        art = _render_run_timeline(cfg, profile.run_id, f"{out_dir}/runs")
-        valcurve = _val_curve_png(
-            profile, analysis, f"{out_dir}/runs/{profile.run_id}-valcurve.png"
-        )
-        results.append(
-            {
-                "label": label,
-                "nodes": nodes,
-                "preempt": bool(kills),
-                "run_id": profile.run_id,
-                "analysis": analysis,
-                "cost": round(profile.cost_now(), 4),
-                "wandb": getattr(profile._wb, "url", None) if profile._wb else None,
-                "png": art["png"],
-                "events": art["events"],
-                "valcurve": valcurve,
-            }
-        )
+        try:
+            profile, _metrics = _run_supervised(
+                cfg,
+                kind="multinode-preempt" if kills else "multinode",
+                budget=budget,
+                replace_on_loss=bool(kills),
+                kill_schedule=kills,
+                return_profile=True,
+            )
+            analysis = _analyze_overfit(profile)
+            art = _render_run_timeline(cfg, profile.run_id, f"{out_dir}/runs")
+            valcurve = _val_curve_png(
+                profile, analysis, f"{out_dir}/runs/{profile.run_id}-valcurve.png"
+            )
+            results.append(
+                {
+                    "label": label,
+                    "nodes": nodes,
+                    "preempt": bool(kills),
+                    "run_id": profile.run_id,
+                    "analysis": analysis,
+                    "cost": round(profile.cost_now(), 4),
+                    "wandb": getattr(profile._wb, "url", None) if profile._wb else None,
+                    "png": art["png"],
+                    "events": art["events"],
+                    "valcurve": valcurve,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad run must not sink the suite
+            # _run_supervised terminates its own instances in a finally, so nothing
+            # leaks. Record the failure and press on to the next config.
+            print(f"[overfit-experiment] {label} FAILED: {exc}", file=sys.stderr)
+            results.append(
+                {
+                    "label": label,
+                    "nodes": nodes,
+                    "preempt": bool(kills),
+                    "run_id": "-",
+                    "analysis": {"reached": False, "why": f"run failed: {exc}"},
+                    "cost": 0.0,
+                    "wandb": None,
+                    "png": None,
+                    "events": None,
+                    "valcurve": None,
+                }
+            )
+        # Rewrite the summary after EVERY run so partial results (and completed
+        # per-run artifacts) survive even if a later run is preempted or crashes.
+        _write_overfit_report(f"{out_dir}/summary.txt", results, recipe)
+        print(f"[overfit-experiment] {label} done → {out_dir}/summary.txt", file=sys.stderr)
 
-    _write_overfit_report(f"{out_dir}/summary.txt", results, recipe)
     print(f"\n\033[1m[overfit-experiment] DONE → {out_dir}/summary.txt\033[0m", file=sys.stderr)
     with open(f"{out_dir}/summary.txt") as f:
         print(f.read())
