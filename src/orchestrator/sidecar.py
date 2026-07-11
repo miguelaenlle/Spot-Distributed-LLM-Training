@@ -178,6 +178,18 @@ def run(
                 rank, node_count, master_addr, master_port = mine
                 epoch_changed = epoch != running_epoch
                 crashed = proc is not None and proc.poll() is not None
+                if epoch_changed and running_epoch != -1:
+                    # REALIZED the world changed: we've read a new epoch doc. This
+                    # is distinct from (and precedes) provisioning — the gap is the
+                    # teardown of the old collective (kill_tree).
+                    events.emit(
+                        "reconfiguring",
+                        by="sidecar",
+                        node=node_index,
+                        epoch=epoch,
+                        world=node_count,
+                        cause=f"epoch {running_epoch}->{epoch}",
+                    )
                 if epoch_changed and proc is not None:
                     _log(f"node {node_index}: killed for epoch {epoch}")
                     kill_tree(proc)

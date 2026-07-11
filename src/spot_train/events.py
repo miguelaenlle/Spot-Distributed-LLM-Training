@@ -31,7 +31,7 @@ import sys
 import time
 
 PREFIX = "[event] "
-STATES = ("provisioning", "training", "stalled", "down", "killed")
+STATES = ("provisioning", "reconfiguring", "training", "stalled", "down", "killed")
 # Field order kept stable for readable log lines; ts/state/by always present.
 _FIELDS = ("ts", "node", "attempt", "state", "epoch", "world", "step", "cause", "by")
 
@@ -68,11 +68,14 @@ def emit(
     return rec
 
 
-def parse(text: str, *, default_node: int | None = None) -> list[dict]:
+def parse(
+    text: str, *, default_node: int | None = None, default_attempt: int | None = None
+) -> list[dict]:
     """Pull every well-formed ``[event]`` record out of a log blob. A record that
-    omits ``node`` (shouldn't happen, but be defensive) is attributed to
-    ``default_node`` — the node whose log it came from. Malformed lines and any
-    line without a numeric ``ts``/``state`` are skipped, not raised on."""
+    omits ``node``/``attempt`` is attributed to ``default_node``/``default_attempt``
+    — the box whose log it came from (each attempt writes its own log file), so a
+    replacement's events land on its own row. Malformed lines and any line without
+    a numeric ``ts``/``state`` are skipped, not raised on."""
     out: list[dict] = []
     for line in text.splitlines():
         i = line.find(PREFIX)
@@ -87,5 +90,7 @@ def parse(text: str, *, default_node: int | None = None) -> list[dict]:
         if not isinstance(rec["ts"], (int | float)):
             continue
         rec.setdefault("node", default_node)
+        if default_attempt is not None:
+            rec.setdefault("attempt", default_attempt)
         out.append(rec)
     return out

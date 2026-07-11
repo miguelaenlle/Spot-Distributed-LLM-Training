@@ -489,7 +489,9 @@ class Supervisor:
         self.profile.mark("kill")
         self._event(f"terminated node {node} ({iid})")
         # Orchestrator-initiated stop => "killed" (vs a spot reclaim => "down").
-        self._emit_event("killed", node=node, cause="scheduled-kill")
+        # attempt attaches the event to the exact box's Gantt row (node vs r1).
+        attempt = self.logs.get(node, {}).get("attempt", 0)
+        self._emit_event("killed", node=node, attempt=attempt, cause="scheduled-kill")
         self._downed.add((node, iid))
 
     def _launch_replacement(self, node: int) -> None:
@@ -576,7 +578,8 @@ class Supervisor:
                     continue
                 self._downed.add((node, iid))
                 if iid not in self._terminated_iids:
-                    self._emit_event("down", node=node, cause="reclaimed")
+                    attempt = self.logs.get(node, {}).get("attempt", 0)
+                    self._emit_event("down", node=node, attempt=attempt, cause="reclaimed")
             actions = decide(obs, self.policy)
             if any(isinstance(a, Done) for a in actions):
                 self._pull_logs()

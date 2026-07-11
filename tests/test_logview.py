@@ -416,29 +416,44 @@ _EVENTS = [
     _ev("training", 40, node=1, world=2, step=0, by="trainer"),
     _ev("killed", 152, node=1, by="orch", cause="scheduled-kill"),
     _ev("stalled", 150, node=0, world=2, step=60, by="trainer", cause="peer-stall"),
+    _ev("reconfiguring", 156, node=0, world=1, by="sidecar", cause="epoch 1->2"),
     _ev("epoch", 154, world=1, by="orch"),
     _ev("provisioning", 158, node=0, world=1, by="sidecar", cause="torchrun-exit:1"),
-    _ev("training", 176, node=0, world=1, step=60, by="trainer", cause="resumed"),
+    # resumes from step 50 — the 10 steps trained after the last checkpoint (up to
+    # the crash at step 60) are lost and re-done ("wasted").
+    _ev("training", 176, node=0, world=1, step=50, by="trainer", cause="resumed"),
     _ev("provisioning", 176, node=1, attempt=1, by="sidecar", cause="boot"),
     _ev("epoch", 200, world=2, by="orch"),
     _ev("training", 200, node=1, attempt=1, world=2, step=66, by="trainer"),
 ]
 
 
-def test_from_events_builds_authoritative_timeline():
+def test_from_events_rows_per_attempt_and_wasted():
     rec = TimelineRecorder.from_events(_EVENTS, now=238.0)
     assert rec.t0 == 0.0 and rec.full == 2
-    # node0: provisioning -> training -> STALLED (blocked on down peer) ->
-    # provisioning (re-rendezvous/restore) -> training. Source-stamped, not inferred.
-    assert [lbl for _t, lbl in rec.samples[0]] == ["prov", "train", "stalled", "prov", "train"]
-    # node1: boot/train, then killed (down), then the replacement boots+trains.
-    assert [lbl for _t, lbl in rec.samples[1]] == ["prov", "train", "down", "prov", "train"]
-    r0 = rec.runs(0, 238.0)
-    stalled = [(s, d) for s, d, lbl in r0 if lbl == "stalled"][0]
-    assert stalled == (150.0, 8.0)  # onset stamped at the last good step (t=150), not detection
-    # World staircase straight from epoch events: 2 -> 1 -> 2.
+    # Rows are keyed by (node, attempt): the killed original and its replacement
+    # are DISTINCT rows.
+    assert set(rec.samples) == {(0, 0), (1, 0), (1, 1)}
+    # node0 survives: train -> STALLED -> realized (reconfig) -> provisioning ->
+    # WASTED (re-doing rolled-back steps) -> training.
+    assert [lbl for _t, lbl in rec.samples[(0, 0)]] == [
+        "prov",
+        "train",
+        "stalled",
+        "reconfig",
+        "prov",
+        "wasted",
+        "train",
+    ]
+    assert rec.samples[(1, 0)][-1][1] == "down"  # original node1 killed
+    assert [lbl for _t, lbl in rec.samples[(1, 1)]] == ["prov", "train"]  # replacement
+    assert rec.wasted == {(0, 0): 10}  # exactly the 10 rolled-back steps
+    assert (152.0, (1, 0)) in rec.kills  # kill attaches to node1·r0
+    # stalled onset stamped at the last good step (t=150), not detection.
+    stalled = [(s, d) for s, d, lbl in rec.runs((0, 0), 238.0) if lbl == "stalled"][0]
+    assert stalled[0] == 150.0
+    # World staircase from epoch events (group-level): 2 -> 1 -> 2.
     assert rec.world_runs(238.0) == [(40.0, 114.0, 2), (154.0, 46.0, 1), (200.0, 38.0, 2)]
-    assert (152.0, 1) in rec.kills  # kill marker for node1
 
 
 def test_from_events_empty_falls_back():
@@ -447,43 +462,44 @@ def test_from_events_empty_falls_back():
     assert TimelineRecorder.from_events([{"ts": 1.0, "state": "noise"}], now=1.0).samples == {}
 
 
-def test_render_gantt_from_events_shows_stalled():
+def test_render_gantt_from_events_shows_stalled_and_wasted():
     rec = TimelineRecorder.from_events(_EVENTS, now=238.0)
-    frame = render_gantt(rec, now=238.0, size=(90, 14), meta={"run_id": "mn"})
-    assert " n0 │" in frame and " n1 │" in frame
-    assert "▚" in frame  # the stalled glyph appears on node0's row
-    assert "world 2/2" in frame and "degraded" in frame
+    frame = render_gantt(rec, now=238.0, size=(100, 16), meta={"run_id": "mn"})
+    assert "n1·r1" in frame  # the replacement has its own row
+    assert "▚" in frame  # stalled glyph on node0's row
+    assert "▨" in frame  # wasted glyph on node0's row
+    assert "◇" in frame  # reconfig (realized) glyph
+    assert "world 2/2" in frame and "wasted 10 steps" in frame
 
 
 def test_render_events_lists_stamped_transitions():
-    frame = render_events(_EVENTS, now=238.0, size=(90, 20), meta={"run_id": "mn"})
-    assert "13 transitions" in frame
+    frame = render_events(_EVENTS, now=238.0, size=(100, 22), meta={"run_id": "mn"})
+    assert "14 transitions" in frame
     assert "node0: training" in frame
     assert "node1: KILLED" in frame and "scheduled-kill" in frame
-    assert "STALLED" in frame
+    assert "node1·r1: provisioning" in frame  # replacement distinct in the log too
+    assert "STALLED" in frame and "REALIZED world changed" in frame
     assert "orch: epoch published" in frame
-    # relative offsets present (t+Ns), newest at the bottom
-    assert "t+" in frame
+    assert "t+" in frame  # relative offsets present
 
 
-def test_collect_events_from_tab_buffers():
+def test_collect_events_attributes_node_and_attempt():
     tabs = {
         (ORCH, 0): Tab(ORCH, 0, "u", "alive"),
         (0, 0): Tab(0, 0, "u", "alive"),
-        (1, 0): Tab(1, 0, "u", "dead"),
+        (1, 1): Tab(1, 1, "u", "alive"),  # a replacement's log
     }
     tabs[(ORCH, 0)].buf.extend(b'[event] {"ts": 154.0, "state": "epoch", "world": 1}\n')
-    # a node record MISSING its node field is attributed to the tab it came from
+    # records missing node/attempt are attributed to the tab they came from
     tabs[(0, 0)].buf.extend(b'step 5: loss 2.0\n[event] {"ts": 40.0, "state": "training"}\n')
-    tabs[(1, 0)].buf.extend(b'[event] {"ts": 152.0, "state": "down", "node": 1}\n')
+    tabs[(1, 1)].buf.extend(b'[event] {"ts": 176.0, "state": "training", "world": 2}\n')
     recs = collect_events(tabs)
-    by = {(r.get("node"), r["state"]) for r in recs}
-    assert (None, "epoch") in by  # orch epoch, no node
-    assert (0, "training") in by  # attributed to node 0 via default_node
-    assert (1, "down") in by
-    # And it drives from_events end to end.
+    by = {(r.get("node"), r.get("attempt"), r["state"]) for r in recs}
+    assert (None, None, "epoch") in by  # orch epoch, no node/attempt
+    assert (0, 0, "training") in by  # node 0, attempt 0 (the tab's)
+    assert (1, 1, "training") in by  # attributed to the replacement's row
     rec = TimelineRecorder.from_events(recs, now=200.0)
-    assert rec.full == 1 and rec.samples[0][0][1] == "train"
+    assert (1, 1) in rec.samples  # replacement is its own row
 
 
 def test_export_gantt_writes_png_and_events_txt(tmp_path):

@@ -343,15 +343,27 @@ def render_grid(tabs: list[Tab], size: tuple[int, int], meta: dict, now: float) 
 # actually observes per node, tick by tick, and draws it as a Gantt — the truth,
 # per node. It reflects what the viewer saw, so attach at run start for the full
 # history.
-# prov = booting/joining/restoring, train = productively training, stalled =
-# alive but blocked on a down peer (pre-NCCL-timeout hang), restart = the
-# inferred-fallback survivor re-rendezvous, down = dead/reclaimed/killed.
-_GANTT = {"prov": "░", "train": "▓", "stalled": "▚", "restart": "▒", "down": "·"}  # glyph per state
+# Gantt labels: prov = booting/restoring, reconfig = REALIZED the world changed
+# and tearing down the old collective (before provisioning), train = productively
+# training, wasted = re-doing steps rolled back to the last checkpoint (lost
+# work), stalled = blocked on a down peer, restart = inferred-fallback re-rdzv,
+# down = gone/reclaimed/killed.
+_GANTT = {
+    "prov": "░",
+    "reconfig": "◇",
+    "train": "▓",
+    "wasted": "▨",
+    "stalled": "▚",
+    "restart": "▒",
+    "down": "·",
+}
 _GANTT_COLORS = {  # for the PNG (order = legend order)
     "prov": "#4C78A8",
+    "reconfig": "#B279A2",
     "train": "#59A14F",
+    "wasted": "#F58518",
     "stalled": "#E45756",
-    "restart": "#F58518",
+    "restart": "#EDC948",
     "down": "#BAB0AC",
 }
 # A restart window with no observable checkpoint progress is capped here so a
@@ -359,9 +371,11 @@ _GANTT_COLORS = {  # for the PNG (order = legend order)
 _RESTART_CAP_S = 90.0
 
 # Event-sourced timeline: node lifecycle event `state` -> Gantt label. killed and
-# down are the same "gone" bar (distinguished by cause + the ✗ marker).
+# down are the same "gone" bar (distinguished by cause + the ✗ marker). "wasted"
+# is derived (a step rollback), not an emitted state.
 _EVENT_STATE_MAP = {
     "provisioning": "prov",
+    "reconfiguring": "reconfig",
     "training": "train",
     "stalled": "stalled",
     "down": "down",
@@ -370,6 +384,7 @@ _EVENT_STATE_MAP = {
 # One-line human descriptions for the events view.
 _EVENT_HUMAN = {
     "provisioning": "provisioning",
+    "reconfiguring": "REALIZED world changed (tearing down)",
     "training": "training",
     "stalled": "STALLED (blocked on down peer)",
     "down": "DOWN (reclaimed)",
@@ -404,10 +419,13 @@ class TimelineRecorder:
     epoch's member set. World size = |members|; the full world is the max seen."""
 
     t0: float | None = None
-    samples: dict[int, list[tuple[float, str]]] = field(default_factory=dict)
-    kills: list[tuple[float, int]] = field(default_factory=list)
+    # Rows are keyed by a "row id": an int node (inferred fallback) or a
+    # (node, attempt) tuple (event-sourced), so a replacement gets its own line.
+    samples: dict = field(default_factory=dict)
+    kills: list = field(default_factory=list)  # (ts, row_id)
     world: list[tuple[float, int]] = field(default_factory=list)  # (wall, world size)
     full: int = 0  # full world size (max |members| ever observed)
+    wasted: dict = field(default_factory=dict)  # row_id -> steps re-done after a rollback
     _last: dict[int, str] = field(default_factory=dict)
     _epoch: int | None = None
     _prev_members: set[int] = field(default_factory=set)
@@ -523,21 +541,91 @@ class TimelineRecorder:
         if not node_recs and not world_recs:
             return rec
         rec.t0 = min(r["ts"] for r in node_recs + world_recs)
+
+        # One row per (node, attempt): a killed original and its replacement are
+        # distinct boxes and get distinct lines.
+        by_row: dict[tuple[int, int], list[dict]] = {}
         for r in sorted(node_recs, key=lambda r: r["ts"]):
-            rec.samples.setdefault(r["node"], []).append((r["ts"], _EVENT_STATE_MAP[r["state"]]))
+            row = (r["node"], r.get("attempt", 0))
+            by_row.setdefault(row, []).append(r)
+            rec.samples.setdefault(row, []).append((r["ts"], _EVENT_STATE_MAP[r["state"]]))
             if r["state"] in ("killed", "down"):
-                rec.kills.append((r["ts"], r["node"]))
+                rec.kills.append((r["ts"], row))
+
         rec.world = sorted((r["ts"], int(r["world"])) for r in world_recs)
         rec.full = max((w for _t, w in rec.world), default=0)
+        rec._overlay_wasted(by_row)
         return rec
+
+    def _overlay_wasted(self, by_row: dict[tuple[int, int], list[dict]]) -> None:
+        """Lost work: when a survivor's torchrun crashes and it restores from the
+        last checkpoint, the steps trained since that checkpoint are thrown away
+        and re-done. Detect the step ROLLBACK (a training event whose step < the
+        peak reached before the crash) and paint the re-compute window a distinct
+        "wasted" — sized in wall-time by the pre-crash step rate, labelled with the
+        exact lost step count."""
+        for row, rs in by_row.items():
+            seg_start: tuple[float, int] | None = None  # (ts, step) of current train run
+            peak: int | None = None  # max step reached in it
+            peak_ts = 0.0
+            for r in rs:
+                st, step = r["state"], r.get("step")
+                if st == "training":
+                    rolled_back = (
+                        peak is not None
+                        and step is not None
+                        and step < peak
+                        and seg_start is not None
+                        and seg_start[1] is not None
+                    )
+                    if rolled_back:
+                        lost = peak - step
+                        run_steps = peak - seg_start[1]
+                        run_secs = peak_ts - seg_start[0]
+                        rate = run_steps / run_secs if run_secs > 0 else 0
+                        secs = lost / rate if rate > 0 else 0
+                        if lost > 0 and secs > 0:
+                            self._paint_wasted(row, r["ts"], r["ts"] + secs)
+                            self.wasted[row] = self.wasted.get(row, 0) + lost
+                    seg_start, peak, peak_ts = (r["ts"], step), step, r["ts"]
+                elif st == "stalled" and step is not None:
+                    peak = step if peak is None else max(peak, step)
+                    peak_ts = r["ts"]
+
+    def _paint_wasted(self, row: tuple[int, int], ws: float, we: float) -> None:
+        """Relabel the leading [ws, we) of the post-resume training run as
+        "wasted" (the re-compute), clamped to the next real transition."""
+        samples = self.samples[row]
+        for i, (ts, _lbl) in enumerate(samples):
+            if ts == ws:
+                nxt = samples[i + 1][0] if i + 1 < len(samples) else float("inf")
+                we = min(we, nxt)
+                samples[i] = (ws, "wasted")
+                if ws < we < nxt:  # re-open training after the re-compute window
+                    samples.insert(i + 1, (we, "train"))
+                return
+
+
+def _row_parts(row) -> tuple[int, int]:
+    """A row id -> (node, attempt), accepting either an int node (inferred
+    fallback) or a (node, attempt) tuple (event-sourced)."""
+    return row if isinstance(row, tuple) else (row, 0)
+
+
+def _row_label(row) -> str:
+    node, attempt = _row_parts(row)
+    if node == ORCH:
+        return "orch"
+    return f"n{node}" if not attempt else f"n{node}·r{attempt}"
 
 
 def render_gantt(
     rec: TimelineRecorder, now: float, size: tuple[int, int], meta: dict, note: str = ""
 ) -> str:
-    """One frame of the per-node Gantt. Pure — drives the snapshot tests."""
+    """One frame of the per-(node, attempt) Gantt. Pure — drives the snapshots."""
     cols, rows = max(40, size[0]), max(8, size[1])
-    labelw = 4
+    rowkeys = sorted(rec.samples, key=_row_parts)
+    labelw = max(4, *(len(_row_label(r)) for r in rowkeys)) if rowkeys else 4
     inner = cols - labelw - 1
     t0 = rec.t0 if rec.t0 is not None else now
     span = max(1.0, now - t0)
@@ -557,18 +645,18 @@ def render_gantt(
         return (samples[k][1] if samples else None), k
 
     body: list[str] = []
-    for node in sorted(rec.samples):
-        s = rec.samples[node]
+    for row in rowkeys:
+        s = rec.samples[row]
         chars, k = [], 0
         for x in range(inner):
             lbl, k = _at(s, t0 + (x + 0.5) * span / inner, k)
             chars.append(_GANTT.get(lbl, " "))
         for kw, kn in rec.kills:
-            if kn == node:
+            if kn == row:
                 xi = int((kw - t0) / span * inner)
                 if 0 <= xi < inner:
                     chars[xi] = "✗"
-        body.append(f"n{node}".center(labelw) + "│" + "".join(chars))
+        body.append(_row_label(row).center(labelw) + "│" + "".join(chars))
 
     # World-size strip: the N -> N-1 -> N staircase as a sparkline under the rows.
     blocks = " ▁▂▃▄▅▆▇█"
@@ -582,16 +670,16 @@ def render_gantt(
     ws_row = "ws".center(labelw) + "│" + "".join(ws_chars)
 
     deg = rec.degraded(now)
-    longest = int(max((d for _s, d, _w in deg["windows"]), default=0))
     n_dips = len(deg["windows"])
+    lost = sum(rec.wasted.values())
     summary = (
         f" world {deg['current']}/{deg['full']}   "
         f"degraded {int(deg['total'])}s ({n_dips} dip{'' if n_dips == 1 else 's'})   "
-        f"longest recovery {longest}s"
+        f"wasted {lost} steps"
     )[:cols]
 
     rule = "─" * labelw + "┴" + "─" * inner
-    legend = " ░ provision   ▓ training   ▚ stalled   · down   ✗ killed/gone"[:cols]
+    legend = " ░prov ◇reconfig ▓train ▨wasted ▚stalled ·down ✗gone"[:cols]
     footer = (note or "[e] export   [v] events   [t] tabs   [g] grid   [q] quit")[:cols]
     head = [title, axis]
     foot = [rule, ws_row, summary, legend, footer]
@@ -606,15 +694,22 @@ def collect_events(tabs: dict[tuple[int, int], Tab]) -> list[dict]:
     log carries epoch / killed / down. Idempotent: each line lives in exactly one
     buffer, so re-parsing the growing buffers never duplicates."""
     recs: list[dict] = []
-    for (node, _a), tab in tabs.items():
+    for (node, attempt), tab in tabs.items():
         text = tab.buf.decode("utf-8", errors="replace")
-        recs += events.parse(text, default_node=None if node == ORCH else node)
+        if node == ORCH:  # orch events carry their own node + attempt
+            recs += events.parse(text, default_node=None)
+        else:  # a box's log => its (node, attempt); replacements land on their row
+            recs += events.parse(text, default_node=node, default_attempt=attempt)
     return recs
 
 
 def _event_line(r: dict, t0: float, cols: int) -> str:
     ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
-    who = "orch" if r.get("node") is None else f"node{r['node']}"
+    if r.get("node") is None:
+        who = "orch"
+    else:
+        a = r.get("attempt") or 0
+        who = f"node{r['node']}" + (f"·r{a}" if a else "")
     base = _EVENT_HUMAN.get(r["state"], r["state"])
     extra = []
     if r.get("world") is not None:
@@ -666,45 +761,45 @@ def export_gantt(
     import matplotlib.pyplot as plt
 
     t0 = rec.t0 if rec.t0 is not None else now
-    nodes = sorted(rec.samples)
+    rowkeys = sorted(rec.samples, key=_row_parts)
     deg = rec.degraded(now)
-    # Two stacked panels sharing the time axis: the per-node Gantt on top, the
-    # world-size (membership) staircase below.
+    # Two stacked panels sharing the time axis: the per-(node,attempt) Gantt on
+    # top, the world-size (membership) staircase below.
     fig, (ax, wax) = plt.subplots(
         2,
         1,
-        figsize=(12, 1.6 + 0.7 * max(1, len(nodes))),
-        gridspec_kw={"height_ratios": [max(1, len(nodes)), 1.1], "hspace": 0.32},
+        figsize=(12, 1.6 + 0.7 * max(1, len(rowkeys))),
+        gridspec_kw={"height_ratios": [max(1, len(rowkeys)), 1.1], "hspace": 0.32},
         sharex=True,
     )
-    for i, node in enumerate(nodes):
-        runs = rec.runs(node, now)
+    for i, row in enumerate(rowkeys):
+        runs = rec.runs(row, now)
         ax.broken_barh(
             [(s, d) for s, d, _lbl in runs],
             (i * 10 + 2, 6),
             facecolors=[_GANTT_COLORS.get(lbl, "#ccc") for _s, _d, lbl in runs],
         )
-        for s, d, _lbl in runs:  # segment-length labels (PNG only)
+        for s, d, lbl in runs:  # segment-length labels (PNG only)
             if d >= 0.04 * max(1.0, now - t0):  # skip slivers too thin for text
+                cap = f"{int(d)}s"
+                if lbl == "wasted" and rec.wasted.get(row):
+                    cap = f"{rec.wasted[row]} steps lost"  # exact rolled-back count
                 ax.text(
-                    s + d / 2,
-                    i * 10 + 5,
-                    f"{int(d)}s",
-                    ha="center",
-                    va="center",
-                    fontsize=8,
-                    color="white",
+                    s + d / 2, i * 10 + 5, cap, ha="center", va="center", fontsize=8, color="white"
                 )
         for kw, kn in rec.kills:
-            if kn == node:
+            if kn == row:
                 ax.plot(kw - t0, i * 10 + 5, marker="x", color="#E45756", ms=11, mew=3)
-    ax.set_yticks([i * 10 + 5 for i in range(len(nodes))])
-    ax.set_yticklabels([f"node{n}" for n in nodes])
-    ax.set_ylim(0, max(1, len(nodes)) * 10)
+    ax.set_yticks([i * 10 + 5 for i in range(len(rowkeys))])
+    ax.set_yticklabels([_row_label(r).replace("n", "node", 1) for r in rowkeys])
+    ax.set_ylim(0, max(1, len(rowkeys)) * 10)
     ax.set_title(f"Run timeline — {run_id}")
+    _used = {lbl for r in rowkeys for _s, _d, lbl in rec.runs(r, now)}
     ax.legend(
-        handles=[mpatches.Patch(color=c, label=lbl) for lbl, c in _GANTT_COLORS.items()]
-        + [mpatches.Patch(color="#E45756", label="killed")],
+        handles=[
+            mpatches.Patch(color=c, label=lbl) for lbl, c in _GANTT_COLORS.items() if lbl in _used
+        ]
+        + [mpatches.Patch(color="#E45756", label="killed/gone")],
         loc="upper right",
         fontsize=8,
     )
