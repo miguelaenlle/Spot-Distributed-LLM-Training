@@ -15,8 +15,10 @@ before terminating. Instances are always terminated in a ``finally`` block.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
+import os
 import sys
 import time
 
@@ -479,7 +481,8 @@ def _run_supervised(
     replace_on_loss: bool,
     kill_schedule: list[tuple[float, int]],
     verdict: bool = False,
-) -> dict | None:
+    return_profile: bool = False,
+):
     """Shared driver for every multi-node experiment: launch N boxes, hand
     membership to the epoch :class:`~orchestrator.supervisor.Supervisor`, and let
     it drive to metrics.json. ``multinode`` passes no kills; ``multinode-shrink``
@@ -529,7 +532,7 @@ def _run_supervised(
                     aws.wait_quota_released(node_ids[victim])
                     node_ids[victim] = launch_node(victim)
             print(f"[{kind}] dry-run: skipping supervision", file=sys.stderr)
-            return None
+            return (profile, None) if return_profile else None
 
         policy = Policy(
             replace_on_loss=replace_on_loss,
@@ -559,7 +562,7 @@ def _run_supervised(
         print(f"[{kind}] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
         if metrics is not None:
             print(f"\n[{kind}] metrics: {json.dumps(metrics, indent=2)}")
-        return metrics
+        return (profile, metrics) if return_profile else metrics
     finally:
         for iid in node_ids.values():
             aws.terminate(iid)
@@ -614,6 +617,258 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
         replace_on_loss=True,
         kill_schedule=schedule,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Overfit scaling experiment: does adding nodes reduce time-to-overfit?
+# --------------------------------------------------------------------------- #
+def _analyze_overfit(profile: RunProfile) -> dict:
+    """Find the overfit point rigorously — the step of MINIMUM validation loss
+    (overfitting = val loss bottoms out then rises while train loss keeps
+    falling), and the wall-clock time to reach it FROM the first training step
+    (so the ~constant boot is excluded, but preemption downtime/re-compute is
+    included). ``reached`` is False if the run didn't clearly turn up (a real
+    interior minimum) — then the comparison is inconclusive, not a bogus argmin
+    at the last step."""
+    vals = sorted(profile.val_samples, key=lambda v: v.step)
+    steps = sorted(profile.samples, key=lambda s: s.t_rel)
+    if len(vals) < 3 or not steps:
+        return {"reached": False, "why": "too few eval / step samples"}
+    best = min(vals, key=lambda v: v.loss)
+    last = vals[-1]
+    reached = best.step < last.step and last.loss > best.loss + 1e-3  # a rise after the min
+
+    first_train = steps[0].t_rel  # wall of the first training step (seconds since launch)
+    overfit_wall = next((s.t_rel for s in steps if s.step >= best.step), steps[-1].t_rel)
+    return {
+        "reached": reached,
+        "overfit_step": best.step,
+        "best_val": round(best.loss, 4),
+        "final_val": round(last.loss, 4),
+        "last_step": last.step,
+        "steps_to_overfit": best.step,  # ~equal across node counts validates the control
+        "time_to_overfit_s": round(overfit_wall - first_train, 1),
+        "total_train_s": round(steps[-1].t_rel - first_train, 1),
+    }
+
+
+def _fetch_run_events(cfg: OrchestratorConfig, run_id: str) -> list[dict]:
+    """All ``[event]`` records for a finished run, parsed from its S3 logs."""
+    from . import logview
+
+    prefix = cfg.run_logs_prefix(run_id)
+    items = []
+    for key in aws.list_keys(cfg.bucket, prefix):
+        name = key.rsplit("/", 1)[-1]
+        with contextlib.suppress(Exception):
+            items.append((name, aws.get_text(cfg.bucket, key)))
+    return logview.parse_run_events(items)
+
+
+def _render_run_timeline(cfg: OrchestratorConfig, run_id: str, out_dir: str) -> dict:
+    """Export the event-sourced Gantt PNG + events.txt for a finished run."""
+    from .logview import TimelineRecorder, export_gantt
+
+    records = _fetch_run_events(cfg, run_id)
+    if not records:
+        return {"png": None, "events": None}
+    now = max(r["ts"] for r in records)
+    rec = TimelineRecorder.from_events(records, now)
+    where = export_gantt(rec, run_id, now, out_dir=out_dir, local_only=True, records=records)
+    return {"png": where[0], "events": where[1] if len(where) > 1 else None}
+
+
+def _val_curve_png(profile: RunProfile, analysis: dict, path: str) -> str | None:
+    """Val-loss (and train-loss) vs step with the overfit point marked — makes
+    the 'done' call auditable."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    vals = sorted(profile.val_samples, key=lambda v: v.step)
+    if not vals:
+        return None
+    fig, ax = plt.subplots(figsize=(8, 4))
+    tr = sorted(profile.samples, key=lambda s: s.step)
+    if tr:
+        ax.plot([s.step for s in tr], [s.loss for s in tr], color="#BAB0AC", lw=1, label="train")
+    ax.plot([v.step for v in vals], [v.loss for v in vals], color="#4C78A8", lw=2, label="val")
+    if analysis.get("overfit_step") is not None:
+        ax.axvline(analysis["overfit_step"], ls="--", color="#E45756", lw=1)
+        ax.plot(
+            [analysis["overfit_step"]],
+            [analysis["best_val"]],
+            marker="*",
+            color="#F2C800",
+            ms=16,
+            mec="#7a6000",
+            label=f"overfit (val {analysis['best_val']})",
+        )
+    ax.set_xlabel("step")
+    ax.set_ylabel("loss")
+    ax.set_title(f"{profile.run_id} — val-loss overfit point")
+    ax.legend(fontsize=8)
+    fig.savefig(path, bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    return os.path.abspath(path)
+
+
+def _write_overfit_report(path: str, results: list[dict], recipe: dict) -> None:
+    """The human summary: recipe, per-run table, and the H1/H2 verdicts."""
+
+    def t(label: str) -> float | None:
+        r = next((x for x in results if x["label"] == label), None)
+        return (
+            r["analysis"].get("time_to_overfit_s") if r and r["analysis"].get("reached") else None
+        )
+
+    def verdict(name: str, faster: str, slower: str, claim: str) -> str:
+        a, b = t(faster), t(slower)
+        if a is None or b is None:
+            return (
+                f"{name}: INCONCLUSIVE — a run did not clearly overfit ({faster}={a}, {slower}={b})"
+            )
+        ok = a < b
+        ratio = b / a if a else float("inf")
+        return (
+            f"{name}: {'TRUE' if ok else 'FALSE'} — {claim}\n"
+            f"     {faster} = {a}s   vs   {slower} = {b}s   ({ratio:.2f}x "
+            f"{'speedup' if ok else 'SLOWER'})"
+        )
+
+    lines = [
+        f"Overfit scaling experiment — {recipe['stamp']}",
+        "=" * 72,
+        "",
+        "Hypotheses (time-to-overfit = wall-clock from first training step to the",
+        "step of MINIMUM validation loss; overfit = val loss bottoms out then rises):",
+        "  H1: time_to_overfit(4 nodes) < time_to_overfit(2 nodes), no preemptions",
+        "  H2: same, WITH preemptions",
+        "",
+        "Controls: identical model/data/seed, CONSTANT global batch "
+        f"(GLOBAL_BATCH_SIZE={recipe['global_batch']}) so 2- and 4-node follow the",
+        "same trajectory vs step -> the comparison isolates throughput. Sequential",
+        f"runs on {recipe['market']}. MAX_STEPS={recipe['max_steps']}, "
+        f"EVAL_INTERVAL_STEPS={recipe['eval_interval']}, DROPOUT={recipe['dropout']}.",
+        f"Preemptions: 2 worker kills at t+{recipe['offsets']}s after train start.",
+        "",
+        "VERDICTS",
+        "-" * 72,
+        verdict("H1 (clean)", "4n-clean", "2n-clean", "more nodes overfit faster"),
+        "",
+        verdict("H2 (preempt)", "4n-preempt", "2n-preempt", "more nodes win despite preemption"),
+        "",
+        "PER-RUN",
+        "-" * 72,
+    ]
+    for r in results:
+        a = r["analysis"]
+        if a.get("reached"):
+            detail = (
+                f"  step {a['overfit_step']}  best_val {a['best_val']}  "
+                f"time_to_overfit {a['time_to_overfit_s']}s  "
+                f"(total train {a['total_train_s']}s)"
+            )
+        else:
+            detail = f"  ({a.get('why', 'val did not turn up — raise MAX_STEPS')})"
+        lines += [
+            f"[{r['label']}]  run_id={r['run_id']}  nodes={r['nodes']}  preempt={r['preempt']}",
+            f"    overfit: {'YES' if a.get('reached') else 'NOT REACHED'}{detail}",
+            f"    cost: ${r['cost']}    wandb: {r['wandb'] or '(disabled)'}",
+            f"    gantt: {r['png']}    events: {r['events']}    valcurve: {r['valcurve']}",
+            "",
+        ]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def run_overfit_experiment(cfg: OrchestratorConfig) -> list[dict]:
+    """ONE command: 2- vs 4-node time-to-overfit, clean and preempted, on spot.
+    Runs the four configs sequentially, determines each run's overfit point from
+    its validation-loss curve, and compiles reports/overfit-experiment-<ts>/ with
+    per-run Gantt + events + val-curve and the H1/H2 verdicts."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    # --- fixed recipe (env-overridable) — constant global batch is the control ---
+    recipe = {
+        "max_steps": os.environ.setdefault("MAX_STEPS", "5000"),
+        "global_batch": os.environ.setdefault("GLOBAL_BATCH_SIZE", "64"),
+        "eval_interval": os.environ.setdefault("EVAL_INTERVAL_STEPS", "100"),
+        "dropout": os.environ.setdefault("DROPOUT", "0.0"),  # overfit clearly: measure the point
+        "market": "spot",
+        "stamp": stamp,
+    }
+    for k, v in {
+        "LEARNING_RATE": "1e-3",
+        "LR_DECAY_STEPS": "5000",
+        "MIN_LR": "1e-4",
+        "WARMUP_STEPS": "100",
+        "GRAD_CLIP": "1.0",
+        "SAMPLE_INTERVAL_STEPS": "0",
+    }.items():
+        os.environ.setdefault(k, v)
+    os.environ.setdefault("WANDB_GROUP", f"overfit-experiment-{stamp}")
+    cfg.spot_market = "spot"
+    cfg.batch_size = int(os.environ.get("BATCH_SIZE", "16"))  # per-rank micro; global stays 64
+    budget = int(os.environ.get("OVERFIT_BUDGET", "3600"))  # generous: MAX_STEPS is the stop
+    offsets = [float(x) for x in os.environ.get("PREEMPT_OFFSETS", "60,150").split(",")]
+    recipe["offsets"] = ",".join(str(int(o)) for o in offsets)
+
+    out_dir = os.path.abspath(f"reports/overfit-experiment-{stamp}")
+    os.makedirs(f"{out_dir}/runs", exist_ok=True)
+    print(
+        "\n\033[1m⚠️  BILLABLE: this launches four SEQUENTIAL spot runs "
+        "(2x2-node + 2x4-node). Peak 16 vCPUs.\033[0m\n"
+        f"[overfit-experiment] recipe: {recipe}\n[overfit-experiment] report dir: {out_dir}",
+        file=sys.stderr,
+    )
+
+    plan = [
+        ("2n-clean", 2, []),
+        ("4n-clean", 4, []),
+        ("2n-preempt", 2, [(offsets[0], 1), (offsets[1], 1)]),  # kill worker node1 twice
+        ("4n-preempt", 4, [(offsets[0], 3), (offsets[1], 3)]),  # kill worker node3 twice
+    ]
+    results: list[dict] = []
+    for label, nodes, kills in plan:
+        cfg.node_count = nodes
+        print(
+            f"\n[overfit-experiment] === {label} (nodes={nodes}, kills={kills}) ===",
+            file=sys.stderr,
+        )
+        profile, _metrics = _run_supervised(
+            cfg,
+            kind="multinode-preempt" if kills else "multinode",
+            budget=budget,
+            replace_on_loss=bool(kills),
+            kill_schedule=kills,
+            return_profile=True,
+        )
+        analysis = _analyze_overfit(profile)
+        art = _render_run_timeline(cfg, profile.run_id, f"{out_dir}/runs")
+        valcurve = _val_curve_png(
+            profile, analysis, f"{out_dir}/runs/{profile.run_id}-valcurve.png"
+        )
+        results.append(
+            {
+                "label": label,
+                "nodes": nodes,
+                "preempt": bool(kills),
+                "run_id": profile.run_id,
+                "analysis": analysis,
+                "cost": round(profile.cost_now(), 4),
+                "wandb": getattr(profile._wb, "url", None) if profile._wb else None,
+                "png": art["png"],
+                "events": art["events"],
+                "valcurve": valcurve,
+            }
+        )
+
+    _write_overfit_report(f"{out_dir}/summary.txt", results, recipe)
+    print(f"\n\033[1m[overfit-experiment] DONE → {out_dir}/summary.txt\033[0m", file=sys.stderr)
+    with open(f"{out_dir}/summary.txt") as f:
+        print(f.read())
+    return results
 
 
 def _shrink_verdict(cfg, run_id, profile, sup, metrics) -> None:

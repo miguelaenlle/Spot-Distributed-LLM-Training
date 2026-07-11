@@ -730,6 +730,26 @@ def render_gantt(
     return "\n".join([*head, *body, *foot])
 
 
+def parse_run_events(items: list[tuple[str, str]]) -> list[dict]:
+    """Parse ``[event]`` records from a run's raw logs — ``(filename, text)`` per
+    log object (as fetched straight from S3, no Tab objects). node/attempt are
+    attributed from the filename (``boot-node1-r2.log`` -> node 1, attempt 2);
+    ``orchestrator.log`` carries its node in the record. For post-run reporting
+    (the Gantt / events.txt export) without attaching the live viewer."""
+    recs: list[dict] = []
+    for name, text in items:
+        if name == "orchestrator.log":
+            recs += events.parse(text, default_node=None)
+            continue
+        m = _LOG_NAME.match(name)
+        if not m:
+            continue
+        recs += events.parse(
+            text, default_node=int(m.group(1) or 0), default_attempt=int(m.group(2) or 0)
+        )
+    return recs
+
+
 def collect_events(tabs: dict[tuple[int, int], Tab]) -> list[dict]:
     """Parse every ``[event]`` record out of all tab buffers. Node logs carry
     node-lifecycle events (default-attributed to the tab's node); the orchestrator

@@ -52,6 +52,7 @@ def main() -> None:
         "multinode",
         "multinode-shrink",
         "multinode-preempt",
+        "overfit-experiment",
     ):
         sub.add_parser(name, parents=[common])
     res_parser = sub.add_parser("resume", parents=[common])
@@ -272,6 +273,8 @@ def main() -> None:
         experiments.run_multinode_shrink(cfg)
     elif args.command == "multinode-preempt":
         experiments.run_multinode_preempt(cfg)
+    elif args.command == "overfit-experiment":
+        experiments.run_overfit_experiment(cfg)
     elif args.command == "resume":
         experiments.run_resume(cfg, args.run_id, budget=args.budget, market=args.market)
     elif args.command == "compare":
