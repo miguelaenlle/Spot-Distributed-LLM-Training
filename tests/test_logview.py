@@ -463,6 +463,39 @@ def test_from_events_empty_falls_back():
     assert TimelineRecorder.from_events([{"ts": 1.0, "state": "noise"}], now=1.0).samples == {}
 
 
+# Leadership (rank-0) handovers carried on the epoch events.
+_LEADER_EVENTS = [
+    _ev("provisioning", 0, node=0, by="sidecar"),
+    _ev("provisioning", 0, node=1, by="sidecar"),
+    _ev("epoch", 10, world=2, leader=0, by="orch"),  # node0 is rank-0 leader
+    _ev("training", 10, node=0, world=2, step=0, by="trainer"),
+    _ev("training", 10, node=1, world=2, step=0, by="trainer"),
+    _ev("killed", 100, node=0, by="orch", cause="scheduled-kill"),  # the master dies
+    _ev("epoch", 105, world=1, leader=1, by="orch"),  # node1 takes over
+    _ev("training", 110, node=1, world=1, step=30, by="trainer"),
+    _ev("provisioning", 130, node=0, attempt=1, by="sidecar"),  # replacement
+    _ev("epoch", 150, world=2, leader=1, by="orch"),  # grow back — leader STAYS node1
+    _ev("training", 155, node=1, world=2, step=40, by="trainer"),
+    _ev("training", 155, node=0, attempt=1, world=2, step=40, by="trainer"),
+]
+
+
+def test_from_events_leader_handovers_and_current():
+    rec = TimelineRecorder.from_events(_LEADER_EVENTS, now=180.0)
+    # Deduped to the moments leadership actually moves; sticky across the grow.
+    assert rec.leaders == [(10.0, 0), (105.0, 1)]
+    assert rec.current_leader(now=50.0) == 0  # before the handover
+    assert rec.current_leader(now=180.0) == 1  # after node0 died, node1 leads
+    assert rec.leader_row(1, 105.0) == (1, 0)  # marker lands on node1's live box
+
+
+def test_render_gantt_shows_leader():
+    rec = TimelineRecorder.from_events(_LEADER_EVENTS, now=180.0)
+    frame = render_gantt(rec, now=180.0, size=(90, 14), meta={"run_id": "mn"})
+    assert "★" in frame  # the became-leader marker on a row
+    assert "leader node1" in frame  # current leader called out in the summary
+
+
 def test_render_gantt_from_events_shows_stalled_and_wasted():
     rec = TimelineRecorder.from_events(_EVENTS, now=238.0)
     frame = render_gantt(rec, now=238.0, size=(100, 16), meta={"run_id": "mn"})

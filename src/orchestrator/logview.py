@@ -423,6 +423,7 @@ class TimelineRecorder:
     samples: dict = field(default_factory=dict)
     kills: list = field(default_factory=list)  # (ts, row_id): a box went down/killed
     realized: list = field(default_factory=list)  # (ts, row_id): node saw the world change
+    leaders: list = field(default_factory=list)  # (ts, node): node became rank-0 leader
     world: list[tuple[float, int]] = field(default_factory=list)  # (wall, world size)
     full: int = 0  # full world size (max |members| ever observed)
     wasted: dict = field(default_factory=dict)  # row_id -> steps re-done after a rollback
@@ -560,8 +561,31 @@ class TimelineRecorder:
 
         rec.world = sorted((r["ts"], int(r["world"])) for r in world_recs)
         rec.full = max((w for _t, w in rec.world), default=0)
+        # Leadership (rank-0) handovers from the epoch events, deduped to the
+        # moments the leader actually changes.
+        prev_leader = None
+        for r in sorted(world_recs, key=lambda r: r["ts"]):
+            ldr = r.get("leader")
+            if ldr is not None and ldr != prev_leader:
+                rec.leaders.append((r["ts"], int(ldr)))
+                prev_leader = ldr
         rec._overlay_wasted(by_row)
         return rec
+
+    def leader_row(self, node: int, ts: float) -> tuple[int, int]:
+        """The (node, attempt) row that was the live box for ``node`` at ``ts`` —
+        the highest attempt started by then — so a leadership marker lands on the
+        right line even after that node was itself replaced."""
+        started = [a for (n, a), s in self.samples.items() if n == node and s and s[0][0] <= ts]
+        if started:
+            return (node, max(started))
+        attempts = sorted(a for (n, a) in self.samples if n == node)
+        return (node, attempts[0]) if attempts else (node, 0)
+
+    def current_leader(self, now: float) -> int | None:
+        """The node holding rank 0 at ``now`` (the last handover at or before it)."""
+        seen = [n for ts, n in self.leaders if ts <= now]
+        return seen[-1] if seen else None
 
     def _overlay_wasted(self, by_row: dict[tuple[int, int], list[dict]]) -> None:
         """Lost work: when a survivor's torchrun crashes and it restores from the
@@ -662,6 +686,11 @@ def render_gantt(
                 xi = int((rw - t0) / span * inner)
                 if 0 <= xi < inner:
                     chars[xi] = "◆"
+        for lw, ln in rec.leaders:  # "★" = this node became rank-0 leader here
+            if rec.leader_row(ln, lw) == row:
+                xi = int((lw - t0) / span * inner)
+                if 0 <= xi < inner:
+                    chars[xi] = "★"
         for kw, kn in rec.kills:  # "✗" drawn last so a kill is never hidden
             if kn == row:
                 xi = int((kw - t0) / span * inner)
@@ -683,14 +712,16 @@ def render_gantt(
     deg = rec.degraded(now)
     n_dips = len(deg["windows"])
     lost = sum(rec.wasted.values())
+    leader = rec.current_leader(now)
+    ldr_txt = f"   leader node{leader}" if leader is not None else ""
     summary = (
         f" world {deg['current']}/{deg['full']}   "
         f"degraded {int(deg['total'])}s ({n_dips} dip{'' if n_dips == 1 else 's'})   "
-        f"wasted {lost} steps"
+        f"wasted {lost} steps{ldr_txt}"
     )[:cols]
 
     rule = "─" * labelw + "┴" + "─" * inner
-    legend = " ░prov ▓train ▨wasted ▚stalled ·down ✗gone ◆realized-world-change"[:cols]
+    legend = " ░prov ▓train ▨wasted ▚stalled ·down ✗gone ◆realized ★leader"[:cols]
     footer = (note or "[e] export   [v] events   [t] tabs   [g] grid   [q] quit")[:cols]
     head = [title, axis]
     foot = [rule, ws_row, summary, legend, footer]
@@ -802,6 +833,11 @@ def export_gantt(
         for rw, rn in rec.realized:  # realized the world changed — a point in time
             if rn == row:
                 ax.plot(rw - t0, i * 10 + 5, marker="D", color="#B279A2", ms=8, mec="white", mew=1)
+        for lw, ln in rec.leaders:  # became rank-0 leader
+            if rec.leader_row(ln, lw) == row:
+                ax.plot(
+                    lw - t0, i * 10 + 5, marker="*", color="#F2C800", ms=16, mec="#7a6000", mew=0.8
+                )
         for kw, kn in rec.kills:
             if kn == row:
                 ax.plot(kw - t0, i * 10 + 5, marker="x", color="#E45756", ms=11, mew=3)
@@ -824,6 +860,19 @@ def export_gantt(
                 ms=7,
                 mec="white",
                 label="realized world change",
+            )
+        )
+    if rec.leaders:
+        marks.append(
+            Line2D(
+                [],
+                [],
+                marker="*",
+                color="#F2C800",
+                ls="",
+                ms=12,
+                mec="#7a6000",
+                label="became leader (rank 0)",
             )
         )
     ax.legend(

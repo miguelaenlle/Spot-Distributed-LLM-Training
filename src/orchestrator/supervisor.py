@@ -499,9 +499,9 @@ class Supervisor:
             f"published epoch {epoch}: members {sorted(members)} master=node{master} "
             f"({doc['master_addr']}:{doc['master_port']})"
         )
-        # World-size sample for the timeline (the N -> N-1 -> N staircase),
-        # authoritative from the membership decision, not inferred by polling.
-        self._emit_event("epoch", epoch=epoch, world=len(members))
+        # World-size sample for the timeline (the N -> N-1 -> N staircase) +
+        # who's rank-0 leader this epoch — authoritative from the decision.
+        self._emit_event("epoch", epoch=epoch, world=len(members), leader=master)
         if shrinking:
             # The kill mark + baselines were captured in _terminate; a grow resets
             # the shrink markers so the next kill re-arms them.

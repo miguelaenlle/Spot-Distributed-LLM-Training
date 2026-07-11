@@ -33,7 +33,7 @@ import time
 PREFIX = "[event] "
 STATES = ("provisioning", "reconfiguring", "training", "stalled", "down", "killed")
 # Field order kept stable for readable log lines; ts/state/by always present.
-_FIELDS = ("ts", "node", "attempt", "state", "epoch", "world", "step", "cause", "by")
+_FIELDS = ("ts", "node", "attempt", "state", "epoch", "world", "leader", "step", "cause", "by")
 
 
 def emit(
@@ -44,6 +44,7 @@ def emit(
     attempt: int | None = None,
     epoch: int | None = None,
     world: int | None = None,
+    leader: int | None = None,
     step: int | None = None,
     cause: str | None = None,
     ts: float | None = None,
@@ -59,6 +60,7 @@ def emit(
         "state": state,
         "epoch": epoch,
         "world": world,
+        "leader": leader,
         "step": step,
         "cause": cause,
         "by": by,
