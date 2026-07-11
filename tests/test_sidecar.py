@@ -110,6 +110,29 @@ def test_launch_emits_provisioning_and_exports_node_env(tmp_path, monkeypatch, c
     assert launching and launching[0]["node"] == 0 and launching[0]["world"] == 2
 
 
+def test_reconfiguring_fires_after_crash_then_new_epoch(tmp_path, monkeypatch, capsys):
+    # Regression: a peer's death crashes our torchrun BEFORE the shrunk epoch is
+    # published, so running_epoch resets to -1. "realized world changed" must
+    # still fire when the new epoch arrives (it's gated on member_epoch, which
+    # persists across the crash) — otherwise the reconfiguring event never shows.
+    run_uri = str(tmp_path)
+    h = Harness(monkeypatch)
+    monkeypatch.setattr(sidecar, "POLL_SECONDS", 0.02)
+    _write_epoch(run_uri, 1, [0, 1])
+    t, result = _run_in_thread(run_uri, 0, h.launch)
+    t.start()
+    _spin(lambda: len(h.launches) == 1)  # launched epoch 1
+    h.live.stop(rc=1)  # torchrun crashes on the peer's NCCL abort (epoch unchanged)
+    _write_epoch(run_uri, 2, [0])  # supervisor publishes the shrink after the crash
+    _spin(lambda: any(p.epoch == 2 for p in h.launches))  # relaunched at world 1
+    s3_store.put_bytes(b"{}", sidecar._join(run_uri, "metrics.json"))
+    t.join(timeout=3)
+
+    reconfig = [r for r in events.parse(capsys.readouterr().err) if r["state"] == "reconfiguring"]
+    assert reconfig, "expected a reconfiguring event on the crash-then-new-epoch path"
+    assert reconfig[0]["node"] == 0 and reconfig[0]["cause"] == "epoch 1->2"
+
+
 def test_enters_epoch_then_exits_on_metrics(tmp_path, monkeypatch):
     run_uri = str(tmp_path)
     h = Harness(monkeypatch)

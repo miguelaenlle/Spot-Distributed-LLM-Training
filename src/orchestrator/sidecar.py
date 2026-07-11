@@ -155,7 +155,10 @@ def run(
     # are attributed to this node and epoch — see spot_train.train.
     os.environ["SPOT_NODE_INDEX"] = str(node_index)
     proc: subprocess.Popen | None = None
-    running_epoch = -1  # the epoch `proc` was launched for
+    running_epoch = -1  # the epoch `proc` was launched for (reset on crash)
+    member_epoch = -1  # the last epoch we were admitted to (PERSISTS across crashes,
+    # so "realized the world changed" still fires when our torchrun crashed on the
+    # peer's death BEFORE the shrunk epoch was published — the common preempt path)
     idle_deadline = time.monotonic() + idle_budget
     try:
         while True:
@@ -178,18 +181,20 @@ def run(
                 rank, node_count, master_addr, master_port = mine
                 epoch_changed = epoch != running_epoch
                 crashed = proc is not None and proc.poll() is not None
-                if epoch_changed and running_epoch != -1:
-                    # REALIZED the world changed: we've read a new epoch doc. This
-                    # is distinct from (and precedes) provisioning — the gap is the
-                    # teardown of the old collective (kill_tree).
+                if member_epoch != -1 and epoch != member_epoch:
+                    # REALIZED the world changed: we've read a new epoch doc (vs.
+                    # the last one we were admitted to). Distinct from — and
+                    # preceding — provisioning; the gap is the teardown of the old
+                    # collective. Fires whether or not our torchrun already crashed.
                     events.emit(
                         "reconfiguring",
                         by="sidecar",
                         node=node_index,
                         epoch=epoch,
                         world=node_count,
-                        cause=f"epoch {running_epoch}->{epoch}",
+                        cause=f"epoch {member_epoch}->{epoch}",
                     )
+                member_epoch = epoch
                 if epoch_changed and proc is not None:
                     _log(f"node {node_index}: killed for epoch {epoch}")
                     kill_tree(proc)
