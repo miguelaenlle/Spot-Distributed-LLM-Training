@@ -320,6 +320,25 @@ class OrchestratorConfig:
     def run_epoch_uri(self, run_id: str) -> str:
         return f"s3://{self.bucket}/{self.run_epoch_key(run_id)}"
 
+    # Observability doc the supervisor rewrites every tick: per-(node, attempt)
+    # liveness + log keys, so ANY process (the `logs` viewer) can discover which
+    # log belongs to whom and whether that box is alive — without the driver's
+    # in-memory state. Same single writer as epoch.json; sidecars never read it.
+    def run_status_key(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/status.json"
+
+    def run_status_uri(self, run_id: str) -> str:
+        return f"s3://{self.bucket}/{self.run_status_key(run_id)}"
+
+    # The supervisor's OWN decision log (published epoch / terminated / relaunch),
+    # uploaded next to the box logs so the viewer can show the control plane's
+    # narrative as a tab too.
+    def run_orch_log_key(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/logs/orchestrator.log"
+
+    def run_logs_prefix(self, run_id: str) -> str:
+        return f"{self.run_prefix}/{run_id}/logs/"
+
     def run_nodes_prefix(self, run_id: str) -> str:
         return f"{self.run_prefix}/{run_id}/nodes/"
 

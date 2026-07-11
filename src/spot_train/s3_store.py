@@ -193,6 +193,64 @@ def read_bytes(uri: str) -> bytes | None:
         return None
 
 
+def last_modified(uri: str) -> float | None:
+    """Epoch seconds the object/file was last written, or None if absent.
+    The log viewer's liveness signal: box logs re-upload every few seconds, so a
+    stale mtime means a dead/wedged box."""
+    if is_s3(uri):
+        bucket, key = _split(uri)
+        try:
+            return _client().head_object(Bucket=bucket, Key=key)["LastModified"].timestamp()
+        except Exception:  # noqa: BLE001 — NoSuchKey / transient => absent
+            return None
+    try:
+        return os.stat(uri).st_mtime
+    except OSError:
+        return None
+
+
+def list_names(uri: str) -> list[str]:
+    """Names directly under a prefix/dir, sorted; [] if absent. For S3 the name
+    is the key with the prefix stripped (the layouts listed here are flat)."""
+    if is_s3(uri):
+        bucket, prefix = _split(uri)
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        try:
+            names = []
+            paginator = _client().get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    names.append(obj["Key"][len(prefix) :])
+            return sorted(names)
+        except Exception:  # noqa: BLE001
+            return []
+    try:
+        return sorted(os.listdir(uri))
+    except OSError:
+        return []
+
+
+def read_bytes_from(uri: str, offset: int) -> bytes:
+    """Bytes of ``uri`` from ``offset`` to the end — a ranged read so a viewer
+    tailing a growing log only downloads the new tail, never the whole object.
+    Valid because log objects are append-only per key (whole-file re-uploads of
+    a file that only grows). Absent key or offset past EOF (S3: 416) => b""."""
+    if is_s3(uri):
+        bucket, key = _split(uri)
+        try:
+            resp = _client().get_object(Bucket=bucket, Key=key, Range=f"bytes={offset}-")
+            return resp["Body"].read()
+        except Exception:  # noqa: BLE001 — NoSuchKey / InvalidRange => no new bytes
+            return b""
+    try:
+        with open(uri, "rb") as f:
+            f.seek(offset)
+            return f.read()
+    except OSError:
+        return b""
+
+
 def exists(uri: str) -> bool:
     if is_s3(uri):
         bucket, key = _split(uri)

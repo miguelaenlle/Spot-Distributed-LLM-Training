@@ -34,6 +34,19 @@ def test_ingest_parses_and_types():
     assert isinstance(s.tok_s, int) and s.tok_s == 996
 
 
+def test_ingest_ignores_non_master_rank_lines():
+    # Non-master ranks now log their own progress (train.py) so every node's log
+    # shows it training. That line is deliberately NOT in the "step N: loss ..."
+    # form, so only rank 0's authoritative line feeds the loss curve — a node's
+    # per-rank line must never add a (duplicate, differently-timed) sample.
+    p = RunProfile("mn-1", "multinode", "spot")
+    p.ingest_log(
+        "step 20: loss 2.9876, 80ms/step, 15300 tok/s, ws 2\n"
+        "[rank 1] step 20 | loss 2.9876 | local 3.0012 | 81ms/step | ws 2\n"
+    )
+    assert [s.step for s in p.samples] == [20]  # exactly the rank-0 sample, no dupe
+
+
 def test_ingest_dedup_on_repeated_full_reads():
     p = RunProfile("baseline-1", "baseline", "on-demand")
     p.ingest_log(LOG)

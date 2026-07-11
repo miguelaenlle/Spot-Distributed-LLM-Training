@@ -303,9 +303,9 @@ def train(cfg: TrainConfig) -> dict:
         # profile so the N -> N-1 -> N staircase shows up next to the loss curve.
         if cfg.log_interval_steps and step % cfg.log_interval_steps == 0:
             gloss = distributed.mean_loss(ddp, micro_loss)  # all ranks participate
+            t = time.monotonic()
+            per_step = (t - last_log_time) / max(1, step - last_log_step)
             if ddp.master:
-                t = time.monotonic()
-                per_step = (t - last_log_time) / max(1, step - last_log_step)
                 toks = accum * ddp.world_size * cfg.batch_size * cfg.block_size
                 tok_s = toks / per_step if per_step else 0
                 print(
@@ -314,7 +314,20 @@ def train(cfg: TrainConfig) -> dict:
                     file=sys.stderr,
                     flush=True,
                 )
-                last_log_time, last_log_step = t, step
+            else:
+                # Every non-master rank logs its own progress too, so each node's
+                # log shows it training (not just boot output). A distinct format
+                # — no "step N: loss" — keeps these out of the rank-0-authoritative
+                # run profile (see profile._STEP_RE); `local` is this rank's slice
+                # loss, `loss` the all-reduced global mean it just helped compute.
+                print(
+                    f"[rank {ddp.rank}] step {step} | loss {gloss:.4f} "
+                    f"| local {micro_loss:.4f} | {per_step * 1000:.0f}ms/step "
+                    f"| ws {ddp.world_size}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            last_log_time, last_log_step = t, step
 
         # Periodic exact eval + inference snapshots — step-keyed, so every run
         # produces points at identical steps and a resumed run self-heals onto

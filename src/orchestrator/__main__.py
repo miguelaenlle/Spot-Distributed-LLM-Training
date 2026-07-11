@@ -68,6 +68,34 @@ def main() -> None:
     cmp_parser = sub.add_parser("compare", parents=[common])
     cmp_parser.add_argument("run_ids", nargs="+", help="run ids to compare (2+ recommended)")
 
+    logs_parser = sub.add_parser(
+        "logs",
+        parents=[common],
+        help="live per-node log dashboard: arrow keys switch nodes, dead nodes freeze",
+    )
+    logs_parser.add_argument("run_id", help="run id to view (live or finished)")
+    logs_parser.add_argument(
+        "--node", type=int, default=None, help="node index to select first (default: first node)"
+    )
+    logs_parser.add_argument(
+        "--interval", type=float, default=None, help="poll seconds (default: LOG_STREAM_SECONDS)"
+    )
+    logs_parser.add_argument(
+        "--uri",
+        default=None,
+        help="run base override — a local dir or s3://… (default: s3://BUCKET/runs/<run_id>)",
+    )
+    logs_parser.add_argument(
+        "--grid",
+        action="store_true",
+        help="show all node logs at once in a tiled grid (up to 8 panes); g toggles",
+    )
+    logs_parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="append-tail one node (--node) with join/death notices — for tmux panes/pipes",
+    )
+
     fleet_parser = sub.add_parser(
         "fleet", parents=[common], help="inference fleet (ROADMAP Part 1)"
     )
@@ -250,6 +278,18 @@ def main() -> None:
         from . import compare
 
         compare.run_compare(cfg, args.run_ids)
+    elif args.command == "logs":
+        from . import logview
+
+        logview.run_logs(
+            cfg,
+            args.run_id,
+            uri=args.uri,
+            interval=args.interval,
+            node=args.node,
+            grid=args.grid,
+            plain=args.plain,
+        )
     else:  # pragma: no cover — argparse enforces the choices
         parser.error(f"unknown command {args.command}")
 

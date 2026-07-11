@@ -32,6 +32,12 @@ def _run_id(kind: str) -> str:
     return f"{kind}-{int(time.time())}"
 
 
+def _logs_hint(run_id: str) -> None:
+    """Point at the live per-node dashboard — attachable from another terminal
+    the moment the run exists (and after it finishes)."""
+    print(f"[logs] dashboard:  spot-orchestrate logs {run_id}", file=sys.stderr)
+
+
 def _poll_metrics(cfg: OrchestratorConfig, run_id: str) -> dict:
     key = cfg.run_metrics_key(run_id)
     deadline = time.monotonic() + cfg.metrics_timeout_seconds
@@ -282,6 +288,7 @@ def _run_single_box(
     run_id = _run_id(kind)
     extra = f" nproc_per_node={nproc_per_node or 'auto(gpu)'}" if ddp else ""
     print(f"[{kind}] run_id={run_id} budget={budget}s{extra}", file=sys.stderr)
+    _logs_hint(run_id)
     # Collect a run profile (timeline + loss) and mirror to W&B if configured.
     profile = RunProfile(run_id, kind=kind, market=market)
     if not aws.is_dry_run():  # dry-run must not create a real W&B run
@@ -358,6 +365,7 @@ def run_resume(
     logs_key = cfg.run_logs_key(run_id, attempt=attempt)
     ddp = kind == "ddp"
     print(f"[resume] run_id={run_id} budget={budget}s market={market}", file=sys.stderr)
+    _logs_hint(run_id)
     # Profile object only feeds log ingestion/streaming; never started or finalized.
     profile = RunProfile(run_id, kind=kind, market=market)
     iid = _launch(
@@ -448,7 +456,11 @@ def _make_launch_node(cfg, ami, sg_id, run_id, market, budget, profile, logs):
     def launch(node_index: int) -> str:
         attempts[node_index] = attempts.get(node_index, 0) + 1
         key = cfg.run_logs_key(run_id, node=node_index, attempt=attempts[node_index] - 1)
-        logs[node_index] = {"key": key, "state": {"printed": 0}}
+        logs[node_index] = {
+            "key": key,
+            "attempt": attempts[node_index] - 1,
+            "state": {"printed": 0},
+        }
         iid = _launch_node(
             cfg, ami, sg_id, run_id, market, budget, node_index=node_index, logs_key=key
         )
@@ -494,6 +506,7 @@ def _run_supervised(
         f"kills={kill_schedule} replace={replace_on_loss}",
         file=sys.stderr,
     )
+    _logs_hint(run_id)
     profile = RunProfile(run_id, kind=kind, market=market)
     if not aws.is_dry_run():
         profile.wandb_start(cfg)
@@ -753,6 +766,7 @@ def run_preempt(cfg: OrchestratorConfig, *, ddp: bool = False) -> dict | None:
         f"instance per segment, node not told the schedule",
         file=sys.stderr,
     )
+    _logs_hint(run_id)
 
     profile = RunProfile(run_id, kind=kind, market=cfg.spot_market)
     if not aws.is_dry_run():  # dry-run must not create a real W&B run
@@ -852,6 +866,7 @@ def run_spot(cfg: OrchestratorConfig) -> dict | None:
         f"[spot] run_id={run_id} seg1={cfg.spot_seg1_seconds}s seg2={cfg.spot_seg2_seconds}s",
         file=sys.stderr,
     )
+    _logs_hint(run_id)
 
     # --- segment 1: train, then kill mid-run ------------------------------ #
     iid1 = _launch(cfg, ami, sg_id, run_id, cfg.spot_market, _SEG1_TRAINER_BUDGET)

@@ -196,6 +196,77 @@ def epoch_doc(
     }
 
 
+def status_doc(
+    run_id: str,
+    obs: Observation,
+    policy: Policy,
+    *,
+    epoch: int,
+    members: frozenset[int],
+    ips: dict[int, str],
+    node_ids: dict[int, str],
+    logs: dict[int, dict],
+    orch_log_key: str,
+    prev: dict | None,
+    now: float,
+    done: bool = False,
+) -> dict:
+    """The observability document (status.json), rewritten every tick so ANY
+    process — chiefly the ``spot-orchestrate logs`` viewer — can discover each
+    (node, attempt)'s log key and liveness without the driver's in-memory state.
+
+    Entries are keyed by (node, attempt): a replacement reuses the node index
+    but is a different box with a different log, so it gets its OWN entry and
+    the superseded attempt is carried forward from ``prev`` frozen at "dead".
+    Death is sticky per (node, attempt) — once dead, an entry never resurrects
+    (its log is frozen for the viewer), matching how replacements actually
+    arrive as fresh attempts."""
+    prev_nodes = {(e["node"], e["attempt"]): e for e in (prev or {}).get("nodes", [])}
+    by_node = {n.node: n for n in obs.nodes}
+    entries: dict[tuple[int, int], dict] = {}
+    for node, entry in logs.items():
+        attempt = entry.get("attempt", 0)
+        n = by_node.get(node)
+        pe = prev_nodes.get((node, attempt))
+        if pe is not None and pe["state"] == "dead":
+            state = "dead"
+        elif n is None:
+            state = "pending"
+        elif _healthy(n, policy):
+            state = "alive"
+        elif n.aws_state in _DEAD_STATES:
+            state = "dead"
+        elif pe is not None and pe["state"] == "alive":
+            state = "dead"  # was alive, now unhealthy: a stale-heartbeat wedge
+        else:
+            state = "pending"  # booting/joining — never was alive
+        entries[(node, attempt)] = {
+            "node": node,
+            "attempt": attempt,
+            "log_key": entry["key"],
+            "state": state,
+            "aws_state": n.aws_state if n is not None else "unknown",
+            "instance_id": node_ids.get(node),
+            "ip": ips.get(node),
+            "log_age_s": n.log_age_s if n is not None else None,
+        }
+    # Superseded attempts (their node now maps to a newer attempt) stay
+    # enumerable forever, frozen dead — the viewer keeps their log readable.
+    for k, pe in prev_nodes.items():
+        if k not in entries:
+            entries[k] = {**pe, "state": "dead"}
+    return {
+        "version": 1,
+        "run_id": run_id,
+        "updated_at": now,
+        "epoch": epoch,
+        "members": sorted(members),
+        "done": done,
+        "orchestrator": {"log_key": orch_log_key},
+        "nodes": [entries[k] for k in sorted(entries)],
+    }
+
+
 @dataclass
 class SupervisorState:
     """Cross-tick memory the pure reducer deliberately doesn't hold."""
@@ -255,6 +326,49 @@ class Supervisor:
         self._fired_kills: set[int] = set()
         self._terminated_iids: set[str] = set()  # guard against double-terminating a box
         self.metrics: dict | None = None
+        # Observability: status.json rewritten every tick + the supervisor's own
+        # decision log uploaded next to the box logs, so the `logs` viewer can
+        # show live per-node tabs plus the control plane's narrative.
+        self.status_key = cfg.run_status_key(run_id)
+        self.orch_log_key = cfg.run_orch_log_key(run_id)
+        self._last_status: dict | None = None
+        self._orch_lines: list[str] = []
+        self._orch_dirty = False
+
+    # -- observability ------------------------------------------------------ #
+    def _event(self, msg: str) -> None:
+        """A supervisor decision line: stderr (as always) + the orchestrator.log
+        buffer the next _write_status uploads."""
+        print(f"[supervisor] {msg}", file=sys.stderr)
+        self._orch_lines.append(f"[{time.strftime('%H:%M:%S')}] [supervisor] {msg}")
+        self._orch_dirty = True
+
+    def _write_status(self, obs: Observation, wall: float, *, done: bool = False) -> None:
+        """Upload status.json (every tick — updated_at doubles as the supervisor's
+        own heartbeat) and orchestrator.log (only when new events accrued).
+        Observability must never kill the run: any failure is a stderr line."""
+        try:
+            doc = status_doc(
+                self.run_id,
+                obs,
+                self.policy,
+                epoch=self.st.epoch,
+                members=self.st.members,
+                ips=self.st.ips,
+                node_ids=self.node_ids,
+                logs=self.logs,
+                orch_log_key=self.orch_log_key,
+                prev=self._last_status,
+                now=wall,
+                done=done,
+            )
+            aws.put_text(self.cfg.bucket, self.status_key, json.dumps(doc))
+            self._last_status = doc
+            if self._orch_dirty:
+                aws.put_text(self.cfg.bucket, self.orch_log_key, "\n".join(self._orch_lines) + "\n")
+                self._orch_dirty = False
+        except Exception as exc:  # noqa: BLE001
+            print(f"[supervisor] status write failed (non-fatal): {exc}", file=sys.stderr)
 
     # -- observation ------------------------------------------------------- #
     def _node_ip(self, node: int) -> str | None:
@@ -325,10 +439,9 @@ class Supervisor:
         aws.put_text(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id), json.dumps(doc))
         self.st.epoch, self.st.members = epoch, frozenset(members)
         self.st.replacing -= set(members)  # any admitted member is no longer "in flight"
-        print(
-            f"[supervisor] published epoch {epoch}: members {sorted(members)} "
-            f"(master {doc['master_addr']}:{doc['master_port']})",
-            file=sys.stderr,
+        self._event(
+            f"published epoch {epoch}: members {sorted(members)} "
+            f"(master {doc['master_addr']}:{doc['master_port']})"
         )
         if shrinking:
             # The kill mark + baselines were captured in _terminate; a grow resets
@@ -351,12 +464,13 @@ class Supervisor:
         self._terminated_iids.add(iid)
         self.profile.instance_stopped(iid)
         self.profile.mark("kill")
-        print(f"[supervisor] terminated node {node} ({iid})", file=sys.stderr)
+        self._event(f"terminated node {node} ({iid})")
 
     def _launch_replacement(self, node: int) -> None:
         if node in self.st.replacing:
             return
         self.st.replacing.add(node)
+        self._event(f"launching replacement for node {node}")
         aws.wait_quota_released(self.node_ids[node])
         aws.wait_vcpu_headroom(self.cfg.instance_vcpu_count(), self.cfg.vcpu_quota)
         self.st.ips.pop(node, None)  # force re-read of the replacement's fresh registration
@@ -364,9 +478,7 @@ class Supervisor:
         self.profile.mark("relaunch")
 
     def _whole_group_restart(self) -> None:
-        import sys
-
-        print("[supervisor] whole-group restart (floor)", file=sys.stderr)
+        self._event("whole-group restart (floor)")
         aws.delete_object(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id))
         for iid in self.node_ids.values():
             aws.terminate(iid)
@@ -431,8 +543,20 @@ class Supervisor:
             actions = decide(obs, self.policy)
             if any(isinstance(a, Done) for a in actions):
                 self._pull_logs()
+                self._event("run complete (metrics.json)")
+                self._write_status(obs, wall, done=True)
                 self.metrics = json.loads(aws.get_text(self.cfg.bucket, self.metrics_key))
                 return self.metrics
+            # Write status BEFORE executing this tick's actions: _execute mutates
+            # self.logs / self.node_ids (a replacement bumps node N to a new
+            # attempt + instance), and pairing those with THIS tick's older `obs`
+            # would tag the fresh attempt with the dead predecessor's AWS state —
+            # stamping node N·rK [dead] the instant it's born, which sticky-dead
+            # then locks in forever. Observed obs + as-observed logs stay
+            # consistent here; the new attempt surfaces next tick with its real
+            # state. (Cost: this tick's decision events reach orchestrator.log one
+            # tick later — negligible vs. a permanently-wrong dead badge.)
+            self._write_status(obs, wall)
             self._execute(actions)
             self._emit_marks()
             time.sleep(self.cfg.log_stream_seconds)
