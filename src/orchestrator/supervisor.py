@@ -182,17 +182,49 @@ def decide(obs: Observation, policy: Policy) -> list[Action]:
 # --------------------------------------------------------------------------- #
 # The imperative shell
 # --------------------------------------------------------------------------- #
+def elect_master(
+    members: tuple[int, ...], prev_members: frozenset[int], current_master: int | None
+) -> int:
+    """Pick the rendezvous master (which becomes rank 0 — it hosts the c10d
+    TCPStore every rank bootstraps against). STICKY to a proven survivor:
+
+    1. keep the current master if it's still a member — it already has a running
+       torchrun / store up, so never migrate the store onto a fresh box;
+    2. else the lowest-index member that was in the PREVIOUS epoch (a survivor
+       that's been training, not a just-booted replacement);
+    3. else (startup, or the whole group was replaced) the lowest-index member.
+
+    This is why a master(rank-0) preemption recovers like a worker preemption
+    instead of deadlocking the grow-back: when the killed master's replacement
+    re-takes its node index, the master role does NOT follow it — it stays on a
+    survivor whose store is already live, and the replacement joins as a worker.
+    No leader election needed; the single-writer supervisor just assigns it."""
+    ordered = sorted(members)
+    if current_master is not None and current_master in members:
+        return current_master
+    survivors = [n for n in ordered if n in prev_members]
+    return survivors[0] if survivors else ordered[0]
+
+
 def epoch_doc(
-    run_id: str, epoch: int, members: tuple[int, ...], ips: dict[int, str], port_base: int
+    run_id: str,
+    epoch: int,
+    members: tuple[int, ...],
+    ips: dict[int, str],
+    port_base: int,
+    master: int,
 ) -> dict:
     """The membership document, built from the node->ip map the boxes registered.
-    rank = position in the sorted member list; master = the lowest-index member."""
-    ranked = [{"node": n, "ip": ips[n], "rank": r} for r, n in enumerate(members)]
+    The elected ``master`` is placed at rank 0 (torchrun needs master_addr to be
+    rank 0's host, since that agent starts the rendezvous store); the remaining
+    members keep sorted order at ranks 1..N-1."""
+    ordered = [master, *(n for n in sorted(members) if n != master)]
+    ranked = [{"node": n, "ip": ips[n], "rank": r} for r, n in enumerate(ordered)]
     return {
         "epoch": epoch,
         "members": ranked,
         "node_count": len(members),
-        "master_addr": ips[members[0]],
+        "master_addr": ips[master],
         "master_port": port_base + epoch,
     }
 
@@ -280,6 +312,7 @@ class SupervisorState:
 
     epoch: int = 0
     members: frozenset[int] = frozenset()
+    master: int | None = None  # current rendezvous master (rank 0); sticky across grows
     replacing: set[int] = field(default_factory=set)  # a LaunchReplacement is in flight
     ips: dict[int, str] = field(default_factory=dict)  # node -> private IP (from registration)
     ckpt_step: int = -1
@@ -455,13 +488,16 @@ class Supervisor:
     # -- effects ----------------------------------------------------------- #
     def _publish_epoch(self, epoch: int, members: tuple[int, ...]) -> None:
         shrinking = self.st.members and len(members) < len(self.st.members)
-        doc = epoch_doc(self.run_id, epoch, members, self.st.ips, self.cfg.rdzv_port)
+        # Elect BEFORE updating st.members/st.master (elect_master reads the prior
+        # epoch's set + current master to stay sticky to a survivor).
+        master = elect_master(members, self.st.members, self.st.master)
+        doc = epoch_doc(self.run_id, epoch, members, self.st.ips, self.cfg.rdzv_port, master)
         aws.put_text(self.cfg.bucket, self.cfg.run_epoch_key(self.run_id), json.dumps(doc))
-        self.st.epoch, self.st.members = epoch, frozenset(members)
+        self.st.epoch, self.st.members, self.st.master = epoch, frozenset(members), master
         self.st.replacing -= set(members)  # any admitted member is no longer "in flight"
         self._event(
-            f"published epoch {epoch}: members {sorted(members)} "
-            f"(master {doc['master_addr']}:{doc['master_port']})"
+            f"published epoch {epoch}: members {sorted(members)} master=node{master} "
+            f"({doc['master_addr']}:{doc['master_port']})"
         )
         # World-size sample for the timeline (the N -> N-1 -> N staircase),
         # authoritative from the membership decision, not inferred by polling.

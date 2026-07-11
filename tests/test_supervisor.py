@@ -160,7 +160,7 @@ def test_unregistered_node_is_not_healthy():
 # epoch_doc schema + config keys + storage
 # --------------------------------------------------------------------------- #
 def test_epoch_doc_ranks_and_master():
-    doc = epoch_doc("r", 3, (0, 2), {0: "10.0.0.1", 2: "10.0.0.2"}, port_base=29400)
+    doc = epoch_doc("r", 3, (0, 2), {0: "10.0.0.1", 2: "10.0.0.2"}, port_base=29400, master=0)
     assert doc == {
         "epoch": 3,
         "members": [
@@ -168,9 +168,84 @@ def test_epoch_doc_ranks_and_master():
             {"node": 2, "ip": "10.0.0.2", "rank": 1},
         ],
         "node_count": 2,
-        "master_addr": "10.0.0.1",  # lowest-index member
+        "master_addr": "10.0.0.1",  # the elected master
         "master_port": 29403,  # base + epoch
     }
+
+
+def test_epoch_doc_puts_master_at_rank_0():
+    # A non-lowest master (a survivor) is placed at rank 0 — torchrun needs
+    # master_addr to be rank 0's host; the rest keep sorted order after it.
+    doc = epoch_doc(
+        "r", 5, (0, 1, 2), {0: "10.0.0.0", 1: "10.0.0.1", 2: "10.0.0.2"}, port_base=29400, master=1
+    )
+    assert doc["members"] == [
+        {"node": 1, "ip": "10.0.0.1", "rank": 0},  # master -> rank 0
+        {"node": 0, "ip": "10.0.0.0", "rank": 1},
+        {"node": 2, "ip": "10.0.0.2", "rank": 2},
+    ]
+    assert doc["master_addr"] == "10.0.0.1"
+
+
+def test_elect_master_sticky_survivor():
+    from orchestrator.supervisor import elect_master
+
+    # Startup: no prior epoch -> lowest index.
+    assert elect_master((0, 1, 2, 3), frozenset(), None) == 0
+    # Master (0) dies, shrink to survivors -> lowest-index survivor becomes master.
+    assert elect_master((1, 2, 3), frozenset({0, 1, 2, 3}), 0) == 1
+    # Grow back: node0's replacement re-takes index 0, but the master is STICKY to
+    # the survivor (1) — it does NOT migrate to the fresh box. (The bug fixed.)
+    assert elect_master((0, 1, 2, 3), frozenset({1, 2, 3}), 1) == 1
+    # A worker dies, master (0) survives -> master unchanged.
+    assert elect_master((0, 1, 2), frozenset({0, 1, 2, 3}), 0) == 0
+    # The sticky master itself dies -> migrate to the lowest-index survivor.
+    assert elect_master((2, 3), frozenset({1, 2, 3}), 1) == 2
+    # Whole group replaced (no survivor of the prior epoch) -> lowest index.
+    assert elect_master((0, 1), frozenset({5, 6}), 5) == 0
+
+
+def test_publish_epoch_keeps_master_sticky_across_grow_back(monkeypatch):
+    # The end-to-end fix for the observed hang: master node0 killed, group shrinks
+    # to [1,2,3] (master -> node1), then grows back to 4 with node0's replacement.
+    # The rendezvous master must STAY node1 (rank 0) — never migrate to the fresh
+    # node0·r1 — so the grow-back rendezvous doesn't deadlock on a not-yet-ready box.
+    import json as _json
+
+    from orchestrator import supervisor as sup_mod
+    from orchestrator.profile import RunProfile
+
+    cfg = OrchestratorConfig(bucket="b")
+    cfg.node_count = 4
+    puts: dict[str, str] = {}
+    monkeypatch.setattr(sup_mod.aws, "put_text", lambda b, k, t: puts.__setitem__(k, t))
+
+    s = sup_mod.Supervisor(
+        cfg,
+        RunProfile("r", kind="multinode-preempt", market="spot"),
+        run_id="r",
+        policy=PREEMPT,
+        node_ids={i: f"i-{i}" for i in range(4)},
+        logs={i: {"key": f"k{i}", "attempt": 0} for i in range(4)},
+        launch_node=lambda n: "i-new",
+        pull_logs=lambda: None,
+    )
+    s.st.ips = {0: "10.0.0.0", 1: "10.0.0.1", 2: "10.0.0.2", 3: "10.0.0.3"}
+
+    def master_of() -> dict:
+        return _json.loads(puts[cfg.run_epoch_key("r")])
+
+    s._publish_epoch(1, (0, 1, 2, 3))  # startup
+    assert s.st.master == 0 and master_of()["master_addr"] == "10.0.0.0"
+
+    s._publish_epoch(2, (1, 2, 3))  # node0 (master) killed -> survivor node1 takes over
+    assert s.st.master == 1 and master_of()["master_addr"] == "10.0.0.1"
+
+    s._publish_epoch(3, (0, 1, 2, 3))  # node0·r1 rejoins -> master STAYS node1 (sticky)
+    doc = master_of()
+    assert s.st.master == 1 and doc["master_addr"] == "10.0.0.1"
+    ranks = {m["node"]: m["rank"] for m in doc["members"]}
+    assert ranks[1] == 0 and ranks[0] == 1  # survivor is rank 0; replacement a worker
 
 
 def test_config_epoch_keys():

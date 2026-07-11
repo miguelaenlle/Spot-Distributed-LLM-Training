@@ -213,7 +213,13 @@ class OrchestratorConfig:
     nccl_timeout_seconds: int = field(default_factory=lambda: _env_int("NCCL_TIMEOUT", 20))
     # No checkpoint progress for this long -> the supervisor's whole-group
     # restart floor (terminate all, relaunch, publish a fresh epoch).
-    recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 600))
+    # No-checkpoint-progress this long => the whole group is wedged (e.g. a torchrun
+    # rendezvous that can't converge) => whole-group restart. The deadlock-breaker
+    # of last resort. Must sit ABOVE the worst-case LEGITIMATE no-progress window
+    # (a whole-group reboot: ~45-70s boot + restore + first checkpoint ~= 90s) so it
+    # never false-fires mid-recovery, yet well under METRICS_TIMEOUT so a genuine
+    # hang is broken within a run instead of stalling to the deadline.
+    recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 150))
 
     # --- inference fleet (ROADMAP Part 1) ------------------------------------
     # CPU instances by default: the 10M-param model serves fine on CPU, and
