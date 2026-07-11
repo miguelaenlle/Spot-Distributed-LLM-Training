@@ -434,17 +434,18 @@ def test_from_events_rows_per_attempt_and_wasted():
     # Rows are keyed by (node, attempt): the killed original and its replacement
     # are DISTINCT rows.
     assert set(rec.samples) == {(0, 0), (1, 0), (1, 1)}
-    # node0 survives: train -> STALLED -> realized (reconfig) -> provisioning ->
-    # WASTED (re-doing rolled-back steps) -> training.
+    # node0 survives: train -> STALLED -> provisioning -> WASTED (re-doing
+    # rolled-back steps) -> training. "realized" is an instant MARKER, not a
+    # segment (teardown->relaunch is same-tick), so it's not in the spans.
     assert [lbl for _t, lbl in rec.samples[(0, 0)]] == [
         "prov",
         "train",
         "stalled",
-        "reconfig",
         "prov",
         "wasted",
         "train",
     ]
+    assert (156.0, (0, 0)) in rec.realized  # realized-world-change marker on node0
     assert rec.samples[(1, 0)][-1][1] == "down"  # original node1 killed
     assert [lbl for _t, lbl in rec.samples[(1, 1)]] == ["prov", "train"]  # replacement
     assert rec.wasted == {(0, 0): 10}  # exactly the 10 rolled-back steps
@@ -468,7 +469,7 @@ def test_render_gantt_from_events_shows_stalled_and_wasted():
     assert "n1·r1" in frame  # the replacement has its own row
     assert "▚" in frame  # stalled glyph on node0's row
     assert "▨" in frame  # wasted glyph on node0's row
-    assert "◇" in frame  # reconfig (realized) glyph
+    assert "◆" in frame  # realized-world-change marker on node0's row
     assert "world 2/2" in frame and "wasted 10 steps" in frame
 
 

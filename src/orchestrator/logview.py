@@ -350,7 +350,6 @@ def render_grid(tabs: list[Tab], size: tuple[int, int], meta: dict, now: float) 
 # down = gone/reclaimed/killed.
 _GANTT = {
     "prov": "░",
-    "reconfig": "◇",
     "train": "▓",
     "wasted": "▨",
     "stalled": "▚",
@@ -359,13 +358,13 @@ _GANTT = {
 }
 _GANTT_COLORS = {  # for the PNG (order = legend order)
     "prov": "#4C78A8",
-    "reconfig": "#B279A2",
     "train": "#59A14F",
     "wasted": "#F58518",
     "stalled": "#E45756",
     "restart": "#EDC948",
     "down": "#BAB0AC",
 }
+_REALIZED_COLOR = "#B279A2"  # the "realized world changed" marker (a point in time)
 # A restart window with no observable checkpoint progress is capped here so a
 # missing/never-advancing ckpt_step can't paint a permanent restart bar.
 _RESTART_CAP_S = 90.0
@@ -422,7 +421,8 @@ class TimelineRecorder:
     # Rows are keyed by a "row id": an int node (inferred fallback) or a
     # (node, attempt) tuple (event-sourced), so a replacement gets its own line.
     samples: dict = field(default_factory=dict)
-    kills: list = field(default_factory=list)  # (ts, row_id)
+    kills: list = field(default_factory=list)  # (ts, row_id): a box went down/killed
+    realized: list = field(default_factory=list)  # (ts, row_id): node saw the world change
     world: list[tuple[float, int]] = field(default_factory=list)  # (wall, world size)
     full: int = 0  # full world size (max |members| ever observed)
     wasted: dict = field(default_factory=dict)  # row_id -> steps re-done after a rollback
@@ -548,6 +548,12 @@ class TimelineRecorder:
         for r in sorted(node_recs, key=lambda r: r["ts"]):
             row = (r["node"], r.get("attempt", 0))
             by_row.setdefault(row, []).append(r)
+            if r["state"] == "reconfiguring":
+                # An INSTANT (realized the world changed), not a duration — the
+                # teardown->relaunch is usually same-tick, so a segment would be
+                # zero-width. Render it as a point marker on the row instead.
+                rec.realized.append((r["ts"], row))
+                continue
             rec.samples.setdefault(row, []).append((r["ts"], _EVENT_STATE_MAP[r["state"]]))
             if r["state"] in ("killed", "down"):
                 rec.kills.append((r["ts"], row))
@@ -651,7 +657,12 @@ def render_gantt(
         for x in range(inner):
             lbl, k = _at(s, t0 + (x + 0.5) * span / inner, k)
             chars.append(_GANTT.get(lbl, " "))
-        for kw, kn in rec.kills:
+        for rw, rn in rec.realized:  # "◆" = this node realized the world changed
+            if rn == row:
+                xi = int((rw - t0) / span * inner)
+                if 0 <= xi < inner:
+                    chars[xi] = "◆"
+        for kw, kn in rec.kills:  # "✗" drawn last so a kill is never hidden
             if kn == row:
                 xi = int((kw - t0) / span * inner)
                 if 0 <= xi < inner:
@@ -679,7 +690,7 @@ def render_gantt(
     )[:cols]
 
     rule = "─" * labelw + "┴" + "─" * inner
-    legend = " ░prov ◇reconfig ▓train ▨wasted ▚stalled ·down ✗gone"[:cols]
+    legend = " ░prov ▓train ▨wasted ▚stalled ·down ✗gone ◆realized-world-change"[:cols]
     footer = (note or "[e] export   [v] events   [t] tabs   [g] grid   [q] quit")[:cols]
     head = [title, axis]
     foot = [rule, ws_row, summary, legend, footer]
@@ -759,6 +770,7 @@ def export_gantt(
     matplotlib.use("Agg")
     import matplotlib.patches as mpatches
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     t0 = rec.t0 if rec.t0 is not None else now
     rowkeys = sorted(rec.samples, key=_row_parts)
@@ -787,6 +799,9 @@ def export_gantt(
                 ax.text(
                     s + d / 2, i * 10 + 5, cap, ha="center", va="center", fontsize=8, color="white"
                 )
+        for rw, rn in rec.realized:  # realized the world changed — a point in time
+            if rn == row:
+                ax.plot(rw - t0, i * 10 + 5, marker="D", color="#B279A2", ms=8, mec="white", mew=1)
         for kw, kn in rec.kills:
             if kn == row:
                 ax.plot(kw - t0, i * 10 + 5, marker="x", color="#E45756", ms=11, mew=3)
@@ -795,11 +810,27 @@ def export_gantt(
     ax.set_ylim(0, max(1, len(rowkeys)) * 10)
     ax.set_title(f"Run timeline — {run_id}")
     _used = {lbl for r in rowkeys for _s, _d, lbl in rec.runs(r, now)}
+    marks = [
+        Line2D([], [], marker="x", color="#E45756", ls="", ms=8, mew=2, label="killed/gone"),
+    ]
+    if rec.realized:
+        marks.append(
+            Line2D(
+                [],
+                [],
+                marker="D",
+                color=_REALIZED_COLOR,
+                ls="",
+                ms=7,
+                mec="white",
+                label="realized world change",
+            )
+        )
     ax.legend(
         handles=[
             mpatches.Patch(color=c, label=lbl) for lbl, c in _GANTT_COLORS.items() if lbl in _used
         ]
-        + [mpatches.Patch(color="#E45756", label="killed/gone")],
+        + marks,
         loc="upper right",
         fontsize=8,
     )
