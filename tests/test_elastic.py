@@ -110,15 +110,17 @@ def test_config_reads_elastic_env(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Budget in the checkpoint (v2)
+# Budget in the checkpoint (v2+)
 # --------------------------------------------------------------------------- #
 def test_checkpoint_carries_trained_seconds(tmp_path):
     uri = str(tmp_path)
     _save(uri, step=5, trained_seconds=42.5)
     blob = checkpoint.load_latest(uri)
-    assert blob["version"] == 2
+    assert blob["version"] == checkpoint.CKPT_VERSION
     assert blob["trained_seconds"] == 42.5
-    checkpoint.verify(s3_store.latest(uri))  # v2 passes verify
+    # No fp16 scaler was passed, so the optional slot is present but empty.
+    assert blob["scaler"] is None
+    checkpoint.verify(s3_store.latest(uri))  # current version passes verify
 
 
 def test_v1_checkpoint_still_loads(tmp_path):

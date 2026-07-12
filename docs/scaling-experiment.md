@@ -129,6 +129,7 @@ for the Gantt, `v` for the events log).
 | `DATASET` | `shakespeare_char` | set to `openwebtext_300m` |
 | `TARGET_LOSS` | — (**required** for the experiment) | stop at `val_loss ≤` this |
 | `N_LAYER/N_HEAD/N_EMBD/BLOCK_SIZE` | `12/12/768/1024` | GPT-2-small |
+| `DTYPE` | `auto` | mixed precision: `auto` (bf16 if GPU supports, else fp16), `float32`, `bfloat16`, `float16`. On a T4 `auto`→fp16 (~6-10× vs fp32) |
 | `GLOBAL_BATCH_SIZE` | `64` | constant global batch (the control) |
 | `BATCH_SIZE` | `4` | per-rank micro-batch (T4 memory) |
 | `EVAL_INTERVAL_STEPS` | `50` | val cadence = target-detection granularity |
@@ -161,8 +162,11 @@ for the Gantt, `v` for the events log).
 - **`stage-data` prints nothing while uploading ~572 MB** — expected; not a hang.
 - **`prepare.py` hangs on exit** — HF streaming threads; Ctrl-C safe, bins are written.
   (Nice-to-have: add `os._exit(0)` after the writes so it returns cleanly.)
-- **T4 memory/perf for GPT-2-124M** — un-validated until `calibrate` runs; shrink the
-  config if it OOMs / is too slow.
+- **T4 memory/perf for GPT-2-124M** — the trainer now runs mixed precision
+  (`DTYPE=auto`→fp16 on a T4); expect **~2-3 s/step** steady-state (ignore step 0,
+  which pays CUDA/cuDNN warmup). If steps are still >8 s each — the old fp32 rate —
+  AMP isn't engaging (check the `[amp] compute dtype: …` line); the stall watchdog's
+  `peer-stall` events at world=1 are the tell. Shrink the config only if it OOMs.
 - **Real spot reclaims** — the preempt runs schedule 2 kills, but AWS may reclaim a
   box on its own; the supervisor handles it identically (a `down` event, cause
   `reclaimed`, vs the scheduled `killed`). More than 2 ✗ on the Gantt = the market

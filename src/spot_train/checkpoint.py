@@ -37,9 +37,11 @@ import torch
 from . import distributed, rng, s3_store
 
 # v2 adds trained_seconds (cumulative in-loop wall-clock, the run-level budget's
-# progress meter). v1 blobs still load — trained_seconds defaults to 0.
-CKPT_VERSION = 2
-_KNOWN_VERSIONS = (1, 2)
+# progress meter). v3 adds an OPTIONAL "scaler" (the fp16 GradScaler's loss-scale
+# state — restoring it keeps a preempt/resume bit-exact instead of re-warming the
+# scale from 2**16). Older blobs still load: trained_seconds -> 0, scaler -> None.
+CKPT_VERSION = 3
+_KNOWN_VERSIONS = (1, 2, 3)
 _REQUIRED_KEYS = ("version", "step", "model", "optimizer", "rng", "loader")
 
 
@@ -60,7 +62,9 @@ def _step_of(ref: str | None) -> int:
     return int(base[len(s3_store.CHECKPOINT_PREFIX) : -len(".pt")])
 
 
-def save(*, model, optimizer, loader, step: int, uri: str, trained_seconds: float = 0.0) -> str:
+def save(
+    *, model, optimizer, loader, step: int, uri: str, trained_seconds: float = 0.0, scaler=None
+) -> str:
     """Atomically persist full training state. Returns the final checkpoint ref."""
     blob: dict[str, Any] = {
         "version": CKPT_VERSION,
@@ -70,6 +74,7 @@ def save(*, model, optimizer, loader, step: int, uri: str, trained_seconds: floa
         "optimizer": optimizer.state_dict(),
         "rng": rng.capture(),
         "loader": loader.state_dict(),
+        "scaler": _scaler_state(scaler),
     }
     fd, tmp_path = tempfile.mkstemp(suffix=".pt")
     os.close(fd)
@@ -83,6 +88,15 @@ def save(*, model, optimizer, loader, step: int, uri: str, trained_seconds: floa
         # into /tmp until the disk fills.
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def _scaler_state(scaler) -> dict | None:
+    """The GradScaler's state, or None when there's no scaler / it's disabled
+    (bf16, fp32, CPU) — a disabled scaler's state_dict is empty and carries no
+    information worth persisting, so None keeps blobs uniform across dtypes."""
+    if scaler is None or not scaler.is_enabled():
+        return None
+    return scaler.state_dict()
 
 
 def _cpu_copy(obj: Any) -> Any:
@@ -101,7 +115,7 @@ def _cpu_copy(obj: Any) -> Any:
 
 
 def snapshot(
-    *, model, optimizer, loader, step: int, trained_seconds: float = 0.0
+    *, model, optimizer, loader, step: int, trained_seconds: float = 0.0, scaler=None
 ) -> dict[str, Any]:
     """Point-in-time CPU copy of the full training state (same schema as
     ``save`` writes). This is the only part of an async checkpoint that must
@@ -116,6 +130,7 @@ def snapshot(
         "optimizer": _cpu_copy(optimizer.state_dict()),
         "rng": rng.capture(),  # capture() already returns copies
         "loader": dict(loader.state_dict()),
+        "scaler": _cpu_copy(_scaler_state(scaler)),
     }
 
 
@@ -185,7 +200,9 @@ class AsyncCheckpointer:
     def busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def submit(self, *, model, optimizer, loader, step: int, trained_seconds: float = 0.0) -> bool:
+    def submit(
+        self, *, model, optimizer, loader, step: int, trained_seconds: float = 0.0, scaler=None
+    ) -> bool:
         """Snapshot now and hand off to the writer. False = previous save still
         in flight (skipped; nothing was snapshotted)."""
         if self.busy():
@@ -196,6 +213,7 @@ class AsyncCheckpointer:
             loader=loader,
             step=step,
             trained_seconds=trained_seconds,
+            scaler=scaler,
         )
         self._count += 1
         self._thread = threading.Thread(
@@ -304,12 +322,19 @@ def load_group_latest(
         return torch.load(local, map_location=map_location, weights_only=False)
 
 
-def restore_into(blob: dict[str, Any], *, model, optimizer, loader) -> int:
-    """Restore all state from ``blob``. Returns the step to resume from."""
+def restore_into(blob: dict[str, Any], *, model, optimizer, loader, scaler=None) -> int:
+    """Restore all state from ``blob``. Returns the step to resume from.
+
+    ``scaler`` is optional: only fp16 runs carry one, and only a v3+ blob written
+    by an enabled scaler holds its state. When either is absent the scaler simply
+    keeps its fresh loss-scale (a brief re-warm, never a divergence)."""
     model.load_state_dict(blob["model"])
     optimizer.load_state_dict(blob["optimizer"])
     loader.load_state_dict(blob["loader"])
     rng.restore(blob["rng"])
+    saved_scaler = blob.get("scaler")
+    if scaler is not None and scaler.is_enabled() and saved_scaler:
+        scaler.load_state_dict(saved_scaler)
     return blob["step"]
 
 

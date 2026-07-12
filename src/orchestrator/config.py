@@ -41,6 +41,7 @@ _TRAINER_PASSTHROUGH = (
     "LEARNING_RATE",
     "WEIGHT_DECAY",
     "DROPOUT",
+    "DTYPE",
     "WARMUP_STEPS",
     "LR_DECAY_STEPS",
     "MIN_LR",

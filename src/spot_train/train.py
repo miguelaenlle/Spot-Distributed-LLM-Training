@@ -63,15 +63,40 @@ def build_model(cfg: TrainConfig, vocab_size: int):
     return GPT(gpt_cfg)
 
 
+def _resolve_amp(dtype_cfg: str, device_type: str):
+    """Map the DTYPE config to (amp dtype | None, autocast context).
+
+    nanoGPT parity (its ``train.py`` lines 73/111-112): "auto" picks bf16 where
+    the GPU supports it — more stable, and it needs no GradScaler — else fp16.
+    CPU and "float32" stay full precision with a nullcontext, so the determinism
+    tests are bit-exact. The returned context is reusable across ``with`` blocks."""
+    name = (dtype_cfg or "auto").lower()
+    if device_type != "cuda" or name in ("float32", "fp32"):
+        return None, contextlib.nullcontext()
+    if name in ("auto", ""):
+        name = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+    amp_dtype = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }[name]
+    return amp_dtype, torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
+
+
 @torch.no_grad()
-def eval_full(model, loader: PositionedLoader, split: str = "val") -> float:
+def eval_full(model, loader: PositionedLoader, split: str = "val", amp_ctx=None) -> float:
     """Mean loss over ONE deterministic full pass of ``split`` (exact — the same
     windows every call and every run, and zero RNG consumed; see
-    ``PositionedLoader.iter_eval_batches``)."""
+    ``PositionedLoader.iter_eval_batches``). ``amp_ctx`` runs the forward under
+    the same autocast dtype as training so eval isn't stuck at fp32 speed; it
+    touches no RNG, so the determinism guarantees are unchanged."""
+    ctx = amp_ctx if amp_ctx is not None else contextlib.nullcontext()
     model.eval()
     total, count = 0.0, 0
     for x, y in loader.iter_eval_batches(split):
-        _, loss = model(x, y)
+        with ctx:
+            _, loss = model(x, y)
         total += loss.item() * x.size(0)
         count += x.size(0)
     model.train()
@@ -79,15 +104,19 @@ def eval_full(model, loader: PositionedLoader, split: str = "val") -> float:
 
 
 @torch.no_grad()
-def estimate_loss(model, loader: PositionedLoader, eval_iters: int) -> dict[str, float]:
+def estimate_loss(
+    model, loader: PositionedLoader, eval_iters: int, amp_ctx=None
+) -> dict[str, float]:
     """Mean train/val loss over ``eval_iters`` batches (nanoGPT-style)."""
+    ctx = amp_ctx if amp_ctx is not None else contextlib.nullcontext()
     model.eval()
     out: dict[str, float] = {}
     for split in ("train", "val"):
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             x, y = loader.next_batch(split)
-            _, loss = model(x, y)
+            with ctx:
+                _, loss = model(x, y)
             losses[k] = loss.item()
         out[split] = float(losses.mean().item())
     model.train()
@@ -148,6 +177,12 @@ def train(cfg: TrainConfig) -> dict:
     cfg.device = ddp.device
     device_type = "cuda" if cfg.device.startswith("cuda") else "cpu"
 
+    # TF32 matmuls/cuDNN (nanoGPT train.py:107-108): a free speedup on Ampere+ and
+    # a no-op on older GPUs (Turing/T4) — safe to enable unconditionally on CUDA.
+    if device_type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     def log(msg: str) -> None:  # only rank 0 prints
         if ddp.master:
             print(msg, file=sys.stderr, flush=True)
@@ -175,6 +210,14 @@ def train(cfg: TrainConfig) -> dict:
         cfg.weight_decay, cfg.learning_rate, (0.9, 0.95), device_type
     )
 
+    # Mixed precision (the nanoGPT optimization our fork had dropped). The
+    # autocast context wraps every forward; the GradScaler is a NO-OP unless the
+    # dtype is fp16 (bf16/fp32/CPU need none), so on CPU this whole block reduces
+    # to fp32 + nullcontext and the determinism tests stay bit-exact.
+    amp_dtype, autocast_ctx = _resolve_amp(cfg.dtype, device_type)
+    scaler = torch.amp.GradScaler(device_type, enabled=(amp_dtype is torch.float16))
+    log(f"[amp] compute dtype: {amp_dtype or 'float32'} (grad scaler: {scaler.is_enabled()})")
+
     # --- the one resume code path --------------------------------------- #
     # Group-agreed across the node-local tier (instant, survivors) and S3
     # (durable, replacements); degrades to plain latest-from-uri single-node.
@@ -184,7 +227,7 @@ def train(cfg: TrainConfig) -> dict:
     resumed = blob is not None
     if resumed:
         start_step = checkpoint.restore_into(
-            blob, model=raw_model, optimizer=optimizer, loader=loader
+            blob, model=raw_model, optimizer=optimizer, loader=loader, scaler=scaler
         )
         trained_before = float(blob.get("trained_seconds", 0.0))
         log(f"[resume] restored from step {start_step} ({trained_before:.0f}s already trained)")
@@ -242,6 +285,7 @@ def train(cfg: TrainConfig) -> dict:
             step=step,
             uri=cfg.checkpoint_uri,
             trained_seconds=trained_seconds,
+            scaler=scaler,
         )
         # Every Nth checkpoint, prove the written artifact reconstructs a model.
         if cfg.smoke_test_every and ckpt_count % cfg.smoke_test_every == 0:
@@ -334,12 +378,17 @@ def train(cfg: TrainConfig) -> dict:
                 contextlib.nullcontext() if last_micro or not ddp.enabled else model.no_sync()
             )
             with sync_ctx:
-                _, loss = model(x, y)
-                (loss / accum).backward()
+                with autocast_ctx:
+                    _, loss = model(x, y)
+                # scaler is a no-op unless fp16: scales the loss so fp16 grads
+                # don't underflow, then unscales before the optimizer sees them.
+                scaler.scale(loss / accum).backward()
             micro_loss += loss.item() / accum
         if cfg.grad_clip > 0:
+            scaler.unscale_(optimizer)  # clip on the true (unscaled) gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
+        scaler.step(optimizer)  # skips the step if fp16 grads were inf/nan
+        scaler.update()  # adjust the loss scale for next step
         step += 1
 
         # per-step progress (nanoGPT-style) — tail the box log to watch this live.
@@ -379,7 +428,7 @@ def train(cfg: TrainConfig) -> dict:
         # inside, but a rank that skipped them would run ahead and stall DDP at
         # the next backward until NCCL_TIMEOUT); only rank 0 prints/writes.
         if cfg.eval_interval_steps and step % cfg.eval_interval_steps == 0:
-            vloss = eval_full(raw_model, loader)
+            vloss = eval_full(raw_model, loader, amp_ctx=autocast_ctx)
             if ddp.master:
                 print(f"eval step {step}: val_loss {vloss:.4f}", file=sys.stderr, flush=True)
             # Target-loss early stop: the full val pass is deterministic and
@@ -415,6 +464,7 @@ def train(cfg: TrainConfig) -> dict:
                     loader=loader,
                     step=step,
                     trained_seconds=trained_now,
+                    scaler=scaler,
                 ):
                     ckpt_count += 1
                     last_ckpt = now
@@ -439,6 +489,7 @@ def train(cfg: TrainConfig) -> dict:
                         loader=loader,
                         step=step,
                         trained_seconds=trained_now,
+                        scaler=scaler,
                     ),
                     cfg.local_checkpoint_dir,
                     step,
@@ -509,7 +560,7 @@ def train(cfg: TrainConfig) -> dict:
 
     final_step = step
     eval_t0 = time.monotonic()
-    losses = estimate_loss(raw_model, loader, cfg.eval_iters)  # unwrapped: no collective
+    losses = estimate_loss(raw_model, loader, cfg.eval_iters, amp_ctx=autocast_ctx)  # no collective
     eval_s = round(time.monotonic() - eval_t0, 2)
 
     # Representative outputs: the full prompt series against the final weights.
@@ -539,6 +590,7 @@ def train(cfg: TrainConfig) -> dict:
         "device": cfg.device,
         "cuda": cuda_ok,
         "gpu": gpu_name,
+        "amp_dtype": str(amp_dtype).replace("torch.", "") if amp_dtype else "float32",
         "dataset": cfg.dataset,
         "world_size": ddp.world_size,
         # Elastic provenance: how many times torchrun restarted this worker

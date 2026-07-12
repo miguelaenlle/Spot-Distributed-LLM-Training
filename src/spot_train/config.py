@@ -66,6 +66,13 @@ class TrainConfig:
     learning_rate: float = 6e-4
     weight_decay: float = 1e-1
     seed: int = 1337
+    # Mixed-precision compute dtype (nanoGPT parity — its train.py's autocast is
+    # the single biggest optimization our fork dropped). "float32" runs full fp32
+    # (the dataclass default, so CPU determinism tests stay bit-exact). On the box
+    # from_env defaults to "auto": bf16 where the GPU supports it (no GradScaler
+    # needed), else fp16 (auto-enables a GradScaler). "auto" always resolves to
+    # float32 on CPU. Options: auto | float32 | bfloat16 | float16.
+    dtype: str = "float32"
     # LR schedule (nanoGPT-style linear warmup -> cosine decay -> min_lr). All a
     # pure function of the step number, so resume needs no extra state. Defaults
     # keep today's constant-LR behavior: lr_decay_steps == 0 disables the schedule.
@@ -182,6 +189,7 @@ class TrainConfig:
             max_steps=_env_int("MAX_STEPS", 100_000),
             learning_rate=_env_float("LEARNING_RATE", 6e-4),
             weight_decay=_env_float("WEIGHT_DECAY", 1e-1),
+            dtype=_env_str("DTYPE", "auto"),
             dropout=_env_float("DROPOUT", 0.0),
             warmup_steps=_env_int("WARMUP_STEPS", 0),
             lr_decay_steps=_env_int("LR_DECAY_STEPS", 0),
