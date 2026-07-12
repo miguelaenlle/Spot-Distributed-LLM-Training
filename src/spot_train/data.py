@@ -24,7 +24,12 @@ import torch
 
 from . import s3_store
 
-_FILES = ("train.bin", "val.bin", "meta.pkl")
+# train/val bins are required; meta.pkl is char-level only. BPE corpora
+# (OpenWebText) ship no meta.pkl — the trainer falls back to vocab 50304 — so it
+# is fetched only when actually staged, never demanded (a missing key would 404).
+_REQUIRED = ("train.bin", "val.bin")
+_OPTIONAL = ("meta.pkl",)
+_FILES = (*_REQUIRED, *_OPTIONAL)
 
 
 @dataclass
@@ -69,17 +74,27 @@ class PositionedLoader:
         missing = [f for f in _FILES if not os.path.exists(os.path.join(self.data_local_dir, f))]
         if not missing:
             return
-        if not self.data_uri:
+        # Required files gate the run; a missing OPTIONAL (meta.pkl) is fine — the
+        # loader falls back to the BPE vocab — so non-rank-0 ranks only wait on the
+        # required set, which is guaranteed to appear.
+        missing_required = [f for f in missing if f in _REQUIRED]
+        if missing_required and not self.data_uri:
             raise FileNotFoundError(
-                f"Dataset files {missing} not found in {self.data_local_dir!r} and no "
+                f"Dataset files {missing_required} not found in {self.data_local_dir!r} and no "
                 f"data_uri set. Run nanoGPT's prepare.py (locally) or `spot-orchestrate "
                 f"stage-data` (to S3) first."
             )
+        if not self.data_uri:
+            return
         if int(os.environ.get("LOCAL_RANK", "0")) != 0:
-            self._wait_for_files(missing)
+            self._wait_for_files(missing_required)
             return
         for name in missing:
             ref = s3_store._join(self.data_uri.rstrip("/"), name)  # s3://.../<name>
+            # meta.pkl is optional: skip cleanly when it was never staged
+            # (BPE datasets), rather than 404-ing on HeadObject.
+            if name in _OPTIONAL and not s3_store.exists(ref):
+                continue
             local = s3_store.download(ref)
             dest = os.path.join(self.data_local_dir, name)
             tmp = f"{dest}.tmp-{os.getpid()}"

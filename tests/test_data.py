@@ -37,6 +37,7 @@ def test_rank0_downloads_atomically(tmp_path, monkeypatch):
         return str(p)
 
     monkeypatch.setattr(data_mod.s3_store, "download", fake_download)
+    monkeypatch.setattr(data_mod.s3_store, "exists", lambda ref: True)
     loader = _make_loader(tmp_path, monkeypatch, "0")
     loader._ensure_data()
     for name in data_mod._FILES:
@@ -80,6 +81,34 @@ def test_single_process_still_downloads_without_local_rank(tmp_path, monkeypatch
         return str(p)
 
     monkeypatch.setattr(data_mod.s3_store, "download", fake_download)
+    monkeypatch.setattr(data_mod.s3_store, "exists", lambda ref: True)
     loader = _make_loader(tmp_path, monkeypatch, None)  # LOCAL_RANK unset
     loader._ensure_data()
     assert sorted(calls) == sorted(data_mod._FILES)
+
+
+def test_missing_optional_meta_is_skipped_not_downloaded(tmp_path, monkeypatch):
+    """BPE datasets (OpenWebText) ship no meta.pkl. The box must fetch the
+    required bins and skip the un-staged meta.pkl cleanly — not 404 on it."""
+    calls = []
+
+    def fake_download(ref):
+        name = ref.rsplit("/", 1)[-1]
+        calls.append(name)
+        p = tmp_path / name
+        p.write_bytes(b"x")
+        return str(p)
+
+    # meta.pkl is not in S3; train/val are.
+    def fake_exists(ref):
+        return not ref.endswith("meta.pkl")
+
+    monkeypatch.setattr(data_mod.s3_store, "download", fake_download)
+    monkeypatch.setattr(data_mod.s3_store, "exists", fake_exists)
+    loader = _make_loader(tmp_path, monkeypatch, "0")
+    loader._ensure_data()  # must not raise
+
+    assert sorted(calls) == sorted(data_mod._REQUIRED)  # meta.pkl never fetched
+    for name in data_mod._REQUIRED:
+        assert os.path.exists(os.path.join(loader.data_local_dir, name))
+    assert not os.path.exists(os.path.join(loader.data_local_dir, "meta.pkl"))
