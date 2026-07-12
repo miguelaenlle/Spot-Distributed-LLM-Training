@@ -263,8 +263,10 @@ def _stream_until_metrics_multi(
 def _prepare(cfg: OrchestratorConfig) -> tuple[str, str]:
     cfg.require_bucket()
     aws.set_region(cfg.region)
+    # train.bin is the universal staged marker — meta.pkl only exists for
+    # char-level datasets (BPE corpora like OpenWebText ship none).
     if not aws.is_dry_run() and not aws.object_exists(
-        cfg.bucket, f"{cfg.data_prefix}/{cfg.dataset}/meta.pkl"
+        cfg.bucket, f"{cfg.data_prefix}/{cfg.dataset}/train.bin"
     ):
         raise SystemExit(
             f"dataset not staged at {cfg.data_uri()} — run `spot-orchestrate stage-data` first"
