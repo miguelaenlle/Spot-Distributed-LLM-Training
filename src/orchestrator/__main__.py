@@ -54,6 +54,7 @@ def main() -> None:
         "multinode-preempt",
         "calibrate",
         "scaling-experiment",
+        "scaling-clean",
     ):
         sub.add_parser(name, parents=[common])
     res_parser = sub.add_parser("resume", parents=[common])
@@ -278,6 +279,8 @@ def main() -> None:
         experiments.run_calibrate(cfg)
     elif args.command == "scaling-experiment":
         experiments.run_scaling_experiment(cfg)
+    elif args.command == "scaling-clean":
+        experiments.run_scaling_clean(cfg)
     elif args.command == "resume":
         experiments.run_resume(cfg, args.run_id, budget=args.budget, market=args.market)
     elif args.command == "compare":

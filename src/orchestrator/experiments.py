@@ -791,6 +791,86 @@ def _write_scaling_report(path: str, results: list[dict], recipe: dict) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def _write_scaling_clean_report(path: str, results: list[dict], recipe: dict) -> None:
+    """Summary for the 1/2/4-node CLEAN sweep: per-run table + speedup and scaling
+    efficiency vs the 1-node baseline, plus a constant-global-batch control check
+    (steps_to_target should match across node counts)."""
+
+    def by_nodes(n: int) -> dict | None:
+        return next((x for x in results if x["nodes"] == n), None)
+
+    def ttt(r: dict | None) -> float | None:
+        return r["analysis"].get("time_to_target_s") if r and r["analysis"].get("reached") else None
+
+    base = by_nodes(min(r["nodes"] for r in results))  # fewest nodes = baseline
+    base_n = base["nodes"] if base else 1
+    base_t = ttt(base)
+    lines = [
+        f"Scaling sweep (CLEAN, time to target loss) — {recipe['stamp']}",
+        "=" * 72,
+        "",
+        f"target val_loss <= {recipe['target']}. time-to-target = wall-clock from the",
+        "first training step to the first eval at or below target (boot excluded).",
+        "",
+        "Control: identical model/data/seed + CONSTANT global batch "
+        f"(GLOBAL_BATCH_SIZE={recipe['global_batch']}), so every node count follows the",
+        "same loss-vs-step curve and the comparison isolates throughput. Sequential",
+        f"{recipe['market']} runs on {recipe['instance']}, model {recipe['model']},",
+        f"dataset {recipe['dataset']}, eval every {recipe['eval_interval']} steps, "
+        f"per-run cap {recipe['cap_s']}s.",
+        "",
+        f"SPEEDUP vs {base_n} node(s)",
+        "-" * 72,
+    ]
+    if base_t is None:
+        lines.append(f"  {base_n}-node did not reach target — no baseline (raise cap or target).")
+    else:
+        for n in sorted({r["nodes"] for r in results}):
+            tn = ttt(by_nodes(n))
+            if tn is None:
+                lines.append(f"  {n}n: INCONCLUSIVE (did not reach target within cap)")
+                continue
+            sp = base_t / tn if tn else float("inf")
+            eff = sp / (n / base_n) * 100 if n else 0
+            lines.append(
+                f"  {n}n: {tn}s   {sp:.2f}x vs {base_n}n   "
+                f"scaling efficiency {eff:.0f}% (ideal {n / base_n:.0f}x)"
+            )
+    # Constant-global-batch control: steps_to_target should match across runs.
+    steps = {
+        r["nodes"]: r["analysis"].get("steps_to_target")
+        for r in results
+        if r["analysis"].get("reached")
+    }
+    if len({v for v in steps.values() if v}) > 1:
+        lines += [
+            "",
+            "⚠️  CONTROL CHECK: steps_to_target differ across node counts "
+            f"({steps}) — the",
+            "   constant-global-batch control is imperfect (eval granularity or K",
+            "   rounding); treat the speedups as approximate.",
+        ]
+    lines += ["", "PER-RUN", "-" * 72]
+    for r in sorted(results, key=lambda x: x["nodes"]):
+        a = r["analysis"]
+        if a.get("reached"):
+            detail = (
+                f"  step {a['target_step']}  hit_val {a['hit_val']}  "
+                f"time_to_target {a['time_to_target_s']}s  (total train {a['total_train_s']}s)"
+            )
+        else:
+            detail = f"  ({a.get('why', 'target not reached — raise cap or target')})"
+        lines += [
+            f"[{r['label']}]  run_id={r['run_id']}  nodes={r['nodes']}",
+            f"    target: {'HIT' if a.get('reached') else 'NOT REACHED'}{detail}",
+            f"    cost: ${r['cost']}    wandb: {r['wandb'] or '(disabled)'}",
+            f"    gantt: {r['png']}    events: {r['events']}    valcurve: {r['valcurve']}",
+            "",
+        ]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def run_scaling_experiment(cfg: OrchestratorConfig) -> list[dict]:
     """ONE command: 2- vs 4-node TIME-TO-TARGET-LOSS, clean and preempted, on spot.
     Runs the four configs sequentially (each stops at val_loss <= TARGET_LOSS or a
@@ -910,6 +990,144 @@ def run_scaling_experiment(cfg: OrchestratorConfig) -> list[dict]:
         print(f"[scaling-experiment] {label} done → {out_dir}/summary.txt", file=sys.stderr)
 
     print(f"\n\033[1m[scaling-experiment] DONE → {out_dir}/summary.txt\033[0m", file=sys.stderr)
+    with open(f"{out_dir}/summary.txt") as f:
+        print(f.read())
+    return results
+
+
+def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
+    """ONE command: 1- vs 2- vs 4-node TIME-TO-TARGET-LOSS, CLEAN (no preemption).
+
+    Sequential runs, each stops at val_loss <= TARGET_LOSS or a wall-clock cap
+    (default 480s / 8 min — size the target so the SLOWEST, 1-node, run finishes
+    inside it). Node count 1 routes to the single-box path (the epoch supervisor
+    is 2+-node only); 2 and 4 run under the supervisor with an EMPTY kill
+    schedule. Writes reports/scaling-clean-<ts>/ with per-run timeline + val-curve
+    and the speedup vs the 1-node baseline. Requires TARGET_LOSS — run
+    `calibrate` first (with SCALING_CAP_SECONDS matching this cap) to size it."""
+    target = float(os.environ.get("TARGET_LOSS", "0") or "0")
+    if target <= 0:
+        raise SystemExit(
+            "TARGET_LOSS is required — run `spot-orchestrate calibrate` first "
+            "(SCALING_CAP_SECONDS=480) and pick a loss the 1-node run reaches in "
+            "~6-7 min, then re-run with TARGET_LOSS=<val>."
+        )
+    node_counts = [int(x) for x in os.environ.get("NODE_COUNTS", "1,2,4").split(",") if x.strip()]
+
+    # vCPU-quota guard (before any env mutation): the WIDEST run must fit the quota
+    # — the spot G limit is what binds here.
+    per_box = cfg.instance_vcpu_count()
+    widest = max(node_counts) * per_box
+    if widest > cfg.vcpu_quota:
+        raise SystemExit(
+            f"{max(node_counts)} nodes x {per_box} vCPU = {widest} > VCPU_QUOTA="
+            f"{cfg.vcpu_quota}. Raise VCPU_QUOTA (e.g. =32 for your spot G limit) or "
+            "drop the top node count."
+        )
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    os.environ["TARGET_LOSS"] = str(target)  # relayed to boxes for the early stop
+    for k, v in {  # constant global batch is the control — same recipe as calibrate
+        "N_LAYER": "12",
+        "N_HEAD": "12",
+        "N_EMBD": "768",
+        "BLOCK_SIZE": "1024",
+        "GLOBAL_BATCH_SIZE": "64",
+        "EVAL_INTERVAL_STEPS": "25",  # fine granularity so all node counts detect the same step
+        "DROPOUT": "0.0",
+        "LEARNING_RATE": "6e-4",
+        "MIN_LR": "6e-5",
+        "WARMUP_STEPS": "100",
+        "LR_DECAY_STEPS": "50000",
+        "GRAD_CLIP": "1.0",
+        "SAMPLE_INTERVAL_STEPS": "0",
+        "MAX_STEPS": "1000000",  # the wall-clock cap (below) is the real stop
+    }.items():
+        os.environ.setdefault(k, v)
+    os.environ.setdefault("WANDB_GROUP", f"scaling-clean-{stamp}")
+    market = os.environ.get("MARKET", "spot")  # spot by default (OD quota is tight)
+    cfg.batch_size = int(os.environ.get("BATCH_SIZE", "4"))  # per-rank micro; global constant
+    cap_s = int(os.environ.get("SCALING_CAP_SECONDS", "480"))  # 8-min per-run cap
+
+    recipe = {
+        "stamp": stamp,
+        "target": target,
+        "market": market,
+        "instance": cfg.instance_type,
+        "model": f"{os.environ['N_LAYER']}L-{os.environ['N_EMBD']}d-{os.environ['BLOCK_SIZE']}ctx",
+        "dataset": cfg.dataset,
+        "global_batch": os.environ["GLOBAL_BATCH_SIZE"],
+        "eval_interval": os.environ["EVAL_INTERVAL_STEPS"],
+        "cap_s": cap_s,
+        "node_counts": ",".join(map(str, node_counts)),
+    }
+    out_dir = os.path.abspath(f"reports/scaling-clean-{stamp}")
+    os.makedirs(f"{out_dir}/runs", exist_ok=True)
+    print(
+        f"\n\033[1m⚠️  BILLABLE: {len(node_counts)} SEQUENTIAL {market} runs "
+        f"({recipe['node_counts']} nodes of {cfg.instance_type}, peak {widest} vCPU), "
+        f"each <= {cap_s}s.\033[0m\n"
+        f"[scaling-clean] recipe: {recipe}\n[scaling-clean] report dir: {out_dir}",
+        file=sys.stderr,
+    )
+
+    results: list[dict] = []
+    for nodes in node_counts:
+        label = f"{nodes}n"
+        cfg.node_count = nodes
+        print(f"\n[scaling-clean] === {label} (nodes={nodes}, clean {market}) ===", file=sys.stderr)
+        try:
+            if nodes == 1:
+                # Supervisor is 2+-node only; a single box runs the same trainer.
+                profile, _m = _run_single_box(
+                    cfg, kind="scaling1", market=market, budget=cap_s, return_profile=True
+                )
+            else:
+                profile, _m = _run_supervised(
+                    cfg,
+                    kind="multinode",
+                    budget=cap_s,
+                    replace_on_loss=False,
+                    kill_schedule=[],
+                    return_profile=True,
+                )
+            analysis = _analyze_target(profile, target)
+            art = _render_run_timeline(cfg, profile.run_id, f"{out_dir}/runs")
+            valcurve = _val_curve_png(
+                profile, analysis, f"{out_dir}/runs/{profile.run_id}-valcurve.png"
+            )
+            results.append(
+                {
+                    "label": label,
+                    "nodes": nodes,
+                    "run_id": profile.run_id,
+                    "analysis": analysis,
+                    "cost": round(profile.cost_now(), 4),
+                    "wandb": getattr(profile._wb, "url", None) if profile._wb else None,
+                    "png": art["png"],
+                    "events": art["events"],
+                    "valcurve": valcurve,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad run must not sink the sweep
+            print(f"[scaling-clean] {label} FAILED: {exc}", file=sys.stderr)
+            results.append(
+                {
+                    "label": label,
+                    "nodes": nodes,
+                    "run_id": "-",
+                    "analysis": {"reached": False, "why": f"run failed: {exc}"},
+                    "cost": 0.0,
+                    "wandb": None,
+                    "png": None,
+                    "events": None,
+                    "valcurve": None,
+                }
+            )
+        _write_scaling_clean_report(f"{out_dir}/summary.txt", results, recipe)
+        print(f"[scaling-clean] {label} done → {out_dir}/summary.txt", file=sys.stderr)
+
+    print(f"\n\033[1m[scaling-clean] DONE → {out_dir}/summary.txt\033[0m", file=sys.stderr)
     with open(f"{out_dir}/summary.txt") as f:
         print(f.read())
     return results

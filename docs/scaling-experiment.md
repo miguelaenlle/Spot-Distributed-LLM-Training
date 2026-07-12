@@ -109,6 +109,35 @@ is required** — the command errors and points you back to `calibrate` if it's 
 Watch a run live in another terminal: `spot-orchestrate logs <run_id>` (press `t`
 for the Gantt, `v` for the events log).
 
+## Variant: 1 vs 2 vs 4 nodes, CLEAN (no preemption) — `scaling-clean`
+
+For a pure throughput-scaling comparison (skip preemption), `scaling-clean` runs
+**1-, 2-, and 4-node** clean runs to the same `TARGET_LOSS` and reports the
+speedup vs 1 node. Node count 1 routes to the single-box path (the epoch
+supervisor is 2+-node only); 2 and 4 run under the supervisor with no kills.
+
+```bash
+# 1. calibrate with the SAME cap you'll use, to size a target the 1-node run
+#    (the slowest) reaches inside the cap:
+SCALING_CAP_SECONDS=480 DATASET=openwebtext_300m INSTANCE_TYPE=g5.xlarge \
+  spot-orchestrate calibrate
+# 2. run the sweep on SPOT (1/2/4 nodes = 4/8/16 vCPU):
+VCPU_QUOTA=32 MARKET=spot TARGET_LOSS=<from calibrate> \
+  INSTANCE_TYPE=g5.xlarge DATASET=openwebtext_300m \
+  SCALING_CAP_SECONDS=480 NODE_COUNTS=1,2,4 \
+  spot-orchestrate scaling-clean
+```
+
+Report `reports/scaling-clean-<ts>/summary.txt`: per-run `time_to_target_s` +
+**speedup and scaling efficiency vs 1 node** (expect sub-linear — ~1 : 1.9 : 3.4,
+not 1 : 2 : 4, from the gradient all-reduce). Knobs: `NODE_COUNTS` (default
+`1,2,4`), `SCALING_CAP_SECONDS` (default 480 = 8 min), `MARKET` (default `spot`),
+`VCPU_QUOTA` (the sweep refuses to start if the widest run exceeds it). Size the
+target so the **1-node** run finishes under the cap — it's the slowest, so it
+bounds the whole sweep. Caveat: a 1-node spot box that AWS reclaims mid-run just
+dies (no auto-resume on the single-box path) — rerun it, or run 1-node on-demand
+if you have the G quota.
+
 ## Outputs
 
 `reports/scaling-experiment-<ts>/`:

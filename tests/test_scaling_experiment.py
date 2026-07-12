@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator import experiments, logview
 from orchestrator.profile import RunProfile, Sample, ValSample
 
@@ -85,6 +87,106 @@ def test_report_verdicts_true_false_and_inconclusive(tmp_path):
     experiments._write_scaling_report(path, results, recipe)
     with open(path) as f:
         assert "H1 (clean): INCONCLUSIVE" in f.read()
+
+
+def _clean_result(label, nodes, t, reached=True, steps=800):
+    return {
+        "label": label,
+        "nodes": nodes,
+        "run_id": f"{label}-id",
+        "analysis": {
+            "reached": reached,
+            "target": 5.0,
+            "target_step": steps,
+            "hit_val": 4.98,
+            "steps_to_target": steps,
+            "time_to_target_s": t,
+            "total_train_s": t + 30,
+        },
+        "cost": 0.3,
+        "wandb": None,
+        "png": "g.png",
+        "events": "e.txt",
+        "valcurve": "v.png",
+    }
+
+
+_CLEAN_RECIPE = {
+    "stamp": "x",
+    "target": 5.0,
+    "market": "spot",
+    "instance": "g5.xlarge",
+    "model": "12L-768d-1024ctx",
+    "dataset": "openwebtext_300m",
+    "global_batch": "64",
+    "eval_interval": "25",
+    "cap_s": 480,
+    "node_counts": "1,2,4",
+}
+
+
+def test_scaling_clean_report_speedup_and_efficiency(tmp_path):
+    # 1n=400s baseline, 2n=220s (1.82x), 4n=130s (3.08x) — sub-linear, as expected.
+    results = [
+        _clean_result("1n", 1, 400.0),
+        _clean_result("2n", 2, 220.0),
+        _clean_result("4n", 4, 130.0),
+    ]
+    path = str(tmp_path / "summary.txt")
+    experiments._write_scaling_clean_report(path, results, _CLEAN_RECIPE)
+    with open(path) as f:
+        body = f.read()
+    assert "SPEEDUP vs 1 node(s)" in body
+    assert "2n: 220.0s   1.82x vs 1n" in body
+    assert "4n: 130.0s   3.08x vs 1n" in body
+    assert "scaling efficiency" in body
+    assert "run_id=4n-id" in body
+    # steps_to_target match across runs -> no control warning
+    assert "CONTROL CHECK" not in body
+
+
+def test_scaling_clean_report_flags_control_mismatch(tmp_path):
+    # Different steps_to_target across node counts -> constant-batch control broke.
+    results = [
+        _clean_result("1n", 1, 400.0, steps=800),
+        _clean_result("2n", 2, 220.0, steps=825),  # different step -> flagged
+    ]
+    path = str(tmp_path / "summary.txt")
+    experiments._write_scaling_clean_report(path, results, _CLEAN_RECIPE)
+    with open(path) as f:
+        assert "CONTROL CHECK" in f.read()
+
+
+def test_scaling_clean_report_inconclusive_when_target_missed(tmp_path):
+    results = [
+        _clean_result("1n", 1, 400.0),
+        _clean_result("2n", 2, 0.0, reached=False),
+    ]
+    path = str(tmp_path / "summary.txt")
+    experiments._write_scaling_clean_report(path, results, _CLEAN_RECIPE)
+    with open(path) as f:
+        body = f.read()
+    assert "2n: INCONCLUSIVE" in body
+
+
+def test_scaling_clean_requires_target_loss(monkeypatch):
+    from orchestrator.config import OrchestratorConfig
+
+    monkeypatch.delenv("TARGET_LOSS", raising=False)
+    with pytest.raises(SystemExit, match="TARGET_LOSS is required"):
+        experiments.run_scaling_clean(OrchestratorConfig())
+
+
+def test_scaling_clean_vcpu_guard(monkeypatch):
+    from orchestrator.config import OrchestratorConfig
+
+    monkeypatch.setenv("TARGET_LOSS", "5.0")
+    monkeypatch.setenv("NODE_COUNTS", "1,2,4")
+    # default vcpu_quota=8; 4 nodes x 4 vCPU (g4dn/g5.xlarge) = 16 > 8 -> guard trips
+    cfg = OrchestratorConfig()
+    assert cfg.instance_vcpu_count() == 4 and cfg.vcpu_quota == 8
+    with pytest.raises(SystemExit, match="> VCPU_QUOTA="):
+        experiments.run_scaling_clean(cfg)
 
 
 def test_calibration_sizing_projects_and_suggests():
