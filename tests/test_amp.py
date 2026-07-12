@@ -86,6 +86,15 @@ def test_explicit_cuda_dtypes_map_to_autocast():
     assert isinstance(_resolve_amp("float16", "cuda")[1], torch.autocast)
 
 
+def test_auto_prefers_fp16_on_turing_bf16_on_ampere(monkeypatch):
+    """The T4 regression: bf16 has no tensor-core path on Turing (cc 7.5), so
+    'auto' must pick fp16 there and only pick bf16 on Ampere+ (cc >= 8.0)."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (7, 5))
+    assert _resolve_amp("auto", "cuda")[0] is torch.float16  # T4 -> fp16
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0))
+    assert _resolve_amp("auto", "cuda")[0] is torch.bfloat16  # A100 -> bf16
+
+
 # --- scaler state round-trips through a checkpoint -------------------------- #
 def test_enabled_scaler_state_is_saved_and_restored(tmp_path):
     scaler = FakeScaler(enabled=True, state={"scale": 1024.0, "_growth_tracker": 7})

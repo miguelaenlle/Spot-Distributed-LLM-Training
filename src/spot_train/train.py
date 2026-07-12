@@ -66,15 +66,19 @@ def build_model(cfg: TrainConfig, vocab_size: int):
 def _resolve_amp(dtype_cfg: str, device_type: str):
     """Map the DTYPE config to (amp dtype | None, autocast context).
 
-    nanoGPT parity (its ``train.py`` lines 73/111-112): "auto" picks bf16 where
-    the GPU supports it — more stable, and it needs no GradScaler — else fp16.
-    CPU and "float32" stay full precision with a nullcontext, so the determinism
-    tests are bit-exact. The returned context is reusable across ``with`` blocks."""
+    "auto" picks bf16 only on Ampere+ (compute capability >= 8.0), where it has a
+    tensor-core path and needs no GradScaler — else fp16. This is STRICTER than
+    nanoGPT's ``is_bf16_supported()`` (train.py:73) on purpose: that returns True
+    on Turing (T4, cc 7.5) too, but bf16 there runs OFF the tensor cores at ~fp32
+    speed, so "auto" would silently pick the slow path. fp16 hits the T4's tensor
+    cores. CPU and "float32" stay full precision with a nullcontext, so the
+    determinism tests are bit-exact. The returned context is reusable."""
     name = (dtype_cfg or "auto").lower()
     if device_type != "cuda" or name in ("float32", "fp32"):
         return None, contextlib.nullcontext()
     if name in ("auto", ""):
-        name = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+        # bf16 tensor cores are Ampere+ (sm_80); Turing/T4 (sm_75) needs fp16.
+        name = "bfloat16" if torch.cuda.get_device_capability()[0] >= 8 else "float16"
     amp_dtype = {
         "bfloat16": torch.bfloat16,
         "bf16": torch.bfloat16,
@@ -348,9 +352,15 @@ def train(cfg: TrainConfig) -> dict:
     # can't emit. A daemon thread watches forward progress and, past a threshold,
     # emits "stalled" stamped at the LAST good step (the true onset, not when we
     # noticed). The main loop emits "training" again the instant a step completes.
+    #
+    # The threshold must sit ABOVE the longest *legitimate* pause between steps or
+    # it cries wolf — for a GPT-2-124M run that's a checkpoint snapshot (~10s: the
+    # CPU copy of the model + Adam state) or a full-val eval, which at 1.4s/step
+    # dwarf a step. 45s clears both with margin yet still flags a genuinely dead
+    # peer ~10x sooner than NCCL's own timeout. Tune via STALL_THRESHOLD_SECONDS.
     _hb = {"mono": time.monotonic(), "wall": train_started_at, "stalled": False}
     _stop_wd = threading.Event()
-    _stall_after = float(os.environ.get("STALL_THRESHOLD_SECONDS", "8"))
+    _stall_after = float(os.environ.get("STALL_THRESHOLD_SECONDS", "45"))
 
     def _watchdog() -> None:
         while not _stop_wd.wait(1.0):

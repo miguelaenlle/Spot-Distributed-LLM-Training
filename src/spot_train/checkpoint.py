@@ -118,10 +118,14 @@ def snapshot(
     *, model, optimizer, loader, step: int, trained_seconds: float = 0.0, scaler=None
 ) -> dict[str, Any]:
     """Point-in-time CPU copy of the full training state (same schema as
-    ``save`` writes). This is the only part of an async checkpoint that must
-    run on the training critical path — ~tens of ms for a NanoGPT-sized model.
-    RNG and loader state are captured in the same instant as the weights, the
-    invariant that keeps resume from silently diverging."""
+    ``save`` writes). This is the only part of an async checkpoint that must run
+    on the training critical path, and its cost scales with model + optimizer
+    size: ~tens of ms for the small Shakespeare model, but SECONDS for GPT-2-124M
+    — the D2H copy of ~1.5 GB (weights + Adam moments) is what shows up as a
+    periodic stall on the timeline. Keep CHECKPOINT_INTERVAL_SECONDS well above
+    it so the stall is amortized, not per-step. RNG and loader state are captured
+    in the same instant as the weights — the invariant that keeps resume from
+    silently diverging."""
     return {
         "version": CKPT_VERSION,
         "step": step,

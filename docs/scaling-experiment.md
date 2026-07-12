@@ -129,7 +129,8 @@ for the Gantt, `v` for the events log).
 | `DATASET` | `shakespeare_char` | set to `openwebtext_300m` |
 | `TARGET_LOSS` | — (**required** for the experiment) | stop at `val_loss ≤` this |
 | `N_LAYER/N_HEAD/N_EMBD/BLOCK_SIZE` | `12/12/768/1024` | GPT-2-small |
-| `DTYPE` | `auto` | mixed precision: `auto` (bf16 if GPU supports, else fp16), `float32`, `bfloat16`, `float16`. On a T4 `auto`→fp16 (~6-10× vs fp32) |
+| `DTYPE` | `auto` | mixed precision: `auto` (bf16 only on Ampere+ cc≥8.0, else fp16), `float32`, `bfloat16`, `float16`. On a T4 `auto`→**fp16** (bf16 on Turing runs off the tensor cores at ~fp32 speed, so don't force it) |
+| `STALL_THRESHOLD_SECONDS` | `45` | watchdog: emit `stalled`/`peer-stall` after this long with no step. Must exceed a 124M checkpoint snapshot (~10s) + eval, else false alarms |
 | `GLOBAL_BATCH_SIZE` | `64` | constant global batch (the control) |
 | `BATCH_SIZE` | `4` | per-rank micro-batch (T4 memory) |
 | `EVAL_INTERVAL_STEPS` | `50` | val cadence = target-detection granularity |
@@ -162,11 +163,16 @@ for the Gantt, `v` for the events log).
 - **`stage-data` prints nothing while uploading ~572 MB** — expected; not a hang.
 - **`prepare.py` hangs on exit** — HF streaming threads; Ctrl-C safe, bins are written.
   (Nice-to-have: add `os._exit(0)` after the writes so it returns cleanly.)
-- **T4 memory/perf for GPT-2-124M** — the trainer now runs mixed precision
-  (`DTYPE=auto`→fp16 on a T4); expect **~2-3 s/step** steady-state (ignore step 0,
-  which pays CUDA/cuDNN warmup). If steps are still >8 s each — the old fp32 rate —
-  AMP isn't engaging (check the `[amp] compute dtype: …` line); the stall watchdog's
-  `peer-stall` events at world=1 are the tell. Shrink the config only if it OOMs.
+- **T4 perf for GPT-2-124M** — `DTYPE=auto`→**fp16** on a T4 (Turing has no bf16
+  tensor cores; confirm the `[amp] compute dtype: torch.float16` line — bf16 there
+  is a silent ~fp32-speed trap). Measured ~1.4 s/step at batch 4 (one micro-batch);
+  at the experiment's global batch 64 (16 accum) expect **~5-7 s/step** steady-state,
+  interpolated from Karpathy's A100 eager ~250 ms/iter ÷ ~5 (T4 is ~5× slower).
+  Ignore step 0 (CUDA/cuDNN warmup). Shrink the config only if it OOMs.
+- **Periodic checkpoint stall** — the async checkpoint's on-critical-path snapshot
+  is ~10s for 124M (D2H copy of weights + Adam moments), so at the 30s default it
+  eats a chunk of every interval. For long runs raise `CHECKPOINT_INTERVAL_SECONDS`
+  (e.g. 120) and/or `SMOKE_TEST_EVERY` to amortize it.
 - **Real spot reclaims** — the preempt runs schedule 2 kills, but AWS may reclaim a
   box on its own; the supervisor handles it identically (a `down` event, cause
   `reclaimed`, vs the scheduled `killed`). More than 2 ✗ on the Gantt = the market
