@@ -15,6 +15,7 @@ dependencies = [
     "numpy",
     "boto3",          # S3 store (checkpoints/data/metrics) + orchestrator AWS calls
     "requests",       # nanoGPT prepare.py (dataset download); future IMDS polling
+    "tiktoken",       # GPT-2 BPE codec for text samples on BPE datasets (OpenWebText)
 ]
 
 [project.optional-dependencies]

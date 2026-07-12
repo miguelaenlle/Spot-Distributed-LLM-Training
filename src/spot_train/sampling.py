@@ -1,11 +1,13 @@
 """End-of-run and mid-training text generation for a fixed prompt series.
 
-Char-level only: the codec comes from the dataset's ``meta.pkl`` (``stoi`` /
-``itos``, present for shakespeare_char); datasets without those maps skip
-sampling gracefully. Generation is wrapped in RNG capture/restore and seeded
-from ``(seed, step)``, so it never perturbs the training data stream (resume
-determinism) and a re-covered snapshot step after a preemption regenerates the
-identical file.
+Two codecs, picked by what the dataset ships: a char-level one from ``meta.pkl``
+(``stoi`` / ``itos``, present for shakespeare_char), else the GPT-2 BPE via
+``tiktoken`` for the BPE corpora (OpenWebText) that carry no ``meta.pkl`` — the
+same tokenizer their ``prepare.py`` used. Only when neither is available (e.g.
+tiktoken not installed) does sampling skip gracefully. Generation is wrapped in
+RNG capture/restore and seeded from ``(seed, step)``, so it never perturbs the
+training data stream (resume determinism) and a re-covered snapshot step after a
+preemption regenerates the identical file.
 """
 
 from __future__ import annotations
@@ -44,6 +46,29 @@ def _char_codec(
     return encode, decode
 
 
+def _bpe_codec() -> (
+    tuple[Callable[[str], list[int]], Callable[[list[int]], str]] | None
+):
+    """(encode, decode) for the GPT-2 BPE via tiktoken — the codec for BPE
+    corpora (OpenWebText) that ship no meta.pkl. None if tiktoken isn't
+    installed. decode drops ids in the model's padded-vocab tail (>= 50257,
+    since we build with vocab 50304): an undertrained model can still emit them
+    and tiktoken has no mapping, so they'd raise — they carry no text anyway."""
+    try:
+        import tiktoken
+    except ImportError:
+        return None
+    enc = tiktoken.get_encoding("gpt2")
+
+    def encode(text: str) -> list[int]:
+        return enc.encode_ordinary(text)
+
+    def decode(ids: list[int]) -> str:
+        return enc.decode([i for i in ids if 0 <= i < enc.n_vocab])
+
+    return encode, decode
+
+
 @torch.no_grad()
 def generate_samples(
     raw_model,
@@ -65,11 +90,12 @@ def generate_samples(
     if not prompts:
         print("[sample] skipped: no prompts configured", file=sys.stderr)
         return None
-    codec = _char_codec(cfg.data_local_dir)
+    # Char-level (meta.pkl) if present, else GPT-2 BPE (tiktoken) for OWT & co.
+    codec = _char_codec(cfg.data_local_dir) or _bpe_codec()
     if codec is None:
         print(
-            f"[sample] skipped: no stoi/itos in {cfg.data_local_dir}/meta.pkl "
-            "(not a char-level dataset)",
+            f"[sample] skipped: no char codec (meta.pkl) in {cfg.data_local_dir} "
+            "and tiktoken not installed for the BPE fallback",
             file=sys.stderr,
         )
         return None

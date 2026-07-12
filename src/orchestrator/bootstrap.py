@@ -111,6 +111,11 @@ git submodule update --init --depth 1
 "$VENV_PY" -c "import boto3" 2>/dev/null \\
   || "$VENV_PY" -m pip install boto3 \\
   || "$VENV_PY" -m pip install --user boto3 || true
+# tiktoken: the GPT-2 BPE codec for end-of-run/interval samples on BPE datasets
+# (OpenWebText). Missing => sampling skips gracefully, training is unaffected.
+"$VENV_PY" -c "import tiktoken" 2>/dev/null \\
+  || "$VENV_PY" -m pip install tiktoken \\
+  || "$VENV_PY" -m pip install --user tiktoken || true
 
 # Env: drop the trainer's config into a file you can `source` before a manual run.
 cat > /home/ubuntu/spot-train.env <<'ENV'

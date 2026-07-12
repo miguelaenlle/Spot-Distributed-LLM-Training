@@ -106,7 +106,7 @@ def test_generate_samples_restores_rng_and_mode(tmp_path):
     assert model.training  # train mode restored
 
 
-def test_generate_samples_skip_paths(tmp_path):
+def test_generate_samples_skip_paths(tmp_path, monkeypatch):
     _write_char_dataset(tmp_path)
     cfg = _tiny_cfg(tmp_path)
     model = _tiny_model(cfg)
@@ -115,6 +115,8 @@ def test_generate_samples_skip_paths(tmp_path):
     # prompt with chars outside the vocab is skipped individually
     doc = sampling.generate_samples(model, cfg, 1, prompts=["ROMEO:", "Ünïcode"])
     assert [s["prompt"] for s in doc["samples"]] == ["ROMEO:"]
+    # With NO char codec and the BPE fallback unavailable (tiktoken absent), skip.
+    monkeypatch.setattr(sampling, "_bpe_codec", lambda: None)
     # meta.pkl without stoi/itos (non-char dataset) => None
     with open(tmp_path / "meta.pkl", "wb") as f:
         pickle.dump({"vocab_size": 50304}, f)
@@ -122,6 +124,38 @@ def test_generate_samples_skip_paths(tmp_path):
     # no meta.pkl at all => None
     (tmp_path / "meta.pkl").unlink()
     assert sampling.generate_samples(model, cfg, 1) is None
+
+
+def test_bpe_codec_roundtrip_and_padding_filter():
+    """GPT-2 BPE codec round-trips text and drops padded-vocab ids (>= 50257)
+    that our vocab-50304 model can emit but tiktoken can't map."""
+    tiktoken = pytest.importorskip("tiktoken")
+    codec = sampling._bpe_codec()
+    assert codec is not None
+    encode, decode = codec
+    assert decode(encode("Hello, world!")) == "Hello, world!"
+    n_vocab = tiktoken.get_encoding("gpt2").n_vocab  # 50257
+    # ids in the padded tail are silently dropped, not raised on
+    assert decode([*encode("hi"), n_vocab, n_vocab + 46]) == "hi"
+
+
+def test_generate_samples_bpe_fallback_for_owt(tmp_path):
+    """A BPE dataset (no meta.pkl) samples via tiktoken against a vocab-50304
+    model — the OpenWebText path that previously produced no outputs."""
+    pytest.importorskip("tiktoken")
+    # BPE bins, deliberately NO meta.pkl (matches openwebtext_300m staging).
+    rng = np.random.default_rng(0)
+    for name, n in (("train.bin", 2000), ("val.bin", 1000)):
+        rng.integers(0, 50304, n, dtype=np.uint16).tofile(tmp_path / name)
+    cfg = _tiny_cfg(tmp_path, dataset="openwebtext_300m", sample_prompts=["The"])
+    from spot_train.train import build_model
+
+    torch.manual_seed(0)
+    model = build_model(cfg, vocab_size=50304)
+    doc = sampling.generate_samples(model, cfg, step=3)
+    assert doc is not None
+    assert doc["samples"][0]["prompt"] == "The"
+    assert isinstance(doc["samples"][0]["completion"], str)
 
 
 def test_snapshot_uri_zero_padded(tmp_path):
