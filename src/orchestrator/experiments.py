@@ -282,7 +282,8 @@ def _run_single_box(
     budget: int,
     ddp: bool = False,
     nproc_per_node: int = 0,
-) -> dict | None:
+    return_profile: bool = False,
+):
     """One box, run to its wall-clock budget, stream the log, collect the run
     profile, then terminate. Shared by `baseline` (1 process) and `ddp` (torchrun,
     N processes) — the only difference is the ddp/torchrun launch."""
@@ -310,7 +311,7 @@ def _run_single_box(
     try:
         if aws.is_dry_run():
             print(f"[{kind}] dry-run: skipping stream/terminate", file=sys.stderr)
-            return None
+            return (profile, None) if return_profile else None
         metrics = _stream_until_metrics(cfg, run_id, profile)
         profile.mark("metrics" if metrics is not None else "timeout")
         profile.from_metrics(metrics)
@@ -319,7 +320,7 @@ def _run_single_box(
         print(f"[{kind}] profile: {cfg.run_profile_uri(run_id)}", file=sys.stderr)
         if metrics is not None:
             print(f"\n[{kind}] metrics: {json.dumps(metrics, indent=2)}")
-        return metrics
+        return (profile, metrics) if return_profile else metrics
     finally:
         # Destroy the box when training finishes (also on timeout or Ctrl-C).
         aws.terminate(iid)
@@ -620,34 +621,39 @@ def run_multinode_preempt(cfg: OrchestratorConfig) -> dict | None:
 
 
 # --------------------------------------------------------------------------- #
-# Overfit scaling experiment: does adding nodes reduce time-to-overfit?
+# Scaling experiment: does adding nodes reduce time-to-target-loss?
 # --------------------------------------------------------------------------- #
-def _analyze_overfit(profile: RunProfile) -> dict:
-    """Find the overfit point rigorously — the step of MINIMUM validation loss
-    (overfitting = val loss bottoms out then rises while train loss keeps
-    falling), and the wall-clock time to reach it FROM the first training step
-    (so the ~constant boot is excluded, but preemption downtime/re-compute is
-    included). ``reached`` is False if the run didn't clearly turn up (a real
-    interior minimum) — then the comparison is inconclusive, not a bogus argmin
-    at the last step."""
+def _analyze_target(profile: RunProfile, target: float) -> dict:
+    """Wall-clock to first reach val_loss <= target, measured FROM the first
+    training step (so the ~constant boot is excluded, but preemption downtime /
+    re-compute IS included). ``reached`` is False if the run never hit the target
+    within its budget — then that hypothesis is inconclusive, not a fake number.
+    steps_to_target should ~match across node counts (constant global batch), which
+    validates the throughput-only comparison."""
     vals = sorted(profile.val_samples, key=lambda v: v.step)
     steps = sorted(profile.samples, key=lambda s: s.t_rel)
-    if len(vals) < 3 or not steps:
-        return {"reached": False, "why": "too few eval / step samples"}
+    if not vals or not steps:
+        return {"reached": False, "why": "no eval / step samples", "target": target}
+    first_train = steps[0].t_rel
     best = min(vals, key=lambda v: v.loss)
-    last = vals[-1]
-    reached = best.step < last.step and last.loss > best.loss + 1e-3  # a rise after the min
-
-    first_train = steps[0].t_rel  # wall of the first training step (seconds since launch)
-    overfit_wall = next((s.t_rel for s in steps if s.step >= best.step), steps[-1].t_rel)
+    hit = next((v for v in vals if v.loss <= target), None)
+    if hit is None:
+        return {
+            "reached": False,
+            "target": target,
+            "best_val": round(best.loss, 4),
+            "last_step": vals[-1].step,
+            "total_train_s": round(steps[-1].t_rel - first_train, 1),
+            "why": f"target {target} not reached (best val {best.loss:.4f})",
+        }
+    hit_wall = next((s.t_rel for s in steps if s.step >= hit.step), steps[-1].t_rel)
     return {
-        "reached": reached,
-        "overfit_step": best.step,
-        "best_val": round(best.loss, 4),
-        "final_val": round(last.loss, 4),
-        "last_step": last.step,
-        "steps_to_overfit": best.step,  # ~equal across node counts validates the control
-        "time_to_overfit_s": round(overfit_wall - first_train, 1),
+        "reached": True,
+        "target": target,
+        "target_step": hit.step,
+        "hit_val": round(hit.loss, 4),
+        "steps_to_target": hit.step,
+        "time_to_target_s": round(hit_wall - first_train, 1),
         "total_train_s": round(steps[-1].t_rel - first_train, 1),
     }
 
@@ -679,8 +685,8 @@ def _render_run_timeline(cfg: OrchestratorConfig, run_id: str, out_dir: str) -> 
 
 
 def _val_curve_png(profile: RunProfile, analysis: dict, path: str) -> str | None:
-    """Val-loss (and train-loss) vs step with the overfit point marked — makes
-    the 'done' call auditable."""
+    """Val-loss (and train-loss) vs step with the target line + the step it was
+    first crossed — makes the time-to-target call auditable."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -694,41 +700,41 @@ def _val_curve_png(profile: RunProfile, analysis: dict, path: str) -> str | None
     if tr:
         ax.plot([s.step for s in tr], [s.loss for s in tr], color="#BAB0AC", lw=1, label="train")
     ax.plot([v.step for v in vals], [v.loss for v in vals], color="#4C78A8", lw=2, label="val")
-    if analysis.get("overfit_step") is not None:
-        ax.axvline(analysis["overfit_step"], ls="--", color="#E45756", lw=1)
+    if analysis.get("target") is not None:
+        ax.axhline(
+            analysis["target"], ls=":", color="#E45756", lw=1, label=f"target {analysis['target']}"
+        )
+    if analysis.get("reached"):
+        ax.axvline(analysis["target_step"], ls="--", color="#59A14F", lw=1)
         ax.plot(
-            [analysis["overfit_step"]],
-            [analysis["best_val"]],
+            [analysis["target_step"]],
+            [analysis["hit_val"]],
             marker="*",
             color="#F2C800",
             ms=16,
             mec="#7a6000",
-            label=f"overfit (val {analysis['best_val']})",
+            label=f"hit target @ step {analysis['target_step']}",
         )
     ax.set_xlabel("step")
     ax.set_ylabel("loss")
-    ax.set_title(f"{profile.run_id} — val-loss overfit point")
+    ax.set_title(f"{profile.run_id} — time to target loss")
     ax.legend(fontsize=8)
     fig.savefig(path, bbox_inches="tight", dpi=120)
     plt.close(fig)
     return os.path.abspath(path)
 
 
-def _write_overfit_report(path: str, results: list[dict], recipe: dict) -> None:
+def _write_scaling_report(path: str, results: list[dict], recipe: dict) -> None:
     """The human summary: recipe, per-run table, and the H1/H2 verdicts."""
 
     def t(label: str) -> float | None:
         r = next((x for x in results if x["label"] == label), None)
-        return (
-            r["analysis"].get("time_to_overfit_s") if r and r["analysis"].get("reached") else None
-        )
+        return r["analysis"].get("time_to_target_s") if r and r["analysis"].get("reached") else None
 
     def verdict(name: str, faster: str, slower: str, claim: str) -> str:
         a, b = t(faster), t(slower)
         if a is None or b is None:
-            return (
-                f"{name}: INCONCLUSIVE — a run did not clearly overfit ({faster}={a}, {slower}={b})"
-            )
+            return f"{name}: INCONCLUSIVE — a run did not reach target ({faster}={a}, {slower}={b})"
         ok = a < b
         ratio = b / a if a else float("inf")
         return (
@@ -738,24 +744,25 @@ def _write_overfit_report(path: str, results: list[dict], recipe: dict) -> None:
         )
 
     lines = [
-        f"Overfit scaling experiment — {recipe['stamp']}",
+        f"Scaling experiment (time to target loss) — {recipe['stamp']}",
         "=" * 72,
         "",
-        "Hypotheses (time-to-overfit = wall-clock from first training step to the",
-        "step of MINIMUM validation loss; overfit = val loss bottoms out then rises):",
-        "  H1: time_to_overfit(4 nodes) < time_to_overfit(2 nodes), no preemptions",
+        f"target val_loss <= {recipe['target']}. time-to-target = wall-clock from the",
+        "first training step to the first eval at or below target (boot excluded;",
+        "preemption downtime/re-compute included).",
+        "  H1: time_to_target(4 nodes) < time_to_target(2 nodes), no preemptions",
         "  H2: same, WITH preemptions",
         "",
         "Controls: identical model/data/seed, CONSTANT global batch "
         f"(GLOBAL_BATCH_SIZE={recipe['global_batch']}) so 2- and 4-node follow the",
         "same trajectory vs step -> the comparison isolates throughput. Sequential",
-        f"runs on {recipe['market']}. MAX_STEPS={recipe['max_steps']}, "
-        f"EVAL_INTERVAL_STEPS={recipe['eval_interval']}, DROPOUT={recipe['dropout']}.",
+        f"runs on {recipe['market']}, model {recipe['model']}, dataset {recipe['dataset']},",
+        f"EVAL_INTERVAL_STEPS={recipe['eval_interval']}, per-run cap {recipe['cap_s']}s.",
         f"Preemptions: 2 worker kills at t+{recipe['offsets']}s after train start.",
         "",
         "VERDICTS",
         "-" * 72,
-        verdict("H1 (clean)", "4n-clean", "2n-clean", "more nodes overfit faster"),
+        verdict("H1 (clean)", "4n-clean", "2n-clean", "more nodes reach target faster"),
         "",
         verdict("H2 (preempt)", "4n-preempt", "2n-preempt", "more nodes win despite preemption"),
         "",
@@ -766,15 +773,14 @@ def _write_overfit_report(path: str, results: list[dict], recipe: dict) -> None:
         a = r["analysis"]
         if a.get("reached"):
             detail = (
-                f"  step {a['overfit_step']}  best_val {a['best_val']}  "
-                f"time_to_overfit {a['time_to_overfit_s']}s  "
-                f"(total train {a['total_train_s']}s)"
+                f"  step {a['target_step']}  hit_val {a['hit_val']}  "
+                f"time_to_target {a['time_to_target_s']}s  (total train {a['total_train_s']}s)"
             )
         else:
-            detail = f"  ({a.get('why', 'val did not turn up — raise MAX_STEPS')})"
+            detail = f"  ({a.get('why', 'target not reached — raise cap or target')})"
         lines += [
             f"[{r['label']}]  run_id={r['run_id']}  nodes={r['nodes']}  preempt={r['preempt']}",
-            f"    overfit: {'YES' if a.get('reached') else 'NOT REACHED'}{detail}",
+            f"    target: {'HIT' if a.get('reached') else 'NOT REACHED'}{detail}",
             f"    cost: ${r['cost']}    wandb: {r['wandb'] or '(disabled)'}",
             f"    gantt: {r['png']}    events: {r['events']}    valcurve: {r['valcurve']}",
             "",
@@ -783,43 +789,61 @@ def _write_overfit_report(path: str, results: list[dict], recipe: dict) -> None:
         f.write("\n".join(lines) + "\n")
 
 
-def run_overfit_experiment(cfg: OrchestratorConfig) -> list[dict]:
-    """ONE command: 2- vs 4-node time-to-overfit, clean and preempted, on spot.
-    Runs the four configs sequentially, determines each run's overfit point from
-    its validation-loss curve, and compiles reports/overfit-experiment-<ts>/ with
-    per-run Gantt + events + val-curve and the H1/H2 verdicts."""
+def run_scaling_experiment(cfg: OrchestratorConfig) -> list[dict]:
+    """ONE command: 2- vs 4-node TIME-TO-TARGET-LOSS, clean and preempted, on spot.
+    Runs the four configs sequentially (each stops at val_loss <= TARGET_LOSS or a
+    wall-clock cap), and compiles reports/scaling-experiment-<ts>/ with per-run
+    Gantt + events + val-curve and the H1/H2 verdicts. Requires TARGET_LOSS (run
+    `calibrate` first to size it)."""
+    target = float(os.environ.get("TARGET_LOSS", "0") or "0")
+    if target <= 0:
+        raise SystemExit(
+            "TARGET_LOSS is required — run `spot-orchestrate calibrate` to size it, "
+            "then re-run with TARGET_LOSS=<val>."
+        )
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    # --- fixed recipe (env-overridable) — constant global batch is the control ---
-    recipe = {
-        "max_steps": os.environ.setdefault("MAX_STEPS", "5000"),
-        "global_batch": os.environ.setdefault("GLOBAL_BATCH_SIZE", "64"),
-        "eval_interval": os.environ.setdefault("EVAL_INTERVAL_STEPS", "100"),
-        "dropout": os.environ.setdefault("DROPOUT", "0.0"),  # overfit clearly: measure the point
-        "market": "spot",
-        "stamp": stamp,
-    }
+    # --- recipe (env-overridable) — constant global batch is the control ------
+    os.environ["TARGET_LOSS"] = str(target)  # relayed to the boxes for the early stop
     for k, v in {
-        "LEARNING_RATE": "1e-3",
-        "LR_DECAY_STEPS": "5000",
-        "MIN_LR": "1e-4",
+        "N_LAYER": "12",
+        "N_HEAD": "12",
+        "N_EMBD": "768",
+        "BLOCK_SIZE": "1024",  # GPT-2-small
+        "GLOBAL_BATCH_SIZE": "64",
+        "EVAL_INTERVAL_STEPS": "50",
+        "DROPOUT": "0.0",
+        "LEARNING_RATE": "6e-4",
+        "MIN_LR": "6e-5",
         "WARMUP_STEPS": "100",
+        "LR_DECAY_STEPS": "50000",
         "GRAD_CLIP": "1.0",
         "SAMPLE_INTERVAL_STEPS": "0",
+        "MAX_STEPS": "1000000",  # the wall-clock cap (below) is the real stop
     }.items():
         os.environ.setdefault(k, v)
-    os.environ.setdefault("WANDB_GROUP", f"overfit-experiment-{stamp}")
+    os.environ.setdefault("WANDB_GROUP", f"scaling-experiment-{stamp}")
     cfg.spot_market = "spot"
-    cfg.batch_size = int(os.environ.get("BATCH_SIZE", "16"))  # per-rank micro; global stays 64
-    budget = int(os.environ.get("OVERFIT_BUDGET", "3600"))  # generous: MAX_STEPS is the stop
-    offsets = [float(x) for x in os.environ.get("PREEMPT_OFFSETS", "60,150").split(",")]
-    recipe["offsets"] = ",".join(str(int(o)) for o in offsets)
+    cfg.batch_size = int(os.environ.get("BATCH_SIZE", "4"))  # per-rank micro; global stays constant
+    cap_s = int(os.environ.get("SCALING_CAP_SECONDS", "1800"))  # 30-min per-run wall-clock cap
+    offsets = [float(x) for x in os.environ.get("PREEMPT_OFFSETS", "600,1200").split(",")]
+    recipe = {
+        "stamp": stamp,
+        "target": target,
+        "market": "spot",
+        "model": f"{os.environ['N_LAYER']}L-{os.environ['N_EMBD']}d-{os.environ['BLOCK_SIZE']}ctx",
+        "dataset": cfg.dataset,
+        "global_batch": os.environ["GLOBAL_BATCH_SIZE"],
+        "eval_interval": os.environ["EVAL_INTERVAL_STEPS"],
+        "cap_s": cap_s,
+        "offsets": ",".join(str(int(o)) for o in offsets),
+    }
 
-    out_dir = os.path.abspath(f"reports/overfit-experiment-{stamp}")
+    out_dir = os.path.abspath(f"reports/scaling-experiment-{stamp}")
     os.makedirs(f"{out_dir}/runs", exist_ok=True)
     print(
-        "\n\033[1m⚠️  BILLABLE: this launches four SEQUENTIAL spot runs "
-        "(2x2-node + 2x4-node). Peak 16 vCPUs.\033[0m\n"
-        f"[overfit-experiment] recipe: {recipe}\n[overfit-experiment] report dir: {out_dir}",
+        "\n\033[1m⚠️  BILLABLE: four SEQUENTIAL spot runs (2x2-node + 2x4-node), "
+        "peak 16 vCPUs, ~15-30 min each.\033[0m\n"
+        f"[scaling-experiment] recipe: {recipe}\n[scaling-experiment] report dir: {out_dir}",
         file=sys.stderr,
     )
 
@@ -833,19 +857,19 @@ def run_overfit_experiment(cfg: OrchestratorConfig) -> list[dict]:
     for label, nodes, kills in plan:
         cfg.node_count = nodes
         print(
-            f"\n[overfit-experiment] === {label} (nodes={nodes}, kills={kills}) ===",
+            f"\n[scaling-experiment] === {label} (nodes={nodes}, kills={kills}) ===",
             file=sys.stderr,
         )
         try:
             profile, _metrics = _run_supervised(
                 cfg,
                 kind="multinode-preempt" if kills else "multinode",
-                budget=budget,
+                budget=cap_s,
                 replace_on_loss=bool(kills),
                 kill_schedule=kills,
                 return_profile=True,
             )
-            analysis = _analyze_overfit(profile)
+            analysis = _analyze_target(profile, target)
             art = _render_run_timeline(cfg, profile.run_id, f"{out_dir}/runs")
             valcurve = _val_curve_png(
                 profile, analysis, f"{out_dir}/runs/{profile.run_id}-valcurve.png"
@@ -865,9 +889,7 @@ def run_overfit_experiment(cfg: OrchestratorConfig) -> list[dict]:
                 }
             )
         except Exception as exc:  # noqa: BLE001 — one bad run must not sink the suite
-            # _run_supervised terminates its own instances in a finally, so nothing
-            # leaks. Record the failure and press on to the next config.
-            print(f"[overfit-experiment] {label} FAILED: {exc}", file=sys.stderr)
+            print(f"[scaling-experiment] {label} FAILED: {exc}", file=sys.stderr)
             results.append(
                 {
                     "label": label,
@@ -882,15 +904,123 @@ def run_overfit_experiment(cfg: OrchestratorConfig) -> list[dict]:
                     "valcurve": None,
                 }
             )
-        # Rewrite the summary after EVERY run so partial results (and completed
-        # per-run artifacts) survive even if a later run is preempted or crashes.
-        _write_overfit_report(f"{out_dir}/summary.txt", results, recipe)
-        print(f"[overfit-experiment] {label} done → {out_dir}/summary.txt", file=sys.stderr)
+        _write_scaling_report(f"{out_dir}/summary.txt", results, recipe)
+        print(f"[scaling-experiment] {label} done → {out_dir}/summary.txt", file=sys.stderr)
 
-    print(f"\n\033[1m[overfit-experiment] DONE → {out_dir}/summary.txt\033[0m", file=sys.stderr)
+    print(f"\n\033[1m[scaling-experiment] DONE → {out_dir}/summary.txt\033[0m", file=sys.stderr)
     with open(f"{out_dir}/summary.txt") as f:
         print(f.read())
     return results
+
+
+def _calibration_sizing(profile: RunProfile, cap_s: int, global_batch: int, block: int) -> dict:
+    """Turn a single-GPU probe profile into experiment sizing: measured 1-GPU
+    throughput, projected steps for 2-/4-node at the cap (per-step scales ~world
+    size at constant global batch, with a comms haircut), and a suggested
+    TARGET_LOSS extrapolated to land mid-run. Rough — labelled as such."""
+    steps = sorted(profile.samples, key=lambda s: s.step)
+    vals = sorted(profile.val_samples, key=lambda v: v.step)
+    if len(steps) < 3:
+        return {"ok": False, "why": "too few step samples — probe too short / didn't train"}
+    mids = sorted(s.ms_per_step for s in steps)[len(steps) // 4 : -max(1, len(steps) // 4) or None]
+    ms = (sum(mids) / len(mids)) if mids else steps[-1].ms_per_step
+    steps_s_1gpu = 1000.0 / ms if ms else 0.0
+    tok_s_1gpu = sum(s.tok_s for s in steps) / len(steps)
+    haircut = 0.85  # comms/imbalance vs perfect weak scaling
+    proj = {n: int(steps_s_1gpu * n * haircut * cap_s) for n in (1, 2, 4)}
+
+    suggest = None
+    if len(vals) >= 3:
+        # Fit val_loss ~ a + b*ln(step); extrapolate to ~half the 2-node cap run
+        # (a loss that lands mid-run, hit by both 2- and 4-node within the cap).
+        import math as _m
+
+        xs = [_m.log(max(1, v.step)) for v in vals]
+        ys = [v.loss for v in vals]
+        n = len(xs)
+        mx, my = sum(xs) / n, sum(ys) / n
+        denom = sum((x - mx) ** 2 for x in xs) or 1.0
+        b = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=False)) / denom
+        a = my - b * mx
+        target_step = max(vals[-1].step * 2, proj[2] // 2)
+        suggest = round(a + b * _m.log(max(1, target_step)), 2)
+    return {
+        "ok": True,
+        "ms_per_step_1gpu": round(ms, 1),
+        "steps_per_s_1gpu": round(steps_s_1gpu, 2),
+        "tok_per_s_1gpu": int(tok_s_1gpu),
+        "proj_steps_at_cap": proj,  # {1,2,4}-GPU-equiv step counts in cap_s
+        "probe_last_val": round(vals[-1].loss, 4) if vals else None,
+        "suggested_target_loss": suggest,
+        "cap_s": cap_s,
+    }
+
+
+def run_calibrate(cfg: OrchestratorConfig) -> dict:
+    """A cheap single-node GPT-2-small probe to SIZE the scaling experiment: run
+    on one on-demand box for CALIBRATE_SECONDS, then report measured throughput,
+    projected 2-/4-node step counts at the per-run cap, and a suggested
+    TARGET_LOSS. You then re-run the experiment with TARGET_LOSS set."""
+    for k, v in {  # match the scaling experiment's model + batch for accurate throughput
+        "N_LAYER": "12",
+        "N_HEAD": "12",
+        "N_EMBD": "768",
+        "BLOCK_SIZE": "1024",
+        "GLOBAL_BATCH_SIZE": "64",
+        "EVAL_INTERVAL_STEPS": "25",
+        "DROPOUT": "0.0",
+        "LEARNING_RATE": "6e-4",
+        "WARMUP_STEPS": "100",
+        "SAMPLE_INTERVAL_STEPS": "0",
+        "MAX_STEPS": "1000000",
+    }.items():
+        os.environ.setdefault(k, v)
+    cfg.batch_size = int(os.environ.get("BATCH_SIZE", "4"))
+    probe_s = int(os.environ.get("CALIBRATE_SECONDS", "300"))
+    cap_s = int(os.environ.get("SCALING_CAP_SECONDS", "1800"))
+    global_batch = int(os.environ["GLOBAL_BATCH_SIZE"])
+    block = int(os.environ["BLOCK_SIZE"])
+    print(
+        "\n\033[1m⚠️  BILLABLE: one on-demand box, ~"
+        f"{probe_s // 60}-{probe_s // 60 + 3} min (boot + probe).\033[0m",
+        file=sys.stderr,
+    )
+    profile, _metrics = _run_single_box(
+        cfg, kind="calibrate", market="on-demand", budget=probe_s, return_profile=True
+    )
+    sizing = _calibration_sizing(profile, cap_s, global_batch, block)
+    out_dir = os.path.abspath(f"reports/calibrate-{time.strftime('%Y%m%d-%H%M%S')}")
+    os.makedirs(out_dir, exist_ok=True)
+    if sizing.get("ok"):
+        p = sizing["proj_steps_at_cap"]
+        last_val_step = (
+            max(v.step for v in profile.val_samples) if profile.val_samples else "?"
+        )
+        lines = [
+            f"Calibration probe — {profile.run_id}  (GPT-2-small, block {block}, "
+            f"global batch {global_batch})",
+            f"  measured 1-GPU: {sizing['steps_per_s_1gpu']} steps/s "
+            f"({sizing['ms_per_step_1gpu']} ms/step, {sizing['tok_per_s_1gpu']} tok/s)",
+            f"  projected steps in the {cap_s}s cap:  2-node ~{p[2]}   4-node ~{p[4]}  "
+            f"(~world-size scaling, 0.85 haircut)",
+            f"  probe reached val_loss ~{sizing['probe_last_val']} by step {last_val_step}",
+            "",
+            f"  SUGGESTED TARGET_LOSS = {sizing['suggested_target_loss']}   "
+            "(rough log-extrapolation to ~half the 2-node run; adjust from the curve)",
+            "",
+            f"  Next:  TARGET_LOSS={sizing['suggested_target_loss']} "
+            "spot-orchestrate scaling-experiment",
+        ]
+    else:
+        lines = [f"Calibration FAILED: {sizing.get('why')}"]
+    report = "\n".join(lines)
+    with open(f"{out_dir}/calibration.txt", "w") as f:
+        f.write(report + "\n")
+    _val_curve_png(profile, {"target": None}, f"{out_dir}/{profile.run_id}-losscurve.png")
+    print(
+        f"\n\033[1m{report}\033[0m\n[calibrate] report: {out_dir}/calibration.txt", file=sys.stderr
+    )
+    return sizing
 
 
 def _shrink_verdict(cfg, run_id, profile, sup, metrics) -> None:

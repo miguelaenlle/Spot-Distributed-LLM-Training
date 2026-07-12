@@ -17,7 +17,10 @@ checkpoints/
 *.ckpt
 *.pt
 *.pth
-data/
+# Dataset bins are huge + regenerable — ignore them, but KEEP our prep scripts
+# (data/<dataset>/prepare.py) tracked so `stage-data` can build the corpus.
+data/**/*.bin
+data/**/*.pkl
 datasets/
 out/
 wandb/

@@ -382,6 +382,12 @@ def train(cfg: TrainConfig) -> dict:
             vloss = eval_full(raw_model, loader)
             if ddp.master:
                 print(f"eval step {step}: val_loss {vloss:.4f}", file=sys.stderr, flush=True)
+            # Target-loss early stop: the full val pass is deterministic and
+            # identical on every rank, so this fires consistently group-wide and
+            # rides the coordinated stop at the bottom of the loop. (Only informs
+            # the stop; the actual break is the balanced all_reduce_stop below.)
+            if cfg.target_loss and vloss <= cfg.target_loss:
+                reason = "target_reached"
         if cfg.sample_interval_steps and step % cfg.sample_interval_steps == 0:
             doc = sampling.generate_samples(
                 raw_model,

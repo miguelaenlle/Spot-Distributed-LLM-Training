@@ -127,6 +127,10 @@ class TrainConfig:
     # Every N steps, run the deterministic FULL pass over val.bin and print a
     # parseable `eval step S: val_loss X` line. 0 = off (default).
     eval_interval_steps: int = 0
+    # Early-stop target: stop the run the first time a periodic eval reaches
+    # val_loss <= this (reason="target_reached"). 0 = off. Requires
+    # eval_interval_steps > 0. Used by the scaling experiment (time-to-target).
+    target_loss: float = 0.0
 
     # --- text sampling ---------------------------------------------------------
     # Prompts sampled at the end of a graceful run (and, if sample_interval_steps
@@ -170,6 +174,11 @@ class TrainConfig:
         safe to call locally.
         """
         return cls(
+            n_layer=_env_int("N_LAYER", 6),
+            n_head=_env_int("N_HEAD", 6),
+            n_embd=_env_int("N_EMBD", 384),
+            block_size=_env_int("BLOCK_SIZE", 256),
+            target_loss=_env_float("TARGET_LOSS", 0.0),
             max_steps=_env_int("MAX_STEPS", 100_000),
             learning_rate=_env_float("LEARNING_RATE", 6e-4),
             weight_decay=_env_float("WEIGHT_DECAY", 1e-1),

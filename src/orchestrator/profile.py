@@ -439,6 +439,14 @@ class RunProfile:
                 "instance_type": cfg.instance_type,
             },
         )
+        # Chart against the REAL training step. We log with a monotonic internal
+        # step (self._wb_step) so a spot step-number reset never makes W&B's
+        # implicit step go backwards — but that counter advances once per logged
+        # line (every LOG_INTERVAL_STEPS steps), which made the x-axis read
+        # step/10. define_metric points every chart's x-axis at the logged
+        # `train_step` instead, so it reads in true training steps.
+        self._wb.define_metric("train_step")
+        self._wb.define_metric("*", step_metric="train_step")
 
     def _wb_config_cost(self) -> None:
         """Mirror the newest box's rate into the run config (Overview panel)."""

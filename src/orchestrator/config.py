@@ -31,6 +31,11 @@ def _env_float(name: str, default: float) -> float:
 # orchestrator never branches on these values, so they stay untyped strings —
 # TrainConfig.from_env parses them on the box.
 _TRAINER_PASSTHROUGH = (
+    "N_LAYER",
+    "N_HEAD",
+    "N_EMBD",
+    "BLOCK_SIZE",
+    "TARGET_LOSS",
     "MAX_STEPS",
     "GLOBAL_BATCH_SIZE",
     "LEARNING_RATE",
