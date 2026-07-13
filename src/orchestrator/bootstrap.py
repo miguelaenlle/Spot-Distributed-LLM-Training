@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 
 from .config import OrchestratorConfig
 
@@ -430,6 +431,16 @@ def build_user_data(
         # Short collective timeout so survivors of a node kill abort fast (see
         # distributed.init) — the in-band backstop to the supervisor's epoch bump.
         env["NCCL_TIMEOUT"] = str(cfg.nccl_timeout_seconds)
+        # NCCL network hygiene (why 4-node hung where 2-node worked): with no
+        # interface pinned, NCCL auto-selects one — and the DLAMI ships Docker, so
+        # every box has a docker0 on the SAME non-routable 172.17.0.0/16. NCCL can
+        # advertise those addresses; inter-node connects then hang (worse the more
+        # nodes) and the first collective never completes -> NCCL_TIMEOUT abort.
+        # Exclude docker0/lo so NCCL uses the real VPC ENI; disable IB (none on
+        # g4dn/g5); WARN-level debug so any remaining net issue is IN the log.
+        env["NCCL_SOCKET_IFNAME"] = os.environ.get("NCCL_SOCKET_IFNAME", "^docker0,lo")
+        env["NCCL_IB_DISABLE"] = os.environ.get("NCCL_IB_DISABLE", "1")
+        env["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "WARN")
         # Skip torch's post-timeout debug-info dump: it added ~2 minutes to every
         # peer-death crash (observed 18:26:51 -> 18:29:10), delaying the relaunch.
         env["TORCH_NCCL_DUMP_ON_TIMEOUT"] = "0"

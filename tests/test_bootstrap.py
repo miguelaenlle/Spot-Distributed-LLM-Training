@@ -140,6 +140,11 @@ def test_multinode_budget_env_and_done_signal():
         # NCCL crash is the in-band backstop to the supervisor's epoch bump.
         assert 'export NCCL_TIMEOUT="20"' in ud
         assert 'export TORCH_NCCL_DUMP_ON_TIMEOUT="0"' in ud
+        # NCCL net hygiene: pin off docker0/lo (else 4-node hangs on the first
+        # collective), disable IB (none on g4dn/g5), WARN debug in the log.
+        assert 'export NCCL_SOCKET_IFNAME="^docker0,lo"' in ud
+        assert 'export NCCL_IB_DISABLE="1"' in ud
+        assert 'export NCCL_DEBUG="WARN"' in ud
         # The old generation/budget.json rendezvous protocol is gone.
         for marker in ("budget.json", "remaining_seconds", "GEN", "ready/"):
             assert marker not in ud, f"{marker!r} survived the epoch rewrite"
