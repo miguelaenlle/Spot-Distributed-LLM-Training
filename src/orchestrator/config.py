@@ -91,6 +91,14 @@ class OrchestratorConfig:
     # --- AWS placement -------------------------------------------------------
     region: str = field(default_factory=lambda: _env("AWS_REGION", "us-east-1"))
     instance_type: str = field(default_factory=lambda: _env("INSTANCE_TYPE", "g4dn.xlarge"))
+    # Dead-man's switch: seconds after boot a training box self-terminates even if
+    # the orchestrator never sends TerminateInstances (laptop crash, network drop,
+    # kill -9). 0 = off. The box OS-poweroffs and InstanceInitiatedShutdownBehavior
+    # (=terminate) turns that into a real termination, so billing stops. A normal
+    # run ends far sooner, so this only ever catches orphans.
+    max_instance_lifetime_seconds: int = field(
+        default_factory=lambda: _env_int("MAX_INSTANCE_LIFETIME_SECONDS", 0)
+    )
     # Deep Learning AMI. If AMI_ID is set we use it verbatim; otherwise we resolve
     # the newest Amazon-owned image matching this name filter via DescribeImages.
     # Default targets the PyTorch DLAMI (Ubuntu 22.04) so CUDA + PyTorch are

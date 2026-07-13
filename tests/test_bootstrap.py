@@ -158,6 +158,31 @@ def test_nproc_per_node_forwarded_to_sidecar():
     assert 'export NPROC_PER_NODE="2"' in ud
 
 
+def test_autokill_scheduled_when_lifetime_set():
+    cfg = OrchestratorConfig(bucket="test-bucket", max_instance_lifetime_seconds=7200)
+    ud = bootstrap.build_user_data(cfg, run_id="run-1", market="spot", max_seconds=120)
+    assert "systemd-run --on-active=7200s --unit=spot-autokill /usr/bin/systemctl poweroff" in ud
+    assert "shutdown -h +120" in ud  # ceil(7200/60) fallback if systemd-run is absent
+    # Scheduled as root, BEFORE dropping to the ubuntu training block.
+    assert ud.index("spot-autokill") < ud.index("sudo -u ubuntu")
+
+
+def test_no_autokill_by_default():
+    cfg = OrchestratorConfig(bucket="test-bucket", max_instance_lifetime_seconds=0)
+    ud = bootstrap.build_user_data(cfg, run_id="run-1", market="on-demand", max_seconds=120)
+    assert "autokill" not in ud
+
+
+def test_autokill_script_still_parses(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash not available")
+    cfg = OrchestratorConfig(bucket="test-bucket", max_instance_lifetime_seconds=90)
+    p = tmp_path / "autokill.sh"
+    p.write_text(bootstrap.build_user_data(cfg, run_id="run-1", market="spot", max_seconds=120))
+    r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
 def test_config_epoch_keys():
     cfg = _cfg()
     assert cfg.run_epoch_key("run-1") == "runs/run-1/epoch.json"

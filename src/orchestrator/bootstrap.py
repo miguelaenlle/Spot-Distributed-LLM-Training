@@ -478,11 +478,25 @@ def build_user_data(
         )
     else:
         run_cmd = '"$VENV_PY" -u -m spot_train.train'
+    # Dead-man's switch (runs as root, at boot): a systemd timer that OS-poweroffs
+    # the box after max_instance_lifetime_seconds no matter what — the timer is
+    # systemd-owned, so it survives the boot script exiting and a dead orchestrator.
+    # poweroff + InstanceInitiatedShutdownBehavior=terminate => the instance
+    # terminates (billing stops). Falls back to `shutdown` if systemd-run is absent.
+    autokill = ""
+    if cfg.max_instance_lifetime_seconds > 0:
+        n = cfg.max_instance_lifetime_seconds
+        mins = max(1, -(-n // 60))  # ceil(n/60) for the shutdown fallback (minutes)
+        autokill = (
+            f'echo "[autokill] self-terminate scheduled in {n}s (dead-man switch)"\n'
+            f"systemd-run --on-active={n}s --unit=spot-autokill /usr/bin/systemctl poweroff "
+            f'|| shutdown -h +{mins} "spot-train autokill" || true'
+        )
     return f"""#!/bin/bash
 set -x
 exec > /var/log/spot-train-boot.log 2>&1
 chmod 644 /var/log/spot-train-boot.log   # let the ubuntu log-uploader read it
-
+{autokill}
 sudo -u ubuntu -i bash <<'BOOT'
 set -x
 cd /home/ubuntu
