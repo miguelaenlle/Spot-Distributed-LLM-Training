@@ -833,7 +833,7 @@ def _write_scaling_clean_report(path: str, results: list[dict], recipe: dict) ->
         "same loss-vs-step curve and the comparison isolates throughput. Sequential",
         f"{recipe['market']} runs on {recipe['instance']}, model {recipe['model']},",
         f"dataset {recipe['dataset']}, eval every {recipe['eval_interval']} steps, "
-        f"per-run cap {recipe['cap_s']}s.",
+        f"per-run cap {recipe['cap_s']}s, checkpoint every {recipe.get('ckpt_interval_s', '?')}s.",
         "",
         f"SPEEDUP vs {base_n} node(s)",
         "-" * 72,
@@ -1017,6 +1017,14 @@ def run_scaling_experiment(cfg: OrchestratorConfig) -> list[dict]:
     return results
 
 
+def _clean_ckpt_interval(cap_s: int) -> int:
+    """Checkpoint interval for a CLEAN run: no preemption, so dense checkpoints
+    only add the ~seconds 124M-snapshot stall to the timeline for nothing. Aim
+    for ~6 checkpoints per run (so the total stall is ~1% of runtime) while still
+    bounding worst-case lost work if a spot reclaim DOES land — floor 120s."""
+    return max(120, cap_s // 6)
+
+
 def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
     """ONE command: 1- vs 2- vs 4-node TIME-TO-TARGET-LOSS, CLEAN (no preemption).
 
@@ -1070,6 +1078,10 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
     market = os.environ.get("MARKET", "spot")  # spot by default (OD quota is tight)
     cfg.batch_size = int(os.environ.get("BATCH_SIZE", "4"))  # per-rank micro; global constant
     cap_s = int(os.environ.get("SCALING_CAP_SECONDS", "480"))  # 8-min per-run cap
+    # Sparse checkpoints for clean runs so the 124M snapshot stall stays ~1% of
+    # runtime (it's excluded from the reported ms/step too). Operator can pin one.
+    if "CHECKPOINT_INTERVAL_SECONDS" not in os.environ:
+        cfg.checkpoint_interval_seconds = _clean_ckpt_interval(cap_s)
 
     recipe = {
         "stamp": stamp,
@@ -1081,6 +1093,7 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
         "global_batch": os.environ["GLOBAL_BATCH_SIZE"],
         "eval_interval": os.environ["EVAL_INTERVAL_STEPS"],
         "cap_s": cap_s,
+        "ckpt_interval_s": cfg.checkpoint_interval_seconds,
         "node_counts": ",".join(map(str, node_counts)),
     }
     out_dir = os.path.abspath(f"reports/scaling-clean-{stamp}")

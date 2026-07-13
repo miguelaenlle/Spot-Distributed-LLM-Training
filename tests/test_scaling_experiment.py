@@ -125,8 +125,17 @@ _CLEAN_RECIPE = {
     "global_batch": "64",
     "eval_interval": "25",
     "cap_s": 480,
+    "ckpt_interval_s": 120,
     "node_counts": "1,2,4",
 }
+
+
+def test_clean_ckpt_interval_sizes_to_a_few_per_run():
+    # ~6 checkpoints per run, floored at 120s — sparse enough that the 124M
+    # snapshot stall is ~1% of runtime.
+    assert experiments._clean_ckpt_interval(480) == 120  # floor
+    assert experiments._clean_ckpt_interval(1800) == 300  # 1800/6
+    assert experiments._clean_ckpt_interval(3600) == 600
 
 
 def test_scaling_clean_report_speedup_and_efficiency(tmp_path):
