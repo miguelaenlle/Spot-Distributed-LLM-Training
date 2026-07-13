@@ -441,6 +441,12 @@ def build_user_data(
         env["NCCL_SOCKET_IFNAME"] = os.environ.get("NCCL_SOCKET_IFNAME", "^docker0,lo")
         env["NCCL_IB_DISABLE"] = os.environ.get("NCCL_IB_DISABLE", "1")
         env["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "WARN")
+        # No EFA on g4dn/g5.xlarge, so the gradient all-reduce rides bare TCP,
+        # whose NCCL defaults (1 thread x 1 socket) leave bandwidth on the table.
+        # Parallelize the socket transport: ~2-4x all-reduce throughput, the
+        # cheapest fix for the comms-bound multi-node step. Operator-overridable.
+        env["NCCL_SOCKET_NTHREADS"] = os.environ.get("NCCL_SOCKET_NTHREADS", "4")
+        env["NCCL_NSOCKS_PERTHREAD"] = os.environ.get("NCCL_NSOCKS_PERTHREAD", "2")
         # Skip torch's post-timeout debug-info dump: it added ~2 minutes to every
         # peer-death crash (observed 18:26:51 -> 18:29:10), delaying the relaunch.
         env["TORCH_NCCL_DUMP_ON_TIMEOUT"] = "0"

@@ -42,6 +42,7 @@ _TRAINER_PASSTHROUGH = (
     "WEIGHT_DECAY",
     "DROPOUT",
     "DTYPE",
+    "DDP_COMM_HOOK",
     "WARMUP_STEPS",
     "LR_DECAY_STEPS",
     "MIN_LR",

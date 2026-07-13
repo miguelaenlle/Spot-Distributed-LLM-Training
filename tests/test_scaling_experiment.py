@@ -89,11 +89,15 @@ def test_report_verdicts_true_false_and_inconclusive(tmp_path):
         assert "H1 (clean): INCONCLUSIVE" in f.read()
 
 
-def _clean_result(label, nodes, t, reached=True, steps=800):
+def _clean_result(label, nodes, t, reached=True, steps=800, ms=None):
     return {
         "label": label,
         "nodes": nodes,
         "run_id": f"{label}-id",
+        "instance": "g5.xlarge",
+        "market": "spot",
+        "ms_per_step": ms if ms is not None else round(2000 / nodes, 1),
+        "tok_per_s": 30000 * nodes,
         "analysis": {
             "reached": reached,
             "target": 5.0,
@@ -141,6 +145,10 @@ def test_scaling_clean_report_speedup_and_efficiency(tmp_path):
     assert "4n: 130.0s   3.08x vs 1n" in body
     assert "scaling efficiency" in body
     assert "run_id=4n-id" in body
+    # per-run hardware + throughput + duration line
+    assert "hardware: 4x g5.xlarge (spot)" in body
+    assert "ms/step: 500.0" in body  # 2000/4
+    assert "run time: 160.0s" in body  # total_train_s = 130 + 30
     # steps_to_target match across runs -> no control warning
     assert "CONTROL CHECK" not in body
 

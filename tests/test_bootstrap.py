@@ -145,6 +145,9 @@ def test_multinode_budget_env_and_done_signal():
         assert 'export NCCL_SOCKET_IFNAME="^docker0,lo"' in ud
         assert 'export NCCL_IB_DISABLE="1"' in ud
         assert 'export NCCL_DEBUG="WARN"' in ud
+        # Parallel TCP sockets: ~2-4x all-reduce bandwidth on the no-EFA path.
+        assert 'export NCCL_SOCKET_NTHREADS="4"' in ud
+        assert 'export NCCL_NSOCKS_PERTHREAD="2"' in ud
         # The old generation/budget.json rendezvous protocol is gone.
         for marker in ("budget.json", "remaining_seconds", "GEN", "ready/"):
             assert marker not in ud, f"{marker!r} survived the epoch rewrite"

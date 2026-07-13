@@ -172,6 +172,12 @@ class TrainConfig:
     # data-parallel, effective batch = world_size*batch_size). "replicate" => all
     # ranks see identical data (bit-exact vs single-process; a plumbing check).
     data_mode: str = "shard"
+    # DDP gradient-communication compression (multi-node comms are bandwidth-bound
+    # on TCP without EFA). "bf16" all-reduces gradients in bfloat16 — half the
+    # bytes, and bf16's fp32-range exponent means no overflow (unlike fp16). "none"
+    # keeps fp32. Only applied under NCCL (CUDA); a no-op on CPU/gloo so the
+    # determinism tests are unchanged. Options: none | bf16 | fp16.
+    ddp_comm_hook: str = "bf16"
 
     @classmethod
     def from_env(cls) -> TrainConfig:
@@ -225,4 +231,5 @@ class TrainConfig:
             market=_env_str("MARKET", "local"),
             device=_env_str("DEVICE", "auto"),
             data_mode=_env_str("DDP_DATA_MODE", "shard"),
+            ddp_comm_hook=_env_str("DDP_COMM_HOOK", "bf16"),
         )

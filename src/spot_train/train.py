@@ -254,6 +254,17 @@ def train(cfg: TrainConfig) -> dict:
         from torch.nn.parallel import DistributedDataParallel as DDP
 
         model = DDP(raw_model, device_ids=[ddp.local_rank] if device_type == "cuda" else None)
+        # Compress the gradient all-reduce (multi-node comms are TCP-bandwidth-
+        # bound without EFA). bf16 halves the bytes at negligible cost — its
+        # fp32-range exponent can't overflow. NCCL only: gloo (CPU tests) has no
+        # bf16 all-reduce, so leave those on fp32 to stay bit-exact.
+        hook_name = cfg.ddp_comm_hook.lower()
+        if device_type == "cuda" and hook_name in ("bf16", "fp16"):
+            from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as _ch
+
+            hook = _ch.bf16_compress_hook if hook_name == "bf16" else _ch.fp16_compress_hook
+            model.register_comm_hook(state=None, hook=hook)
+            log(f"[ddp] gradient all-reduce compressed to {hook_name}")
         if cfg.data_mode == "shard":  # per-rank data stream (overwrites restored RNG)
             # Seeded by (rank, resume step) so a restart never replays the window
             # stream it already consumed, and after an elastic world-size change

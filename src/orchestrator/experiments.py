@@ -660,6 +660,22 @@ def _analyze_target(profile: RunProfile, target: float) -> dict:
     }
 
 
+def _run_throughput(profile: RunProfile) -> dict:
+    """Trimmed-mean ms/step + tok/s for a finished run. Drops the slowest and
+    fastest quartiles so warmup and the periodic checkpoint-snapshot spikes don't
+    skew the steady-state number the summary reports."""
+    ms = sorted(s.ms_per_step for s in profile.samples if s.ms_per_step)
+    tk = [s.tok_s for s in profile.samples if s.tok_s]
+    if not ms:
+        return {"ms_per_step": None, "tok_per_s": None}
+    k = len(ms) // 4  # trim both tails -> robust central value
+    core = ms[k : len(ms) - k] or ms
+    return {
+        "ms_per_step": round(sum(core) / len(core), 1),
+        "tok_per_s": int(sum(tk) / len(tk)) if tk else None,
+    }
+
+
 def _fetch_run_events(cfg: OrchestratorConfig, run_id: str) -> list[dict]:
     """All ``[event]`` records for a finished run, parsed from its S3 logs."""
     from . import logview
@@ -826,14 +842,16 @@ def _write_scaling_clean_report(path: str, results: list[dict], recipe: dict) ->
         lines.append(f"  {base_n}-node did not reach target — no baseline (raise cap or target).")
     else:
         for n in sorted({r["nodes"] for r in results}):
-            tn = ttt(by_nodes(n))
+            r = by_nodes(n)
+            tn = ttt(r)
+            ms = r.get("ms_per_step") if r else None
             if tn is None:
-                lines.append(f"  {n}n: INCONCLUSIVE (did not reach target within cap)")
+                lines.append(f"  {n}n: INCONCLUSIVE (no target within cap)  {ms} ms/step")
                 continue
             sp = base_t / tn if tn else float("inf")
             eff = sp / (n / base_n) * 100 if n else 0
             lines.append(
-                f"  {n}n: {tn}s   {sp:.2f}x vs {base_n}n   "
+                f"  {n}n: {tn}s   {sp:.2f}x vs {base_n}n   {ms} ms/step   "
                 f"scaling efficiency {eff:.0f}% (ideal {n / base_n:.0f}x)"
             )
     # Constant-global-batch control: steps_to_target should match across runs.
@@ -860,8 +878,12 @@ def _write_scaling_clean_report(path: str, results: list[dict], recipe: dict) ->
             )
         else:
             detail = f"  ({a.get('why', 'target not reached — raise cap or target')})"
+        train_s = a.get("total_train_s", "?")
         lines += [
             f"[{r['label']}]  run_id={r['run_id']}  nodes={r['nodes']}",
+            f"    hardware: {r['nodes']}x {r.get('instance', '?')} ({r.get('market', '?')})    "
+            f"ms/step: {r.get('ms_per_step', '?')}    tok/s: {r.get('tok_per_s', '?')}    "
+            f"run time: {train_s}s",
             f"    target: {'HIT' if a.get('reached') else 'NOT REACHED'}{detail}",
             f"    cost: ${r['cost']}    wandb: {r['wandb'] or '(disabled)'}",
             f"    gantt: {r['png']}    events: {r['events']}    valcurve: {r['valcurve']}",
@@ -1092,6 +1114,7 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
                     return_profile=True,
                 )
             analysis = _analyze_target(profile, target)
+            tput = _run_throughput(profile)
             art = _render_run_timeline(cfg, profile.run_id, f"{out_dir}/runs")
             valcurve = _val_curve_png(
                 profile, analysis, f"{out_dir}/runs/{profile.run_id}-valcurve.png"
@@ -1101,6 +1124,10 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
                     "label": label,
                     "nodes": nodes,
                     "run_id": profile.run_id,
+                    "instance": cfg.instance_type,
+                    "market": market,
+                    "ms_per_step": tput["ms_per_step"],
+                    "tok_per_s": tput["tok_per_s"],
                     "analysis": analysis,
                     "cost": round(profile.cost_now(), 4),
                     "wandb": getattr(profile._wb, "url", None) if profile._wb else None,
@@ -1116,6 +1143,10 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
                     "label": label,
                     "nodes": nodes,
                     "run_id": "-",
+                    "instance": cfg.instance_type,
+                    "market": market,
+                    "ms_per_step": None,
+                    "tok_per_s": None,
                     "analysis": {"reached": False, "why": f"run failed: {exc}"},
                     "cost": 0.0,
                     "wandb": None,
