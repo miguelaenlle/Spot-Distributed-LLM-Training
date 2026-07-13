@@ -666,13 +666,16 @@ def _run_throughput(profile: RunProfile) -> dict:
     skew the steady-state number the summary reports."""
     ms = sorted(s.ms_per_step for s in profile.samples if s.ms_per_step)
     tk = [s.tok_s for s in profile.samples if s.tok_s]
+    walls = sorted(s.t_rel for s in profile.samples)
+    run_time = round(walls[-1] - walls[0], 1) if len(walls) >= 2 else None
     if not ms:
-        return {"ms_per_step": None, "tok_per_s": None}
+        return {"ms_per_step": None, "tok_per_s": None, "run_time_s": run_time}
     k = len(ms) // 4  # trim both tails -> robust central value
     core = ms[k : len(ms) - k] or ms
     return {
         "ms_per_step": round(sum(core) / len(core), 1),
         "tok_per_s": int(sum(tk) / len(tk)) if tk else None,
+        "run_time_s": run_time,
     }
 
 
@@ -808,83 +811,113 @@ def _write_scaling_report(path: str, results: list[dict], recipe: dict) -> None:
 
 
 def _write_scaling_clean_report(path: str, results: list[dict], recipe: dict) -> None:
-    """Summary for the 1/2/4-node CLEAN sweep: per-run table + speedup and scaling
-    efficiency vs the 1-node baseline, plus a constant-global-batch control check
-    (steps_to_target should match across node counts)."""
+    """Summary for the 1/2/4-node CLEAN sweep, in whichever mode ran:
+
+      - target mode:     speedup = time-to-target-loss; lower is faster.
+      - throughput mode: speedup = steady-state ms/step; lower is faster.
+
+    Both compute speedup as base_metric / this_metric and efficiency as
+    speedup / (n / base_n), so one code path serves both."""
+    throughput = recipe.get("throughput_only")
 
     def by_nodes(n: int) -> dict | None:
         return next((x for x in results if x["nodes"] == n), None)
 
-    def ttt(r: dict | None) -> float | None:
-        return r["analysis"].get("time_to_target_s") if r and r["analysis"].get("reached") else None
+    def metric(r: dict | None) -> float | None:
+        """The lower-is-faster number that drives the speedup, per mode."""
+        if r is None:
+            return None
+        if throughput:
+            return r.get("ms_per_step")
+        return r["analysis"].get("time_to_target_s") if r["analysis"].get("reached") else None
 
     base = by_nodes(min(r["nodes"] for r in results))  # fewest nodes = baseline
     base_n = base["nodes"] if base else 1
-    base_t = ttt(base)
+    base_m = metric(base)
+
+    if throughput:
+        header = [
+            f"Scaling sweep (CLEAN, THROUGHPUT / ms-per-step) — {recipe['stamp']}",
+            "=" * 72,
+            "",
+            "each run trains to the wall-clock cap (no target); speedup = steady-state",
+            "ms/step (trimmed mean, warmup + checkpoint spikes dropped) vs the baseline.",
+        ]
+        speed_title = f"THROUGHPUT vs {base_n} node(s)   (ms/step; lower = faster)"
+    else:
+        header = [
+            f"Scaling sweep (CLEAN, time to target loss) — {recipe['stamp']}",
+            "=" * 72,
+            "",
+            f"target val_loss <= {recipe['target']}. time-to-target = wall-clock from the",
+            "first training step to the first eval at or below target (boot excluded).",
+        ]
+        speed_title = f"SPEEDUP vs {base_n} node(s)"
+
     lines = [
-        f"Scaling sweep (CLEAN, time to target loss) — {recipe['stamp']}",
-        "=" * 72,
-        "",
-        f"target val_loss <= {recipe['target']}. time-to-target = wall-clock from the",
-        "first training step to the first eval at or below target (boot excluded).",
+        *header,
         "",
         "Control: identical model/data/seed + CONSTANT global batch "
-        f"(GLOBAL_BATCH_SIZE={recipe['global_batch']}), so every node count follows the",
-        "same loss-vs-step curve and the comparison isolates throughput. Sequential",
-        f"{recipe['market']} runs on {recipe['instance']}, model {recipe['model']},",
-        f"dataset {recipe['dataset']}, eval every {recipe['eval_interval']} steps, "
+        f"(GLOBAL_BATCH_SIZE={recipe['global_batch']}). Sequential {recipe['market']} runs on",
+        f"{recipe['instance']}, model {recipe['model']}, dataset {recipe['dataset']}, "
         f"per-run cap {recipe['cap_s']}s, checkpoint every {recipe.get('ckpt_interval_s', '?')}s.",
         "",
-        f"SPEEDUP vs {base_n} node(s)",
+        speed_title,
         "-" * 72,
     ]
-    if base_t is None:
-        lines.append(f"  {base_n}-node did not reach target — no baseline (raise cap or target).")
+    if base_m is None:
+        why = "no ms/step samples" if throughput else "did not reach target (raise cap or target)"
+        lines.append(f"  {base_n}-node has no baseline metric — {why}.")
     else:
         for n in sorted({r["nodes"] for r in results}):
             r = by_nodes(n)
-            tn = ttt(r)
+            m = metric(r)
             ms = r.get("ms_per_step") if r else None
-            if tn is None:
-                lines.append(f"  {n}n: INCONCLUSIVE (no target within cap)  {ms} ms/step")
+            tok = r.get("tok_per_s") if r else None
+            if m is None:
+                lines.append(f"  {n}n: INCONCLUSIVE (no metric)  {ms} ms/step")
                 continue
-            sp = base_t / tn if tn else float("inf")
+            sp = base_m / m if m else float("inf")
             eff = sp / (n / base_n) * 100 if n else 0
+            unit = f"{m} ms/step" if throughput else f"{m}s to target ({ms} ms/step)"
             lines.append(
-                f"  {n}n: {tn}s   {sp:.2f}x vs {base_n}n   {ms} ms/step   "
-                f"scaling efficiency {eff:.0f}% (ideal {n / base_n:.0f}x)"
+                f"  {n}n: {unit}   {tok} tok/s   {sp:.2f}x vs {base_n}n   "
+                f"efficiency {eff:.0f}% (ideal {n / base_n:.0f}x)"
             )
-    # Constant-global-batch control: steps_to_target should match across runs.
-    steps = {
-        r["nodes"]: r["analysis"].get("steps_to_target")
-        for r in results
-        if r["analysis"].get("reached")
-    }
-    if len({v for v in steps.values() if v}) > 1:
-        lines += [
-            "",
-            "⚠️  CONTROL CHECK: steps_to_target differ across node counts "
-            f"({steps}) — the",
-            "   constant-global-batch control is imperfect (eval granularity or K",
-            "   rounding); treat the speedups as approximate.",
-        ]
+
+    # Target mode only: constant-global-batch control — steps_to_target must match.
+    if not throughput:
+        steps = {
+            r["nodes"]: r["analysis"].get("steps_to_target")
+            for r in results
+            if r["analysis"].get("reached")
+        }
+        if len({v for v in steps.values() if v}) > 1:
+            lines += [
+                "",
+                f"⚠️  CONTROL CHECK: steps_to_target differ across node counts ({steps})",
+                "   — constant-global-batch control imperfect; speedups are approximate.",
+            ]
+
     lines += ["", "PER-RUN", "-" * 72]
     for r in sorted(results, key=lambda x: x["nodes"]):
         a = r["analysis"]
-        if a.get("reached"):
-            detail = (
-                f"  step {a['target_step']}  hit_val {a['hit_val']}  "
-                f"time_to_target {a['time_to_target_s']}s  (total train {a['total_train_s']}s)"
-            )
-        else:
-            detail = f"  ({a.get('why', 'target not reached — raise cap or target')})"
-        train_s = a.get("total_train_s", "?")
         lines += [
             f"[{r['label']}]  run_id={r['run_id']}  nodes={r['nodes']}",
             f"    hardware: {r['nodes']}x {r.get('instance', '?')} ({r.get('market', '?')})    "
             f"ms/step: {r.get('ms_per_step', '?')}    tok/s: {r.get('tok_per_s', '?')}    "
-            f"run time: {train_s}s",
-            f"    target: {'HIT' if a.get('reached') else 'NOT REACHED'}{detail}",
+            f"run time: {r.get('run_time_s', '?')}s",
+        ]
+        if not throughput:
+            if a.get("reached"):
+                detail = (
+                    f"  step {a['target_step']}  hit_val {a['hit_val']}  "
+                    f"time_to_target {a['time_to_target_s']}s"
+                )
+            else:
+                detail = f"  ({a.get('why', 'target not reached — raise cap or target')})"
+            lines.append(f"    target: {'HIT' if a.get('reached') else 'NOT REACHED'}{detail}")
+        lines += [
             f"    cost: ${r['cost']}    wandb: {r['wandb'] or '(disabled)'}",
             f"    gantt: {r['png']}    events: {r['events']}    valcurve: {r['valcurve']}",
             "",
@@ -1033,15 +1066,15 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
     inside it). Node count 1 routes to the single-box path (the epoch supervisor
     is 2+-node only); 2 and 4 run under the supervisor with an EMPTY kill
     schedule. Writes reports/scaling-clean-<ts>/ with per-run timeline + val-curve
-    and the speedup vs the 1-node baseline. Requires TARGET_LOSS — run
-    `calibrate` first (with SCALING_CAP_SECONDS matching this cap) to size it."""
+    and the speedup vs the 1-node baseline.
+
+    Two modes: with TARGET_LOSS set, each run stops at val_loss <= target and the
+    speedup is time-to-target (run `calibrate` first to size it). WITHOUT
+    TARGET_LOSS it's THROUGHPUT mode — each run trains to the cap, eval is off, and
+    the speedup is measured from steady-state ms/step. Use throughput mode when you
+    just want ms/step per world size."""
     target = float(os.environ.get("TARGET_LOSS", "0") or "0")
-    if target <= 0:
-        raise SystemExit(
-            "TARGET_LOSS is required — run `spot-orchestrate calibrate` first "
-            "(SCALING_CAP_SECONDS=480) and pick a loss the 1-node run reaches in "
-            "~6-7 min, then re-run with TARGET_LOSS=<val>."
-        )
+    throughput_only = target <= 0
     node_counts = [int(x) for x in os.environ.get("NODE_COUNTS", "1,2,4").split(",") if x.strip()]
 
     # vCPU-quota guard (before any env mutation): the WIDEST run must fit the quota
@@ -1056,14 +1089,18 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
         )
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    os.environ["TARGET_LOSS"] = str(target)  # relayed to boxes for the early stop
+    if not throughput_only:
+        os.environ["TARGET_LOSS"] = str(target)  # relayed to boxes for the early stop
+    # Throughput mode: no target to detect, so turn eval off (its full val pass is
+    # pure overhead here) and just run to the cap. Target mode keeps fine eval.
+    default_eval = "0" if throughput_only else "25"
     for k, v in {  # constant global batch is the control — same recipe as calibrate
         "N_LAYER": "12",
         "N_HEAD": "12",
         "N_EMBD": "768",
         "BLOCK_SIZE": "1024",
         "GLOBAL_BATCH_SIZE": "64",
-        "EVAL_INTERVAL_STEPS": "25",  # fine granularity so all node counts detect the same step
+        "EVAL_INTERVAL_STEPS": default_eval,  # fine granularity so all node counts detect same step
         "DROPOUT": "0.0",
         "LEARNING_RATE": "6e-4",
         "MIN_LR": "6e-5",
@@ -1086,6 +1123,7 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
     recipe = {
         "stamp": stamp,
         "target": target,
+        "throughput_only": throughput_only,
         "market": market,
         "instance": cfg.instance_type,
         "model": f"{os.environ['N_LAYER']}L-{os.environ['N_EMBD']}d-{os.environ['BLOCK_SIZE']}ctx",
@@ -1141,6 +1179,7 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
                     "market": market,
                     "ms_per_step": tput["ms_per_step"],
                     "tok_per_s": tput["tok_per_s"],
+                    "run_time_s": tput["run_time_s"],
                     "analysis": analysis,
                     "cost": round(profile.cost_now(), 4),
                     "wandb": getattr(profile._wb, "url", None) if profile._wb else None,
@@ -1160,6 +1199,7 @@ def run_scaling_clean(cfg: OrchestratorConfig) -> list[dict]:
                     "market": market,
                     "ms_per_step": None,
                     "tok_per_s": None,
+                    "run_time_s": None,
                     "analysis": {"reached": False, "why": f"run failed: {exc}"},
                     "cost": 0.0,
                     "wandb": None,

@@ -128,8 +128,18 @@ VCPU_QUOTA=32 MARKET=spot TARGET_LOSS=<from calibrate> \
   spot-orchestrate scaling-clean
 ```
 
-Report `reports/scaling-clean-<ts>/summary.txt`: per-run `time_to_target_s` +
-**speedup and scaling efficiency vs 1 node** (expect sub-linear — ~1 : 1.9 : 3.4,
+**Throughput-only mode:** omit `TARGET_LOSS` and each run trains to the cap (eval
+off), with the speedup measured from steady-state **ms/step** instead of
+time-to-target — use it when you just want ms/step per world size, no calibrate
+needed:
+```bash
+VCPU_QUOTA=32 MARKET=spot INSTANCE_TYPE=g5.xlarge DATASET=openwebtext_300m \
+  GLOBAL_BATCH_SIZE=256 BATCH_SIZE=16 SCALING_CAP_SECONDS=600 NODE_COUNTS=1,2,4 \
+  spot-orchestrate scaling-clean
+```
+
+Report `reports/scaling-clean-<ts>/summary.txt`: per-run `time_to_target_s` (or
+ms/step in throughput mode) + **speedup and scaling efficiency vs 1 node** (expect sub-linear — ~1 : 1.9 : 3.4,
 not 1 : 2 : 4, from the gradient all-reduce). Knobs: `NODE_COUNTS` (default
 `1,2,4`), `SCALING_CAP_SECONDS` (default 480 = 8 min), `MARKET` (default `spot`),
 `VCPU_QUOTA` (the sweep refuses to start if the widest run exceeds it). Size the

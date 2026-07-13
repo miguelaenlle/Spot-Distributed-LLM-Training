@@ -98,6 +98,7 @@ def _clean_result(label, nodes, t, reached=True, steps=800, ms=None):
         "market": "spot",
         "ms_per_step": ms if ms is not None else round(2000 / nodes, 1),
         "tok_per_s": 30000 * nodes,
+        "run_time_s": t + 30,
         "analysis": {
             "reached": reached,
             "target": 5.0,
@@ -150,16 +151,35 @@ def test_scaling_clean_report_speedup_and_efficiency(tmp_path):
     with open(path) as f:
         body = f.read()
     assert "SPEEDUP vs 1 node(s)" in body
-    assert "2n: 220.0s   1.82x vs 1n" in body
-    assert "4n: 130.0s   3.08x vs 1n" in body
-    assert "scaling efficiency" in body
+    assert "220.0s to target" in body and "1.82x vs 1n" in body
+    assert "130.0s to target" in body and "3.08x vs 1n" in body
+    assert "efficiency" in body
     assert "run_id=4n-id" in body
     # per-run hardware + throughput + duration line
     assert "hardware: 4x g5.xlarge (spot)" in body
     assert "ms/step: 500.0" in body  # 2000/4
-    assert "run time: 160.0s" in body  # total_train_s = 130 + 30
+    assert "run time: 160.0s" in body  # run_time_s = 130 + 30
     # steps_to_target match across runs -> no control warning
     assert "CONTROL CHECK" not in body
+
+
+def test_scaling_clean_report_throughput_mode(tmp_path):
+    recipe = {**_CLEAN_RECIPE, "throughput_only": True}
+    results = [
+        _clean_result("1n", 1, 0.0, reached=False, ms=1700.0),
+        _clean_result("2n", 2, 0.0, reached=False, ms=1080.0),
+        _clean_result("4n", 4, 0.0, reached=False, ms=800.0),
+    ]
+    path = str(tmp_path / "summary.txt")
+    experiments._write_scaling_clean_report(path, results, recipe)
+    with open(path) as f:
+        body = f.read()
+    assert "THROUGHPUT vs 1 node(s)" in body
+    assert "4n: 800.0 ms/step" in body
+    assert "2.12x vs 1n" in body  # 1700/800
+    # no target verbiage in throughput mode
+    assert "time_to_target" not in body
+    assert "NOT REACHED" not in body
 
 
 def test_scaling_clean_report_flags_control_mismatch(tmp_path):
@@ -184,14 +204,6 @@ def test_scaling_clean_report_inconclusive_when_target_missed(tmp_path):
     with open(path) as f:
         body = f.read()
     assert "2n: INCONCLUSIVE" in body
-
-
-def test_scaling_clean_requires_target_loss(monkeypatch):
-    from orchestrator.config import OrchestratorConfig
-
-    monkeypatch.delenv("TARGET_LOSS", raising=False)
-    with pytest.raises(SystemExit, match="TARGET_LOSS is required"):
-        experiments.run_scaling_clean(OrchestratorConfig())
 
 
 def test_scaling_clean_vcpu_guard(monkeypatch):
