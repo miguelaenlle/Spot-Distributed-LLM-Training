@@ -385,6 +385,30 @@ def train(cfg: TrainConfig) -> dict:
         _wd.start()
 
     while step < cfg.max_steps:
+        # Fault injection (hang experiment): simulate a wedged node — a deadlocked
+        # GPU/driver, NOT a box death. This box stops stepping/checkpointing/logging
+        # but stays UP, so its S3 log heartbeat goes stale and the supervisor evicts
+        # + replaces it like a death (peers meanwhile abort on NCCL_TIMEOUT and
+        # re-rendezvous once the shrink epoch lands). Gate on node index (all local
+        # ranks on the box share SPOT_NODE_INDEX), so the whole box wedges.
+        if (
+            cfg.hang_after_seconds
+            and cfg.hang_node_index in (-1, _node_idx)
+            and (time.monotonic() - start_time) >= cfg.hang_after_seconds
+            # One-shot gate: a replacement joins at a later epoch, so skip it when
+            # hang_max_epoch is set (0 = re-arm on every box).
+            and not (cfg.hang_max_epoch and _epoch is not None and _epoch > cfg.hang_max_epoch)
+        ):
+            _stop_wd.set()  # silence the stall watchdog so the log truly goes quiet
+            print(
+                f"[hang] node {_node_idx}: simulating a wedged process at step {step} "
+                f"— no further steps, checkpoints, or logs (box stays up for the "
+                f"supervisor to evict on stale heartbeat)",
+                file=sys.stderr,
+                flush=True,
+            )
+            while True:
+                time.sleep(3600)
         lr = get_lr(cfg, step)
         for group in optimizer.param_groups:
             group["lr"] = lr

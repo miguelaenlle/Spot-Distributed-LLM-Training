@@ -179,6 +179,22 @@ class TrainConfig:
     # determinism tests are unchanged. Options: none | bf16 | fp16.
     ddp_comm_hook: str = "bf16"
 
+    # --- fault injection (hang experiment) -----------------------------------
+    # Simulate a WEDGED node (a deadlocked kernel / driver hang), distinct from a
+    # box death: after this many seconds of training the target node stops
+    # stepping, checkpointing, and logging but its process/box stay UP. Its S3
+    # log heartbeat then goes stale and the supervisor evicts + replaces it,
+    # treating it exactly like a node death. 0 = off. hang_node_index selects the
+    # box (matched against SPOT_NODE_INDEX); -1 (default) means "any node".
+    hang_after_seconds: float = 0.0
+    hang_node_index: int = -1
+    # One-shot control: only wedge while the box is in an epoch <= this. A
+    # replacement reuses the dead node's index but joins at a LATER epoch, so
+    # HANG_MAX_EPOCH=1 wedges the original box once and lets its replacement train
+    # normally (group returns to full and finishes). 0 (default) = re-arm on every
+    # box, i.e. the node keeps hanging each time it is replaced (a flap stress test).
+    hang_max_epoch: int = 0
+
     @classmethod
     def from_env(cls) -> TrainConfig:
         """Build a config from environment variables (used on the remote box).
@@ -232,4 +248,7 @@ class TrainConfig:
             device=_env_str("DEVICE", "auto"),
             data_mode=_env_str("DDP_DATA_MODE", "shard"),
             ddp_comm_hook=_env_str("DDP_COMM_HOOK", "bf16"),
+            hang_after_seconds=_env_float("HANG_AFTER_SECONDS", 0.0),
+            hang_node_index=_env_int("HANG_NODE_INDEX", -1),
+            hang_max_epoch=_env_int("HANG_MAX_EPOCH", 0),
         )
