@@ -601,6 +601,15 @@ def build_user_data(
         env["NCCL_SOCKET_IFNAME"] = os.environ.get("NCCL_SOCKET_IFNAME", "^docker0,lo")
         env["NCCL_IB_DISABLE"] = os.environ.get("NCCL_IB_DISABLE", "1")
         env["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "WARN")
+        # Force the built-in TCP socket transport and DON'T load the aws-ofi-nccl
+        # (EFA/libfabric) net plugin. The newer DLAMI auto-loads that plugin, but
+        # g4dn/g5.xlarge have NO EFA, so its init fails ("NET/OFI Unable to find a
+        # protocol that worked") and NCCL >=2.29 does not cleanly fall back — the
+        # first inter-node all-reduce then hangs to NCCL_TIMEOUT and the run never
+        # trains. Sockets work (the c10d rendezvous already proves inter-node TCP).
+        # Operator-overridable for a real EFA fleet (NCCL_NET=OFI).
+        env["NCCL_NET"] = os.environ.get("NCCL_NET", "Socket")
+        env["NCCL_NET_PLUGIN"] = os.environ.get("NCCL_NET_PLUGIN", "none")
         # No EFA on g4dn/g5.xlarge, so the gradient all-reduce rides bare TCP,
         # whose NCCL defaults (1 thread x 1 socket) leave bandwidth on the table.
         # Parallelize the socket transport: ~2-4x all-reduce throughput, the
