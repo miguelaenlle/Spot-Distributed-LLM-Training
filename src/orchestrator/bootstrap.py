@@ -363,166 +363,6 @@ echo "bake user-data exited rc=$? — box left UP for the orchestrator (stop + C
 """
 
 
-# Operator/config env vars relayed verbatim to the durable orchestrator box (only
-# when set here), so its OrchestratorConfig + experiment reproduce the laptop's.
-# The AWS *credentials* are NOT here — the box uses its instance-profile role.
-_ORCH_RELAY = (
-    "NODES",
-    "INSTANCE_TYPE",
-    "VCPU_QUOTA",
-    "INSTANCE_VCPUS",
-    "NODE_COUNTS",
-    "TARGET_LOSS",
-    "MARKET",
-    "SCALING_CAP_SECONDS",
-    "TRAIN_TOTAL_SECONDS",
-    "BASELINE_SECONDS",
-    "PREEMPT_COUNT",
-    "PREEMPT_VICTIMS",
-    "PREEMPT_OFFSETS",
-    "PREEMPT_AFTER",
-    "PREEMPT_AFTER_FRACTION",
-    "PREEMPT_CHECKPOINT_SECONDS",
-    "PREEMPT_GRACE",
-    "BATCH_SIZE",
-    "CHECKPOINT_INTERVAL_SECONDS",
-    "HEARTBEAT_TIMEOUT",
-    "RECOVERY_TIMEOUT",
-    "METRICS_TIMEOUT",
-    "LOG_STREAM_SECONDS",
-    "NCCL_TIMEOUT",
-    "RDZV_PORT",
-    "MAX_INSTANCE_LIFETIME_SECONDS",
-    "AMI_ID",
-    "AMI_NAME_FILTER",
-    "SSH_KEY_NAME",
-    "REPO_URL",
-    "REPO_BRANCH",
-    "DATASET",
-    "HOURLY_USD",
-    "WANDB_PROJECT",
-    "WANDB_ENTITY",
-    "WANDB_GROUP",
-    "WANDB_API_KEY",
-    "WANDB_DISABLED",
-)
-
-
-def _orchestrator_env(cfg: OrchestratorConfig, *, job_id: str, experiment: str) -> dict[str, str]:
-    """Environment sourced on the durable orchestrator box: enough for its
-    OrchestratorConfig + the chosen experiment to reproduce the laptop's run. The
-    job identity (REMOTE_RUN_ID for a single run, REMOTE_SWEEP_ID for a sweep) both
-    names the S3 observability prefix and — for single runs — pins the run_id so
-    ``logs <run_id>`` works immediately."""
-    single_run = experiment in ("multinode", "multinode-shrink", "multinode-preempt")
-    env = {
-        "PYTHONPATH": "/home/ubuntu/app/src",
-        "PYTHONUNBUFFERED": "1",
-        "EXPERIMENT": experiment,
-        "ORCH_JOB_ID": job_id,
-        "ORCH_ASG_NAME": cfg.orchestrator_asg_name(job_id),
-        # Bucket/region so the box's config resolves even if the operator didn't
-        # export them (they usually come from the laptop's .env).
-        "SPOT_TRAIN_BUCKET": cfg.bucket,
-        "AWS_REGION": cfg.region,
-        ("REMOTE_RUN_ID" if single_run else "REMOTE_SWEEP_ID"): job_id,
-    }
-    for k in _ORCH_RELAY:
-        if os.environ.get(k):
-            env[k] = os.environ[k]
-    # The model/cadence recipe (relayed only when set), so an operator override on
-    # the laptop reaches the box; unset keeps the experiment's own defaults.
-    env.update(cfg.trainer_passthrough())
-    return env
-
-
-def build_orchestrator_user_data(cfg: OrchestratorConfig, *, job_id: str, experiment: str) -> str:
-    """User-data for the durable t3.micro control plane: provision the repo (same
-    clone/submodule steps as a training box — it reuses the DLAMI), install the
-    orchestrator's extra deps (wandb + matplotlib), then run
-    ``orchestrator.remote`` which drives the whole job (launch GPU boxes,
-    supervise, tear them down) and, on completion, self-scales this box's ASG to 0.
-
-    Unlike a training box there is no trainer/self-shutdown block here — the
-    Python entrypoint owns completion. The box streams its boot log to S3 for
-    ``remote-status``, and powers off after the entrypoint returns (a clean finish
-    already scaled the ASG to 0, so it won't relaunch; a crash leaves the ASG at
-    desired=1, so the box self-heals into a fresh cold-recovery attempt)."""
-    env = _orchestrator_env(cfg, job_id=job_id, experiment=experiment)
-    steps = _provision_steps(cfg, _export_block(env))
-    bucket = cfg.bucket
-    logs_key = f"orchestrators/{job_id}/boot.log"
-    interval = cfg.log_stream_seconds
-    return f"""#!/bin/bash
-set -x
-exec > /var/log/spot-orch-boot.log 2>&1
-chmod 644 /var/log/spot-orch-boot.log
-
-sudo -u ubuntu -i bash <<'BOOT'
-set -x
-cd /home/ubuntu
-
-VENV_PY=/opt/pytorch/bin/python
-[ -x "$VENV_PY" ] || VENV_PY="$(command -v python3)"
-
-# Stream the whole boot to S3 so `remote-status` can see provisioning progress.
-"$VENV_PY" -c "import boto3" 2>/dev/null || "$VENV_PY" -m pip install boto3 2>/dev/null \
-  || "$VENV_PY" -m pip install --user boto3 2>/dev/null || true
-"$VENV_PY" - <<'PY' &
-import os, time, boto3
-c = boto3.client("s3")
-last = -1
-while True:
-    try:
-        sz = os.path.getsize("/var/log/spot-orch-boot.log")
-        if sz != last:
-            c.upload_file("/var/log/spot-orch-boot.log", "{bucket}", "{logs_key}")
-            last = sz
-    except Exception:
-        pass
-    time.sleep({interval})
-PY
-UPLOADER_PID=$!
-
-# Provision (clone repo + nanoGPT submodule, deps, env file, preflight).
-{steps}
-
-# Orchestrator-only deps (not needed by training boxes): W&B mirror + the
-# matplotlib the profile/timeline renders use. Best-effort so a broken pip
-# doesn't wedge the control plane.
-"$VENV_PY" -c "import matplotlib" 2>/dev/null \\
-  || "$VENV_PY" -m pip install matplotlib \\
-  || "$VENV_PY" -m pip install --user matplotlib || true
-"$VENV_PY" -c "import wandb" 2>/dev/null \\
-  || "$VENV_PY" -m pip install wandb \\
-  || "$VENV_PY" -m pip install --user wandb || true
-
-set +e
-source /home/ubuntu/spot-train.env
-# Drive the whole job from the box. Reads EXPERIMENT/ORCH_ASG_NAME/job identity
-# from the sourced env; on completion writes the done-sentinel and self-scales
-# this ASG to 0 (so it won't relaunch) before we power off below.
-"$VENV_PY" -u -m orchestrator.remote --experiment "$EXPERIMENT"
-RC=$?
-
-kill "$UPLOADER_PID" 2>/dev/null || true
-"$VENV_PY" - <<'PY'
-import boto3
-try:
-    boto3.client("s3").upload_file("/var/log/spot-orch-boot.log", "{bucket}", "{logs_key}")
-except Exception:
-    pass
-PY
-exit "$RC"
-BOOT
-RC=$?
-# Always power off: a clean finish already scaled the ASG to 0 (terminate, done);
-# a crash left desired=1, so this poweroff makes the ASG self-heal a fresh box.
-echo "orchestrator entrypoint exited rc=$RC — powering off"
-shutdown -h now
-"""
-
-
 def _multinode_loop(
     cfg: OrchestratorConfig, *, run_id: str, nodes: int, node_index: int, nproc: str
 ) -> str:
@@ -601,15 +441,6 @@ def build_user_data(
         env["NCCL_SOCKET_IFNAME"] = os.environ.get("NCCL_SOCKET_IFNAME", "^docker0,lo")
         env["NCCL_IB_DISABLE"] = os.environ.get("NCCL_IB_DISABLE", "1")
         env["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "WARN")
-        # Force the built-in TCP socket transport and DON'T load the aws-ofi-nccl
-        # (EFA/libfabric) net plugin. The newer DLAMI auto-loads that plugin, but
-        # g4dn/g5.xlarge have NO EFA, so its init fails ("NET/OFI Unable to find a
-        # protocol that worked") and NCCL >=2.29 does not cleanly fall back — the
-        # first inter-node all-reduce then hangs to NCCL_TIMEOUT and the run never
-        # trains. Sockets work (the c10d rendezvous already proves inter-node TCP).
-        # Operator-overridable for a real EFA fleet (NCCL_NET=OFI).
-        env["NCCL_NET"] = os.environ.get("NCCL_NET", "Socket")
-        env["NCCL_NET_PLUGIN"] = os.environ.get("NCCL_NET_PLUGIN", "none")
         # No EFA on g4dn/g5.xlarge, so the gradient all-reduce rides bare TCP,
         # whose NCCL defaults (1 thread x 1 socket) leave bandwidth on the table.
         # Parallelize the socket transport: ~2-4x all-reduce throughput, the
@@ -684,20 +515,11 @@ VENV_PY=/opt/pytorch/bin/python
 "$VENV_PY" -c "import boto3" 2>/dev/null || "$VENV_PY" -m pip install boto3 2>/dev/null \
   || "$VENV_PY" -m pip install --user boto3 2>/dev/null || true
 "$VENV_PY" - <<'PY' &
-import os, time, boto3
+import time, boto3
 c = boto3.client("s3")
-# Upload ONLY when the (append-only) log has grown. The object's S3 LastModified
-# is the supervisor's per-node liveness heartbeat, so it must track real trainer
-# progress: a fixed-cadence re-upload would keep the key "fresh" even while the
-# trainer is wedged, defeating hang detection. A frozen size => no PUT => the
-# heartbeat goes stale and the supervisor can evict the node.
-last = -1
 while True:
     try:
-        sz = os.path.getsize("/var/log/spot-train-boot.log")
-        if sz != last:
-            c.upload_file("/var/log/spot-train-boot.log", "{bucket}", "{logs_key}")
-            last = sz
+        c.upload_file("/var/log/spot-train-boot.log", "{bucket}", "{logs_key}")
     except Exception:
         pass
     time.sleep({interval})

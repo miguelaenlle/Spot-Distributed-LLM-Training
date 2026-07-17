@@ -151,25 +151,6 @@ def test_stale_heartbeat_counts_as_lost():
     assert decide(obs, SHRINK) == [PublishEpoch(2, (0,))]
 
 
-def test_hang_evicted_and_replaced_at_tuned_heartbeat():
-    # Scenario 3: node 4 of a 5-node group hangs — running per AWS, but its log
-    # heartbeat is stale (90s) while peers are fresh. With a tuned 60s timeout the
-    # supervisor evicts it (shrink to 4) AND, under replace_on_loss, relaunches
-    # it — a hang handled exactly like a death.
-    policy = Policy(replace_on_loss=True, recovery_timeout_s=150, heartbeat_timeout_s=60.0)
-    nodes = [_node(i, log_age=2.0) for i in range(4)] + [_node(4, log_age=90.0)]
-    obs = _obs(nodes, epoch=3, members=[0, 1, 2, 3, 4], node_count=5)
-    assert decide(obs, policy) == [PublishEpoch(4, (0, 1, 2, 3)), LaunchReplacement(4)]
-
-
-def test_hang_below_tuned_heartbeat_is_still_healthy():
-    # The same 90s-stale node is NOT yet evicted under the default 90s window
-    # (age must EXCEED the timeout): no membership change until it crosses.
-    nodes = [_node(i, log_age=2.0) for i in range(4)] + [_node(4, log_age=90.0)]
-    obs = _obs(nodes, epoch=3, members=[0, 1, 2, 3, 4], node_count=5)
-    assert decide(obs, PREEMPT) == []  # PREEMPT uses the default 90s heartbeat
-
-
 def test_unregistered_node_is_not_healthy():
     obs = _obs([_node(0), _node(1, registered=False)], epoch=0, members=[], node_count=2)
     assert decide(obs, SHRINK) == []  # only 1 of 2 registered -> keep waiting

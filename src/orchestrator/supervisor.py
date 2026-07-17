@@ -372,25 +372,11 @@ class Supervisor:
         self.status_key = cfg.run_status_key(run_id)
         self.orch_log_key = cfg.run_orch_log_key(run_id)
         self._last_status: dict | None = None
-        # Seed from any existing orchestrator.log so a supervisor that took over a
-        # run (the durable orchestrator relaunched after its box died) APPENDS to
-        # the prior control plane's narrative — including the cold-recovery kill
-        # markers — instead of clobbering it. Empty on a normal first run.
-        self._orch_lines: list[str] = self._load_orch_log()
+        self._orch_lines: list[str] = []
         self._orch_dirty = False
         self._downed: set[tuple[int, str]] = set()  # (node, iid) already emitted down/killed
 
     # -- observability ------------------------------------------------------ #
-    def _load_orch_log(self) -> list[str]:
-        """Prior orchestrator.log lines (empty on a normal first run). Lets a
-        relaunched supervisor preserve the earlier generation's narrative."""
-        try:
-            if aws.object_exists(self.cfg.bucket, self.orch_log_key):
-                return aws.get_text(self.cfg.bucket, self.orch_log_key).splitlines()
-        except Exception:  # noqa: BLE001 — observability seeding is best-effort
-            pass
-        return []
-
     def _event(self, msg: str) -> None:
         """A supervisor decision line: stderr (as always) + the orchestrator.log
         buffer the next _write_status uploads."""

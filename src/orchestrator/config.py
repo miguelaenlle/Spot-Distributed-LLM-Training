@@ -57,14 +57,6 @@ _TRAINER_PASSTHROUGH = (
     "SAMPLE_TEMPERATURE",
     "SAMPLE_TOP_K",
     "SAMPLES_PER_PROMPT",
-    # Fault injection for the hang experiment (normally unset): the trainer wedges
-    # the target node after HANG_AFTER_SECONDS. Each box self-selects by matching
-    # HANG_NODE_INDEX against its own SPOT_NODE_INDEX, so one env relayed to all
-    # boxes hangs exactly one node.
-    "HANG_AFTER_SECONDS",
-    "HANG_NODE_INDEX",
-    "HANG_MAX_EPOCH",
-    "STALL_THRESHOLD_SECONDS",
 )
 
 # vCPUs per instance type, for the quota-headroom gate. Only the types this
@@ -128,27 +120,6 @@ class OrchestratorConfig:
     role_name: str = field(default_factory=lambda: _env("IAM_ROLE", "spot-train-role"))
     instance_profile: str = field(default_factory=lambda: _env("IAM_PROFILE", "spot-train-profile"))
     security_group: str = field(default_factory=lambda: _env("SECURITY_GROUP", "spot-train-sg"))
-
-    # --- durable orchestrator control plane (spot-orchestrate remote-*) -------
-    # A t3.micro that runs the epoch supervisor / a sweep OFF the laptop, kept
-    # alive by a desired=1 Auto Scaling Group for the job's duration and torn down
-    # when it finishes. It reuses the same DLAMI (so bootstrap._provision_steps
-    # works verbatim) but a much smaller instance — it only runs the control loop,
-    # not training. 1 GiB (t3.micro) is usually enough; ORCHESTRATOR_INSTANCE_TYPE
-    # =t3.small is the safe fallback if the DLAMI's footprint is tight.
-    orchestrator_instance_type: str = field(
-        default_factory=lambda: _env("ORCHESTRATOR_INSTANCE_TYPE", "t3.micro")
-    )
-    # A distinct role/profile from the worker's: the control plane calls EC2
-    # RunInstances/TerminateInstances + S3 + self-scales its own ASG, so it needs
-    # controller-equivalent permissions (docs/iam/orchestrator-policy.json), NOT
-    # the worker's S3-only role.
-    orchestrator_role_name: str = field(
-        default_factory=lambda: _env("ORCH_IAM_ROLE", "spot-orch-role")
-    )
-    orchestrator_instance_profile: str = field(
-        default_factory=lambda: _env("ORCH_IAM_PROFILE", "spot-orch-profile")
-    )
 
     # --- S3 key layout -------------------------------------------------------
     run_prefix: str = "runs"
@@ -228,13 +199,6 @@ class OrchestratorConfig:
     # (kill node 1 first, then node 0). Any node is killable — the epoch after a
     # kill just names a new lowest-index master. Empty = always the last node.
     preempt_victims: str = field(default_factory=lambda: _env("PREEMPT_VICTIMS", ""))
-    # scaling-preempt: when in the cap the one aggressive kill round fires, as a
-    # fraction of the per-run wall-clock cap (0.4 => ~40% of the way through). The
-    # supervisor's kill clock is seconds-since-first-checkpoint, so this lands the
-    # round mid-training regardless of boot time.
-    preempt_after_fraction: float = field(
-        default_factory=lambda: _env_float("PREEMPT_AFTER_FRACTION", 0.4)
-    )
 
     # --- DDP experiment (spot-orchestrate ddp) ------------------------------
     # Ranks torchrun launches on the box. 0 (default) = auto: one rank per GPU on
@@ -272,15 +236,6 @@ class OrchestratorConfig:
     # never false-fires mid-recovery, yet well under METRICS_TIMEOUT so a genuine
     # hang is broken within a run instead of stalling to the deadline.
     recovery_timeout_seconds: int = field(default_factory=lambda: _env_int("RECOVERY_TIMEOUT", 150))
-    # A node whose log-key heartbeat is stale this long is presumed WEDGED (running
-    # per AWS, but its trainer stopped making progress — a hang) and dropped from
-    # membership, then replaced/shrunk like a death. Must sit ABOVE the longest
-    # legitimate log-quiet gap (a checkpoint snapshot or full-val eval) yet BELOW
-    # recovery_timeout so a single hung node is evicted individually before the
-    # whole-group-restart floor fires. Lower it (e.g. 60) for a crisp hang demo.
-    heartbeat_timeout_seconds: int = field(
-        default_factory=lambda: _env_int("HEARTBEAT_TIMEOUT", 90)
-    )
 
     # --- inference fleet (ROADMAP Part 1) ------------------------------------
     # CPU instances by default: the 10M-param model serves fine on CPU, and
@@ -418,44 +373,6 @@ class OrchestratorConfig:
     def run_uri(self, run_id: str) -> str:
         """s3://bucket/runs/<run_id> — the base the box sidecar is pointed at."""
         return f"s3://{self.bucket}/{self.run_prefix}/{run_id}"
-
-    # --- durable orchestrator: ASG / launch-template names + observability ---- #
-    # Deterministic from the job id so the laptop and the box agree on the ASG to
-    # scale/tear down without a round-trip through S3.
-    def orchestrator_asg_name(self, job_id: str) -> str:
-        return f"spot-orch-{job_id}"
-
-    def orchestrator_lt_name(self, job_id: str) -> str:
-        return f"spot-orch-lt-{job_id}"
-
-    # A completed job's control-plane done-sentinel: the box writes it (with exit
-    # status) right before self-scaling its ASG to 0, so `remote-status` can tell a
-    # finished job from a still-running one.
-    def orchestrator_done_key(self, job_id: str) -> str:
-        return f"orchestrators/{job_id}/orchestrator-done.json"
-
-    # Monotonic generation counter the box bumps on every (re)boot. gen>1 proves
-    # the ASG relaunched a fresh control plane after a death — the observable the
-    # fault-injection experiments assert on.
-    def orchestrator_generation_key(self, job_id: str) -> str:
-        return f"orchestrators/{job_id}/generation"
-
-    # --- sweep observability (scaling-clean / scaling-preempt) ---------------- #
-    # A sweep runs many per-point runs, each with its own run_id; these keys hold
-    # the sweep-level artifacts (machine-readable results + human summary + a
-    # per-point manifest) so a sweep run ON the durable box — whose local reports/
-    # dir dies with it — is still discoverable and comparable from the laptop.
-    def sweep_prefix(self, sweep_id: str) -> str:
-        return f"sweeps/{sweep_id}/"
-
-    def sweep_results_key(self, sweep_id: str) -> str:
-        return f"sweeps/{sweep_id}/results.json"
-
-    def sweep_summary_key(self, sweep_id: str) -> str:
-        return f"sweeps/{sweep_id}/summary.txt"
-
-    def sweep_manifest_key(self, sweep_id: str) -> str:
-        return f"sweeps/{sweep_id}/manifest.json"
 
     # Inference-fleet keys: heartbeat docs the router polls, per-box boot logs,
     # and a state doc recording which instances belong to the fleet.

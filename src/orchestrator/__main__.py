@@ -55,40 +55,8 @@ def main() -> None:
         "calibrate",
         "scaling-experiment",
         "scaling-clean",
-        "scaling-preempt",
     ):
         sub.add_parser(name, parents=[common])
-
-    # Durable orchestrator: run the supervisor/sweep on a t3.micro (ASG-backed),
-    # driven from the laptop. remote-up starts a job; the others manage it by id.
-    remote_up = sub.add_parser("remote-up", parents=[common])
-    remote_up.add_argument(
-        "--experiment",
-        required=True,
-        choices=[
-            "multinode",
-            "multinode-shrink",
-            "multinode-preempt",
-            "scaling-clean",
-            "scaling-preempt",
-        ],
-        help="what the durable orchestrator runs",
-    )
-    for _rc, _help in (
-        ("remote-down", "delete the ASG + launch template for a job (also the abort switch)"),
-        ("remote-status", "ASG state + generation + sweep manifest + done-sentinel for a job"),
-        ("remote-kill", "FAULT INJECTOR: terminate the live box, leave the ASG to self-heal"),
-    ):
-        _p = sub.add_parser(_rc, parents=[common], help=_help)
-        _p.add_argument("job_id", help="job id printed by remote-up")
-
-    scmp = sub.add_parser(
-        "scaling-compare",
-        parents=[common],
-        help="join a clean + preempt sweep into an overhead table",
-    )
-    scmp.add_argument("clean_id", help="sweep id (or local report dir name) of the CLEAN sweep")
-    scmp.add_argument("preempt_id", help="sweep id of the PREEMPT sweep")
     res_parser = sub.add_parser("resume", parents=[common])
     res_parser.add_argument("run_id", help="existing run id to resume from its latest checkpoint")
     res_parser.add_argument(
@@ -313,26 +281,6 @@ def main() -> None:
         experiments.run_scaling_experiment(cfg)
     elif args.command == "scaling-clean":
         experiments.run_scaling_clean(cfg)
-    elif args.command == "scaling-preempt":
-        experiments.run_scaling_preempt(cfg)
-    elif args.command == "scaling-compare":
-        experiments.run_scaling_compare(cfg, args.clean_id, args.preempt_id)
-    elif args.command == "remote-up":
-        from . import remote
-
-        remote.launch(cfg, args.experiment)
-    elif args.command == "remote-down":
-        from . import remote
-
-        remote.teardown(cfg, args.job_id)
-    elif args.command == "remote-status":
-        from . import remote
-
-        remote.status(cfg, args.job_id)
-    elif args.command == "remote-kill":
-        from . import remote
-
-        remote.kill_orchestrator(cfg, args.job_id)
     elif args.command == "resume":
         experiments.run_resume(cfg, args.run_id, budget=args.budget, market=args.market)
     elif args.command == "compare":
